@@ -1,0 +1,370 @@
+import client from "prom-client";
+import express, { type Request, type Response } from "express";
+import type { Server } from "http";
+import { formatEther } from "viem";
+import pino, { type DestinationStream, type Logger as PinoLogger } from "pino";
+import type { ExecutionResult, LiquidationExecutor } from "./executors/liquidationExecutor";
+import type { HealthFactorMonitor } from "./monitors/healthFactorMonitor";
+import type { LiquidationCandidate } from "./protocols/aaveV3";
+import { calculateLiquidationEV } from "./utils/evCalculator";
+
+export type BotLatencyStage = "scan" | "execution" | "poll_cycle";
+export interface LogContext {
+  readonly chain?: string;
+  readonly opportunityId?: string;
+  readonly [key: string]: unknown;
+}
+
+export interface LoggerLike {
+  info(message: string, meta?: unknown): void;
+  warn(message: string, meta?: unknown): void;
+  error(message: string, meta?: unknown): void;
+  child?(context: LogContext): LoggerLike;
+}
+
+export interface BotDependencies {
+  readonly monitor: Pick<HealthFactorMonitor, "scanOnce"> & Partial<Pick<HealthFactorMonitor, "getLastScanStats" | "startReserveDataUpdatedSubscription" | "stopReserveDataUpdatedSubscription">>;
+  readonly executor: Pick<LiquidationExecutor, "execute">;
+  readonly logger: LoggerLike;
+  readonly minProfitWei?: bigint;
+  readonly simulationMode?: boolean;
+  readonly metrics?: BotMetrics;
+  readonly alert?: (event: LiquidationAlertEvent) => Promise<void>;
+}
+
+export interface BotCycleSummary {
+  readonly scanned: number;
+  readonly executed: number;
+  readonly skipped: number;
+  readonly failed: number;
+}
+
+export interface PollingLoopOptions {
+  readonly pollIntervalMs: number;
+  readonly signal: AbortSignal;
+}
+
+export interface LiquidationAlertEvent {
+  readonly mode: "simulated" | "executed";
+  readonly candidate: LiquidationCandidate;
+  readonly evProfitWei: bigint;
+  readonly txHash?: `0x${string}`;
+}
+
+export interface BotMetricsSnapshot {
+  readonly positionsScanned: number;
+  readonly liquidationsAttempted: number;
+  readonly liquidationsExecuted: number;
+  readonly totalProfitEth: number;
+  readonly errorsTotal: number;
+}
+
+export interface BotMetrics {
+  readonly registry: client.Registry;
+  recordPositionsScanned(count: number): void;
+  recordLiquidationAttempt(): void;
+  recordLiquidationExecuted(): void;
+  recordProfit(profitWei: bigint): void;
+  recordError(): void;
+  recordLatency(stage: BotLatencyStage, durationSeconds: number, labels?: { readonly chain?: string }): void;
+  snapshot(): BotMetricsSnapshot;
+}
+
+export class LiquidationBot {
+  public constructor(private readonly dependencies: BotDependencies) {}
+
+  public static createMetrics(): BotMetrics {
+    return createBotMetrics();
+  }
+
+  public async runPollingLoop(options: PollingLoopOptions): Promise<void> {
+    await this.dependencies.monitor.startReserveDataUpdatedSubscription?.();
+    this.dependencies.logger.info("🚀 Optimism Aave V3 Liquidation Bot Started", {
+      simulationMode: this.dependencies.simulationMode ?? true,
+    });
+    try {
+      while (!options.signal.aborted) {
+        const startedAt = Date.now();
+        await this.runPollingCycle();
+        await sleep(remainingDelayMs(startedAt, options.pollIntervalMs), options.signal);
+      }
+    } finally {
+      this.dependencies.monitor.stopReserveDataUpdatedSubscription?.();
+      this.dependencies.logger.info("liquidation_bot_shutdown", {
+        totalProfitEth: this.dependencies.metrics?.snapshot().totalProfitEth ?? 0,
+      });
+    }
+  }
+
+  private async runPollingCycle(): Promise<void> {
+    const startedAt = Date.now();
+    try {
+      const summary = await this.runOnce();
+      this.dependencies.logger.info("poll_cycle_complete", summary);
+    } catch (error) {
+      this.dependencies.logger.error("poll_cycle_failed", { error });
+      this.dependencies.metrics?.recordError();
+    } finally {
+      this.dependencies.metrics?.recordLatency("poll_cycle", (Date.now() - startedAt) / 1_000);
+    }
+  }
+
+  public async runOnce(): Promise<BotCycleSummary> {
+    const candidates = await this.dependencies.monitor.scanOnce();
+    const scanned = this.dependencies.monitor.getLastScanStats?.().scanned ?? candidates.length;
+    this.dependencies.metrics?.recordPositionsScanned(scanned);
+    let executed = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const candidate of candidates) {
+      if (!this.hasPositiveEv(candidate)) {
+        skipped += 1;
+        continue;
+      }
+
+      const result = await this.executeSafely(candidate);
+      this.dependencies.metrics?.recordLiquidationAttempt();
+      executed += result.status === "sent" || result.status === "simulated" ? 1 : 0;
+      skipped += result.status === "skipped" ? 1 : 0;
+      failed += result.status === "failed" ? 1 : 0;
+      await this.afterExecution(candidate, result);
+    }
+
+    return { scanned, executed, skipped, failed };
+  }
+
+  private async executeSafely(candidate: LiquidationCandidate): Promise<ExecutionResult> {
+    try {
+      return await this.dependencies.executor.execute(candidate);
+    } catch (error) {
+      this.dependencies.logger.error("candidate_execution_uncaught", { error, candidate });
+      this.dependencies.metrics?.recordError();
+      return { status: "failed", reason: "uncaught_executor_error", expectedProfitUsd: 0 };
+    }
+  }
+
+  private async afterExecution(candidate: LiquidationCandidate, result: ExecutionResult): Promise<void> {
+    if (result.status === "failed") {
+      this.dependencies.metrics?.recordError();
+      return;
+    }
+
+    if (result.status !== "sent" && result.status !== "simulated") {
+      return;
+    }
+
+    if (result.status === "sent") {
+      this.dependencies.metrics?.recordLiquidationExecuted();
+    }
+
+    const evProfitWei = result.expectedProfitWei ?? 0n;
+    this.dependencies.metrics?.recordProfit(evProfitWei);
+    const alertEvent = {
+      mode: result.status === "sent" ? "executed" : "simulated",
+      candidate,
+      evProfitWei,
+      ...(result.status === "sent" ? { txHash: result.txHash } : {}),
+    } satisfies LiquidationAlertEvent;
+    await this.dependencies.alert?.(alertEvent);
+  }
+
+  private hasPositiveEv(candidate: LiquidationCandidate): boolean {
+    if (
+      this.dependencies.minProfitWei === undefined
+      || candidate.collateralReceivedWei === undefined
+      || candidate.gasEstimate === undefined
+      || candidate.gasPrice === undefined
+    ) {
+      return true;
+    }
+
+    return calculateLiquidationEV(
+      candidate.debtToCover,
+      candidate.collateralReceivedWei,
+      candidate.bonusPercentage ?? candidate.liquidationBonusBps,
+      candidate.gasEstimate,
+      candidate.gasPrice,
+      this.dependencies.minProfitWei,
+    ).isProfitable;
+  }
+}
+
+export function createBotMetrics(): BotMetrics {
+  const registry = createMetricsRegistry();
+  const snapshot: {
+    positionsScanned: number;
+    liquidationsAttempted: number;
+    liquidationsExecuted: number;
+    totalProfitEth: number;
+    errorsTotal: number;
+  } = {
+    positionsScanned: 0,
+    liquidationsAttempted: 0,
+    liquidationsExecuted: 0,
+    totalProfitEth: 0,
+    errorsTotal: 0,
+  };
+  const positionsScannedTotal = new client.Counter({
+    name: "positions_scanned_total",
+    help: "Total positions scanned by the liquidation bot",
+    registers: [registry],
+  });
+  const liquidationsAttempted = new client.Counter({
+    name: "liquidations_attempted",
+    help: "Total liquidation candidates attempted",
+    registers: [registry],
+  });
+  const liquidationsExecuted = new client.Counter({
+    name: "liquidations_executed",
+    help: "Total live liquidation transactions sent",
+    registers: [registry],
+  });
+  const totalProfitEth = new client.Gauge({
+    name: "total_profit_eth",
+    help: "Cumulative simulated or executed EV in ETH",
+    registers: [registry],
+  });
+  const errorsTotal = new client.Counter({
+    name: "errors_total",
+    help: "Total bot errors",
+    registers: [registry],
+  });
+  const latencySeconds = new client.Histogram({
+    name: "bot_latency_seconds",
+    help: "Latency of critical bot stages",
+    labelNames: ["stage", "chain"],
+    registers: [registry],
+  });
+
+  return {
+    registry,
+    recordPositionsScanned(count) {
+      snapshot.positionsScanned += count;
+      positionsScannedTotal.inc(count);
+    },
+    recordLiquidationAttempt() {
+      snapshot.liquidationsAttempted += 1;
+      liquidationsAttempted.inc();
+    },
+    recordLiquidationExecuted() {
+      snapshot.liquidationsExecuted += 1;
+      liquidationsExecuted.inc();
+    },
+    recordProfit(profitWei) {
+      const profitEth = Number(formatEther(profitWei));
+      snapshot.totalProfitEth += profitEth;
+      totalProfitEth.set(snapshot.totalProfitEth);
+    },
+    recordError() {
+      snapshot.errorsTotal += 1;
+      errorsTotal.inc();
+    },
+    recordLatency(stage, durationSeconds, labels = {}) {
+      latencySeconds.observe({ stage, chain: labels.chain ?? "unknown" }, durationSeconds);
+    },
+    snapshot() {
+      return { ...snapshot };
+    },
+  };
+}
+
+export function startMetricsServer(
+  metrics: BotMetrics,
+  logger: LoggerLike,
+  port = 9090,
+): Server {
+  const app = express();
+  app.get("/healthz", (_request: Request, response: Response) => {
+    response.json({ status: "ok" });
+  });
+  app.get("/metrics", async (_request: Request, response: Response) => {
+    response.setHeader("content-type", metrics.registry.contentType);
+    response.send(await metrics.registry.metrics());
+  });
+
+  const server = app.listen(port, () => {
+    logger.info("metrics_server_started", { port });
+  });
+
+  return server;
+}
+
+function remainingDelayMs(startedAt: number, pollIntervalMs: number): number {
+  return Math.max(0, pollIntervalMs - (Date.now() - startedAt));
+}
+
+function sleep(durationMs: number, signal: AbortSignal): Promise<void> {
+  if (durationMs <= 0 || signal.aborted) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, durationMs);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timeout);
+      resolve();
+    }, { once: true });
+  });
+}
+
+export function createLogger(
+  level = "info",
+  context: LogContext = {},
+  destination?: DestinationStream,
+): LoggerLike {
+  const logger = destination === undefined
+    ? pino(createPinoOptions(level))
+    : pino(createPinoOptions(level), destination);
+  const contextualLogger = Object.keys(context).length === 0 ? logger : logger.child(context);
+  return new PinoLoggerAdapter(contextualLogger);
+}
+
+export function createMetricsRegistry(): client.Registry {
+  const registry = new client.Registry();
+  client.collectDefaultMetrics({ register: registry });
+  return registry;
+}
+
+class PinoLoggerAdapter implements LoggerLike {
+  public constructor(private readonly logger: PinoLogger) {}
+
+  public info(message: string, meta?: unknown): void {
+    this.logger.info(toLogObject(meta), message);
+  }
+
+  public warn(message: string, meta?: unknown): void {
+    this.logger.warn(toLogObject(meta), message);
+  }
+
+  public error(message: string, meta?: unknown): void {
+    this.logger.error(toLogObject(meta), message);
+  }
+
+  public child(context: LogContext): LoggerLike {
+    return new PinoLoggerAdapter(this.logger.child(context));
+  }
+}
+
+function createPinoOptions(level: string): pino.LoggerOptions {
+  return {
+    level,
+    base: null,
+    timestamp: pino.stdTimeFunctions.isoTime,
+    serializers: {
+      error: pino.stdSerializers.err,
+      err: pino.stdSerializers.err,
+    },
+  };
+}
+
+function toLogObject(meta: unknown): Record<string, unknown> {
+  if (meta === undefined) {
+    return {};
+  }
+  if (typeof meta === "object" && meta !== null && !Array.isArray(meta)) {
+    return meta as Record<string, unknown>;
+  }
+
+  return { value: meta };
+}
