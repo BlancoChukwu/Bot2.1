@@ -1,102 +1,194 @@
 # Chain-Agnostic Aave V3 Liquidator
 
-TypeScript Node.js liquidation bot for Aave V3 with Optimism enabled first and Arbitrum-ready chain configuration.
+A TypeScript (Node.js) bot that watches **Aave V3** users on **Layer 2** (Optimism first; Arbitrum configuration included). When a borrow position becomes unhealthy, a **liquidator** can repay part of the debt and seize a discounted amount of collateral. This project automates finding candidates and (optionally) sending liquidation transactions.
 
-## What It Does
+**This is not financial advice.** Liquidation bots compete on speed, capital, and infrastructure. You can lose money (failed txs, gas, wrong parameters). Treat every run as high risk.
 
-- Polls the configured Aave V3 market every `400ms`.
-- Discovers borrower accounts through the configured Aave V3 subgraph, then rechecks health on-chain through `viem`.
-- Reads health factor data through `viem`.
-- Builds liquidation candidates when health factor is below `1.0`.
-- Applies EV checks before execution.
-- Starts in `SIMULATION_MODE=true` by default.
-- Simulates every liquidation before sending when live execution is enabled.
-- Sends Aave V3 `liquidationCall` transactions through a `viem` wallet client.
-- Exposes Aave `flashLoanSimple` call parameter construction for receiver-contract based flash-loan execution.
-- Sends optional Telegram alerts for simulated and executed liquidations.
-- Exposes Prometheus metrics at `http://localhost:9090/metrics`.
-- Logs structured JSON through `winston`.
-- Registers default process metrics through `prom-client`.
+---
 
-## Safety Notes
+## For complete beginners
 
-This bot is intentionally chain-agnostic, but only Optimism is ready for active use. Arbitrum is present in `src/config/chains.ts` so the engine can support it later without rework.
+### Words you will see
 
-The scanner needs a working **Aave V3 subgraph** for broad borrower discovery. The old hosted `api.thegraph.com/subgraphs/name/...` URLs are gone; use The Graph **Gateway** with an API key or any compatible GraphQL URL. Set `AAVE_SUBGRAPH_URL` to the full endpoint, or set `THE_GRAPH_API_KEY` (free from The Graph) and leave `AAVE_SUBGRAPH_URL` empty to use the default subgraph ID for your `CHAIN`. Health factors are still checked on-chain before candidates are emitted.
+- **Aave V3** — A lending protocol: users **deposit** collateral, **borrow** against it, and must keep a **health factor** above `1.0`. If it drops below `1.0`, the position can be **liquidated**.
+- **Health factor (HF)** — A ratio of collateral value vs. debt. Above `1` is “safe enough”; at or below `1`, liquidations are allowed (subject to protocol rules).
+- **Liquidation** — You repay some of the user’s debt (often using a **flash loan**) and receive collateral plus a **liquidation bonus**. Profit is not guaranteed: gas, slippage, competition, and oracle latency matter.
+- **RPC** — Your connection to the blockchain (HTTP or WebSocket URL from a provider). Without a good RPC, you see stale data and miss or revert transactions.
+- **Subgraph** — A **GraphQL index** that lists many borrowers quickly. The bot still **verifies** critical data **on-chain** before acting.
+- **Simulation mode** — The bot **does not broadcast** transactions; it only **simulates** what would happen. Use this until you understand logs, RPC behavior, and risk.
+- **Live mode** — The bot may **send real transactions** from your wallet. **Live startup is guarded** by a **deployment safety gate** (PagerDuty key + recent dry-run validation). See [Simulation vs live](#simulation-vs-live).
 
-WARNING: Never use your main wallet. Create a fresh hot wallet and fund it with only about `$20-50` worth of ETH for Optimism gas. Assume any private key placed in `.env` can be lost. Keep `SIMULATION_MODE=true` until you have reviewed logs, RPC behavior, and gas estimates.
+### What happens when you run the bot (default entry)
 
-## Beginner Quick Start
+The command `npm run start:sim` runs `src/index.ts`, which wires together:
+
+1. **Metrics server** — Prometheus metrics and a JSON health check (see [Observability](#observability)).
+2. **Deployment safety gate** — If you attempt **live** mode without required checks, the process **exits** with an error log (see below).
+3. **Aave protocol adapter** — Talks to the Aave V3 pool using **viem**.
+4. **Subgraph + optional WebSocket** — Discovers borrowers from the subgraph; can subscribe to on-chain events when `WS_RPC_URL` is set.
+5. **Health factor monitor** — Polls on an interval (fixed **400 ms** in config), rebuilds candidates whose HF is below `1.0`, applies **EV / profit** filters.
+6. **Liquidation executor** — For each passing candidate, **estimates gas**, **simulates** the `liquidationCall`, and either stops there (simulation) or **broadcasts** (live).
+
+This repository also contains **additional modules** under `src/` (for example `chainRegistry`, `hybridDetectionPipeline`, `profitabilityEngine`, `safeTransactionExecutor`, `pipelineOrchestrator`). They are heavily tested and intended for **advanced composition**; the **stock** `npm start` path uses the **monitor + executor** loop above. When reading tests or extending the bot, explore those folders.
+
+---
+
+## Prerequisites
+
+- **Node.js** (LTS recommended) and **npm**.
+- A machine with stable network (this doc matches **Windows 11** as well as macOS/Linux).
+- An **Optimism** (or other supported chain) **RPC URL** and a working **Aave V3 subgraph** endpoint or **The Graph API key** (see [Environment](#environment-variables)).
+- A **dedicated hot wallet** funded with a **small** amount of ETH on the chain you use (gas only—**not** your main wallet).
+
+---
+
+## Quick start
+
+### 1. Install dependencies
+
+```bash
+npm install
+```
+
+### 2. Configure environment
+
+Copy the example file:
 
 ```bash
 cp .env.example .env
 ```
 
-1. Copy `.env.example` to `.env`.
-2. Add your Optimism RPC URL, subgraph (`AAVE_SUBGRAPH_URL` or `THE_GRAPH_API_KEY`), and a fresh hot wallet private key to `.env`.
-3. Run `npm install`.
-4. Run `npm run start:sim`.
-5. Watch the logs for simulated liquidations.
-6. When ready, change `SIMULATION_MODE=false` in `.env` and restart, or run `npm run start:live`.
+On **PowerShell** (Windows):
 
-Stop the bot safely with `Ctrl+C`. The bot handles shutdown and logs total tracked profit before exiting.
+```powershell
+Copy-Item .env.example .env
+```
 
-## Required Environment
+Edit `.env` and set at least:
 
-- `CHAIN`: `optimism` by default; `arbitrum` is accepted for future extension.
-- `RPC_URL`: primary RPC endpoint.
-- `FALLBACK_RPC_URLS`: optional comma-separated fallback endpoints.
-- `WS_RPC_URL`: optional WebSocket RPC endpoint for `ReserveDataUpdated` subscriptions.
-- `AAVE_SUBGRAPH_URL`: full GraphQL URL for the Aave V3 subgraph (e.g. `https://gateway.thegraph.com/api/<KEY>/subgraphs/id/<ID>`). Optional if `THE_GRAPH_API_KEY` is set.
-- `THE_GRAPH_API_KEY`: optional; when set and `AAVE_SUBGRAPH_URL` is empty, the bot uses the default Aave V3 subgraph ID for the selected `CHAIN` on The Graph Gateway.
-- `PRIVATE_KEY`: liquidator hot-wallet private key. Never use your main wallet.
-- `SIMULATION_MODE`: defaults to `true`; when true, the bot simulates but never sends real transactions.
-- `POLL_INTERVAL_MS`: exactly `400`.
-- `CANDIDATE_COOLDOWN_MS`: duplicate candidate suppression window.
-- `MIN_PROFIT_THRESHOLD_ETH`: minimum positive EV threshold, defaults to `0.01`.
-- `MIN_PROFIT_USD`: minimum EV threshold before simulation.
-- `GAS_COST_USD`: conservative gas estimate used in EV checks.
-- `SLIPPAGE_BPS`: safety haircut in basis points.
-- `TELEGRAM_BOT_TOKEN`: optional alert bot token.
-- `TELEGRAM_CHAT_ID`: optional alert destination.
-- `LOG_LEVEL`: `debug`, `info`, `warn`, or `error`.
+- `RPC_URL` — your primary HTTP RPC.
+- Either `AAVE_SUBGRAPH_URL` **or** `THE_GRAPH_API_KEY` (see comments in `.env.example`).
+- `PRIVATE_KEY` — **only** a burner hot wallet (never the `.example` all-zeros key in production).
 
-## Beginner Safety Checklist
-
-1. Never use your main wallet.
-2. Start with `SIMULATION_MODE=true`.
-3. Use a fresh hot wallet with only `$20-50` ETH max for gas.
-4. Review `SIMULATED liquidation of ...` logs before setting `SIMULATION_MODE=false`.
-5. Keep private RPC and wallet secrets out of screenshots, commits, and chat.
-
-## Runtime Commands
+### 3. Run in simulation (safe default)
 
 ```bash
 npm run start:sim
-npm run start:live
 ```
 
-`start:sim` is the default safe mode. `start:live` overrides `SIMULATION_MODE=false` and can send real transactions.
+Watch logs: you should see polling cycles and simulated liquidations **without** spending funds.
 
-Prometheus metrics are available at:
+### 4. Run tests (recommended before changing anything)
 
-```text
-http://localhost:9090/metrics
+```bash
+npm test
+npm run typecheck
+npm run build
 ```
 
-## Project Layout
+---
+
+## Simulation vs live
+
+| Mode | `SIMULATION_MODE` | Sends transactions? |
+|------|-------------------|---------------------|
+| Simulation | `true` (default) | No — simulations only |
+| Live | `false` | Yes — if all gates pass |
+
+**Scripts**
+
+- `npm run start:sim` — runs with your `.env` (typically `SIMULATION_MODE=true`).
+- `npm run start:live` — forces `SIMULATION_MODE=false` via `cross-env` (Windows-friendly).
+
+**Windows:** you can also double-click `Start Live Bot.cmd`, which runs `npm run start:live`. It does **not** bypass safety gates.
+
+### Live mode requirements (deployment safety gate)
+
+When `SIMULATION_MODE=false`, startup **fails** unless **all** of the following are satisfied:
+
+1. **At least one chain** is registered (`CHAIN` or `CHAINS`).
+2. **`MIN_PROFIT_MARGIN_BPS`** is **≥ 50** (0.5% — enforced in code and config).
+3. **`PAGERDUTY_ROUTING_KEY`** is set — so critical failures can alert operations (Events API v2 routing key from PagerDuty).
+4. **Dry-run validation receipt** — environment variables proving a **recent, successful** dry run **against the same config** the bot would use live:
+   - `DRY_RUN_SUCCESS=true`
+   - `DRY_RUN_VALIDATED_AT_MS` — Unix timestamp in milliseconds (must be recent; default freshness window is **15 minutes** in code unless you change the gate).
+   - `DRY_RUN_CONFIG_HASH` — must **exactly match** the bot’s internal hash of safety-relevant settings (RPC, subgraph, chains, profit thresholds, etc.). If you change `.env`, you must **recompute** this hash or repeat your dry-run procedure.
+   - `DRY_RUN_CHAINS` — comma-separated list matching your configured `CHAINS` / `CHAIN`.
+
+If live startup is **blocked**, logs show `deployment_safety_gate_blocked` with a `reasons` array. Fix those before retrying.
+
+**Typical workflow for beginners:** run simulation until comfortable → capture the config hash your process uses → set receipt fields after a deliberate dry-run checklist → add PagerDuty → then `start:live`.
+
+---
+
+## Environment variables
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `CHAIN` | Yes* | Single chain: `optimism` or `arbitrum`. *Ignored as sole source if `CHAINS` is set. |
+| `CHAINS` | No | Comma-separated list (e.g. `optimism,arbitrum`). First chain is the **runtime** chain for this entrypoint’s clients. |
+| `RPC_URL` | Yes | Primary HTTP RPC. |
+| `FALLBACK_RPC_URLS` | No | Comma-separated backup RPCs. |
+| `WS_RPC_URL` | No | WebSocket RPC for `ReserveDataUpdated` subscription (falls back to polling if omitted). |
+| `AAVE_SUBGRAPH_URL` | Yes† | Full GraphQL URL for Aave V3 subgraph. †Not required if `THE_GRAPH_API_KEY` is set. |
+| `THE_GRAPH_API_KEY` | No | If set and subgraph URL empty, builds gateway URL using built-in subgraph id for `CHAIN`. |
+| `PRIVATE_KEY` | Yes | `0x` + 64 hex chars. **Placeholder key is rejected in live mode.** |
+| `SIMULATION_MODE` | No | `true` / `false` (default `true`). |
+| `POLL_INTERVAL_MS` | No | **Must be exactly `400`** if set (validator enforces). |
+| `CANDIDATE_COOLDOWN_MS` | No | Suppress duplicate candidates (default `30000`). |
+| `MIN_PROFIT_THRESHOLD_ETH` | No | Minimum EV in ETH terms (default `0.01`). |
+| `MIN_PROFIT_USD` | No | Minimum EV in USD before deeper work (default `10`). |
+| `GAS_COST_USD` | No | Conservative gas dollar estimate for EV (default `0`). |
+| `SLIPPAGE_BPS` | No | Haircut in basis points (default `50`). |
+| `MIN_PROFIT_MARGIN_BPS` | No | Minimum margin; **cannot be below `50`** (0.5%). |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | No | Optional alerts for simulated/executed liquidations. |
+| `LOG_LEVEL` | No | `debug`, `info`, `warn`, `error` (default `info`). |
+| `PAGERDUTY_ROUTING_KEY` | Live | Required when `SIMULATION_MODE=false`. |
+| `DRY_RUN_*` | Live | Receipt fields; see [Live mode requirements](#live-mode-requirements-deployment-safety-gate). |
+
+---
+
+## Observability
+
+- **Logging** — Structured **JSON logs** via **Pino** (`createLogger` in `src/bot.ts`). Set `LOG_LEVEL` to control verbosity.
+- **Metrics** — HTTP server (default port **9090**):
+  - `http://localhost:9090/metrics` — Prometheus scrape endpoint (includes default Node metrics via `prom-client`).
+  - `http://localhost:9090/healthz` — JSON `{"status":"ok"}` for load balancers or quick checks.
+- **Grafana / alerts** — Helper definitions live in `src/production/productionReadiness.ts` (`createGrafanaDashboardDefinition`, PagerDuty-oriented alert shapes) for you to export into your monitoring stack.
+
+---
+
+## Safety checklist
+
+1. **Never** use your main wallet; use a **new** hot wallet with **minimal** ETH for gas.
+2. **Never** commit `.env` or share private keys / RPC URLs in chat or screenshots.
+3. Keep **`SIMULATION_MODE=true`** until you understand every log line you care about.
+4. **Live mode** requires **PagerDuty** and a **valid dry-run receipt** matching current config — do not bypass; fix the gate reasons instead.
+5. **Stop** the bot with **Ctrl+C**; shutdown logs include cumulative profit snapshot from metrics.
+
+---
+
+## Project layout
 
 ```text
 src/
-├── config/chains.ts
-├── protocols/aaveV3.ts
-├── monitors/healthFactorMonitor.ts
-├── utils/evCalculator.ts
-├── executors/liquidationExecutor.ts
-├── utils/failoverProvider.ts
-├── bot.ts
-├── index.ts
+├── index.ts              # Entry point: env parse, safety gate, bot wiring
+├── bot.ts                # LiquidationBot loop, Pino logger, metrics HTTP server
+├── config/               # chains.ts, chainRegistry.ts (registry for multi-chain apps)
+├── protocols/aaveV3.ts     # Pool calls, liquidation params, subgraph queries
+├── monitors/             # healthFactorMonitor, hybridDetectionPipeline, reserveAwareBorrowerCache
+├── executors/            # liquidationExecutor, nonceManager, safeTransactionExecutor
+├── profitability/        # profitabilityEngine, flashLoanProviderRouter
+├── orchestrator/         # pipelineOrchestrator, dead-letter patterns
+├── optimization/         # hazardPrediction (Bayesian / ranking helpers)
+├── production/           # deployment gate, hot reload, shutdown, Grafana/PagerDuty helpers
+└── utils/                # evCalculator, typedAssetMath, failover provider, telegram
+test/
+├── unit/                 # Fast unit tests
+└── integration/          # Chaos / integration scenarios
 ```
+
+---
 
 ## Verification
 
@@ -106,6 +198,24 @@ npm run typecheck
 npm run build
 ```
 
-## Adding Arbitrum
+---
 
-Change `CHAIN=arbitrum`, confirm the Arbitrum Aave V3 reserve config in `src/config/chains.ts`, and use Arbitrum RPC/subgraph URLs.
+## Adding or switching chains
+
+- Set `CHAIN=arbitrum` **or** include `arbitrum` in `CHAINS` and ensure **RPC** + **subgraph** (or Graph key) target **Arbitrum** Aave V3.
+- Confirm addresses and market parameters in `src/config/chains.ts` match the deployment you intend to use.
+
+---
+
+## Troubleshooting (beginners)
+
+- **“AAVE_SUBGRAPH_URL is required unless THE_GRAPH_API_KEY…”** — Provide a full subgraph URL or a Graph API key.
+- **`deployment_safety_gate_blocked`** — You are in live mode without PagerDuty, dry-run receipt, margin, or chain registration. Read the `reasons` in the log.
+- **`PRIVATE_KEY uses the placeholder…`** — Replace the sample key in `.env` for live mode.
+- **`POLL_INTERVAL_MS must be exactly 400`** — Remove the variable to use default or set it to `400` only.
+
+---
+
+## License
+
+See `package.json` (`license` field).
