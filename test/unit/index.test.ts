@@ -16,6 +16,33 @@ describe("parseRuntimeConfig", () => {
     expect(config.aaveSubgraphUrl).toBe("https://subgraph.example");
   });
 
+  it("accepts Node.js process.env (Zod 4 z.record rejects the raw env object)", () => {
+    const keys = ["CHAIN", "RPC_URL", "AAVE_SUBGRAPH_URL", "PRIVATE_KEY"] as const;
+    const previous: Partial<Record<(typeof keys)[number], string | undefined>> = {};
+    for (const key of keys) {
+      previous[key] = process.env[key];
+    }
+    try {
+      process.env.CHAIN = "optimism";
+      process.env.RPC_URL = "https://optimism.example";
+      process.env.AAVE_SUBGRAPH_URL = "https://subgraph.example";
+      process.env.PRIVATE_KEY = "0x0000000000000000000000000000000000000000000000000000000000000001";
+
+      const config = parseRuntimeConfig(process.env);
+
+      expect(config.chain).toBe("optimism");
+    } finally {
+      for (const key of keys) {
+        const value = previous[key];
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
+  });
+
   it("parses multi-chain Aave V3 targets while keeping the first chain as the active legacy target", () => {
     const config = parseRuntimeConfig({
       CHAINS: "optimism, arbitrum",

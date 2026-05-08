@@ -308,7 +308,9 @@ function parseBoolean(value: string | undefined, fallback: boolean): boolean {
 }
 
 function parseRuntimeEnv(env: Env): Env {
-  const result = runtimeEnvSchema.safeParse(env);
+  // Node's `process.env` is not a Zod "plain object" (see zod util.isPlainObject), so z.record() rejects it.
+  const plainEnv = Object.assign(Object.create(null), env) as Env;
+  const result = runtimeEnvSchema.safeParse(plainEnv);
   if (!result.success) {
     throw new Error(`Invalid runtime environment: ${result.error.message}`);
   }

@@ -90,10 +90,12 @@ npm run build
 
 ## Simulation vs live
 
-| Mode | `SIMULATION_MODE` | Sends transactions? |
-|------|-------------------|---------------------|
-| Simulation | `true` (default) | No — simulations only |
-| Live | `false` | Yes — if all gates pass |
+
+| Mode       | `SIMULATION_MODE` | Sends transactions?     |
+| ---------- | ----------------- | ----------------------- |
+| Simulation | `true` (default)  | No — simulations only   |
+| Live       | `false`           | Yes — if all gates pass |
+
 
 **Scripts**
 
@@ -107,13 +109,13 @@ npm run build
 When `SIMULATION_MODE=false`, startup **fails** unless **all** of the following are satisfied:
 
 1. **At least one chain** is registered (`CHAIN` or `CHAINS`).
-2. **`MIN_PROFIT_MARGIN_BPS`** is **≥ 50** (0.5% — enforced in code and config).
-3. **`PAGERDUTY_ROUTING_KEY`** is set — so critical failures can alert operations (Events API v2 routing key from PagerDuty).
+2. `**MIN_PROFIT_MARGIN_BPS`** is **≥ 50** (0.5% — enforced in code and config).
+3. `**PAGERDUTY_ROUTING_KEY`** is set — so critical failures can alert operations (Events API v2 routing key from PagerDuty).
 4. **Dry-run validation receipt** — environment variables proving a **recent, successful** dry run **against the same config** the bot would use live:
-   - `DRY_RUN_SUCCESS=true`
-   - `DRY_RUN_VALIDATED_AT_MS` — Unix timestamp in milliseconds (must be recent; default freshness window is **15 minutes** in code unless you change the gate).
-   - `DRY_RUN_CONFIG_HASH` — must **exactly match** the bot’s internal hash of safety-relevant settings (RPC, subgraph, chains, profit thresholds, etc.). If you change `.env`, you must **recompute** this hash or repeat your dry-run procedure.
-   - `DRY_RUN_CHAINS` — comma-separated list matching your configured `CHAINS` / `CHAIN`.
+  - `DRY_RUN_SUCCESS=true`
+  - `DRY_RUN_VALIDATED_AT_MS` — Unix timestamp in milliseconds (must be recent; default freshness window is **15 minutes** in code unless you change the gate).
+  - `DRY_RUN_CONFIG_HASH` — must **exactly match** the bot’s internal hash of safety-relevant settings (RPC, subgraph, chains, profit thresholds, etc.). If you change `.env`, you must **recompute** this hash or repeat your dry-run procedure.
+  - `DRY_RUN_CHAINS` — comma-separated list matching your configured `CHAINS` / `CHAIN`.
 
 If live startup is **blocked**, logs show `deployment_safety_gate_blocked` with a `reasons` array. Fix those before retrying.
 
@@ -123,28 +125,30 @@ If live startup is **blocked**, logs show `deployment_safety_gate_blocked` with 
 
 ## Environment variables
 
-| Variable | Required | Purpose |
-|----------|----------|---------|
-| `CHAIN` | Yes* | Single chain: `optimism` or `arbitrum`. *Ignored as sole source if `CHAINS` is set. |
-| `CHAINS` | No | Comma-separated list (e.g. `optimism,arbitrum`). First chain is the **runtime** chain for this entrypoint’s clients. |
-| `RPC_URL` | Yes | Primary HTTP RPC. |
-| `FALLBACK_RPC_URLS` | No | Comma-separated backup RPCs. |
-| `WS_RPC_URL` | No | WebSocket RPC for `ReserveDataUpdated` subscription (falls back to polling if omitted). |
-| `AAVE_SUBGRAPH_URL` | Yes† | Full GraphQL URL for Aave V3 subgraph. †Not required if `THE_GRAPH_API_KEY` is set. |
-| `THE_GRAPH_API_KEY` | No | If set and subgraph URL empty, builds gateway URL using built-in subgraph id for `CHAIN`. |
-| `PRIVATE_KEY` | Yes | `0x` + 64 hex chars. **Placeholder key is rejected in live mode.** |
-| `SIMULATION_MODE` | No | `true` / `false` (default `true`). |
-| `POLL_INTERVAL_MS` | No | **Must be exactly `400`** if set (validator enforces). |
-| `CANDIDATE_COOLDOWN_MS` | No | Suppress duplicate candidates (default `30000`). |
-| `MIN_PROFIT_THRESHOLD_ETH` | No | Minimum EV in ETH terms (default `0.01`). |
-| `MIN_PROFIT_USD` | No | Minimum EV in USD before deeper work (default `10`). |
-| `GAS_COST_USD` | No | Conservative gas dollar estimate for EV (default `0`). |
-| `SLIPPAGE_BPS` | No | Haircut in basis points (default `50`). |
-| `MIN_PROFIT_MARGIN_BPS` | No | Minimum margin; **cannot be below `50`** (0.5%). |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | No | Optional alerts for simulated/executed liquidations. |
-| `LOG_LEVEL` | No | `debug`, `info`, `warn`, `error` (default `info`). |
-| `PAGERDUTY_ROUTING_KEY` | Live | Required when `SIMULATION_MODE=false`. |
-| `DRY_RUN_*` | Live | Receipt fields; see [Live mode requirements](#live-mode-requirements-deployment-safety-gate). |
+
+| Variable                                  | Required | Purpose                                                                                                              |
+| ----------------------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------- |
+| `CHAIN`                                   | Yes*     | Single chain: `optimism` or `arbitrum`. *Ignored as sole source if `CHAINS` is set.                                  |
+| `CHAINS`                                  | No       | Comma-separated list (e.g. `optimism,arbitrum`). First chain is the **runtime** chain for this entrypoint’s clients. |
+| `RPC_URL`                                 | Yes      | Primary HTTP RPC.                                                                                                    |
+| `FALLBACK_RPC_URLS`                       | No       | Comma-separated backup RPCs.                                                                                         |
+| `WS_RPC_URL`                              | No       | WebSocket RPC for `ReserveDataUpdated` subscription (falls back to polling if omitted).                              |
+| `AAVE_SUBGRAPH_URL`                       | Yes†     | Full GraphQL URL for Aave V3 subgraph. †Not required if `THE_GRAPH_API_KEY` is set.                                  |
+| `THE_GRAPH_API_KEY`                       | No       | If set and subgraph URL empty, builds gateway URL using built-in subgraph id for `CHAIN`.                            |
+| `PRIVATE_KEY`                             | Yes      | `0x` + 64 hex chars. **Placeholder key is rejected in live mode.**                                                   |
+| `SIMULATION_MODE`                         | No       | `true` / `false` (default `true`).                                                                                   |
+| `POLL_INTERVAL_MS`                        | No       | **Must be exactly `400`** if set (validator enforces).                                                               |
+| `CANDIDATE_COOLDOWN_MS`                   | No       | Suppress duplicate candidates (default `30000`).                                                                     |
+| `MIN_PROFIT_THRESHOLD_ETH`                | No       | Minimum EV in ETH terms (default `0.01`).                                                                            |
+| `MIN_PROFIT_USD`                          | No       | Minimum EV in USD before deeper work (default `10`).                                                                 |
+| `GAS_COST_USD`                            | No       | Conservative gas dollar estimate for EV (default `0`).                                                               |
+| `SLIPPAGE_BPS`                            | No       | Haircut in basis points (default `50`).                                                                              |
+| `MIN_PROFIT_MARGIN_BPS`                   | No       | Minimum margin; **cannot be below `50`** (0.5%).                                                                     |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | No       | Optional alerts for simulated/executed liquidations.                                                                 |
+| `LOG_LEVEL`                               | No       | `debug`, `info`, `warn`, `error` (default `info`).                                                                   |
+| `PAGERDUTY_ROUTING_KEY`                   | Live     | Required when `SIMULATION_MODE=false`.                                                                               |
+| `DRY_RUN_*`                               | Live     | Receipt fields; see [Live mode requirements](#live-mode-requirements-deployment-safety-gate).                        |
+
 
 ---
 
@@ -162,7 +166,7 @@ If live startup is **blocked**, logs show `deployment_safety_gate_blocked` with 
 
 1. **Never** use your main wallet; use a **new** hot wallet with **minimal** ETH for gas.
 2. **Never** commit `.env` or share private keys / RPC URLs in chat or screenshots.
-3. Keep **`SIMULATION_MODE=true`** until you understand every log line you care about.
+3. Keep `**SIMULATION_MODE=true`** until you understand every log line you care about.
 4. **Live mode** requires **PagerDuty** and a **valid dry-run receipt** matching current config — do not bypass; fix the gate reasons instead.
 5. **Stop** the bot with **Ctrl+C**; shutdown logs include cumulative profit snapshot from metrics.
 
@@ -210,9 +214,9 @@ npm run build
 ## Troubleshooting (beginners)
 
 - **“AAVE_SUBGRAPH_URL is required unless THE_GRAPH_API_KEY…”** — Provide a full subgraph URL or a Graph API key.
-- **`deployment_safety_gate_blocked`** — You are in live mode without PagerDuty, dry-run receipt, margin, or chain registration. Read the `reasons` in the log.
-- **`PRIVATE_KEY uses the placeholder…`** — Replace the sample key in `.env` for live mode.
-- **`POLL_INTERVAL_MS must be exactly 400`** — Remove the variable to use default or set it to `400` only.
+- `**deployment_safety_gate_blocked`** — You are in live mode without PagerDuty, dry-run receipt, margin, or chain registration. Read the `reasons` in the log.
+- `**PRIVATE_KEY uses the placeholder…`** — Replace the sample key in `.env` for live mode.
+- `**POLL_INTERVAL_MS must be exactly 400`** — Remove the variable to use default or set it to `400` only.
 
 ---
 
