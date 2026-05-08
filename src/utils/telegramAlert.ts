@@ -16,6 +16,15 @@ export interface TelegramAlertInput {
   readonly fetcher?: TelegramFetch;
 }
 
+export interface TelegramDailySummaryInput {
+  readonly token: string | undefined;
+  readonly chatId: string | undefined;
+  readonly netProfitUsd: number;
+  readonly arbitrageExecuted: number;
+  readonly liquidationsExecuted: number;
+  readonly fetcher?: TelegramFetch;
+}
+
 export async function sendLiquidationAlert(input: TelegramAlertInput): Promise<void> {
   if (input.token === undefined || input.chatId === undefined) {
     return;
@@ -34,6 +43,32 @@ export async function sendLiquidationAlert(input: TelegramAlertInput): Promise<v
 
   if (!response.ok) {
     throw new Error("Telegram liquidation alert failed");
+  }
+}
+
+export async function sendDailyPnlSummary(input: TelegramDailySummaryInput): Promise<void> {
+  if (input.token === undefined || input.chatId === undefined) {
+    return;
+  }
+
+  const fetcher: TelegramFetch = input.fetcher ?? fetch;
+  const response = await fetcher(`https://api.telegram.org/bot${input.token}/sendMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chat_id: input.chatId,
+      parse_mode: "Markdown",
+      text: [
+        "*Daily P&L Summary*",
+        `Net profit: *$${input.netProfitUsd.toFixed(2)}*`,
+        `Arb executed: \`${input.arbitrageExecuted}\``,
+        `Liquidations executed: \`${input.liquidationsExecuted}\``,
+      ].join("\n"),
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error("Telegram daily summary failed");
   }
 }
 

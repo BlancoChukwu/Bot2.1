@@ -57,6 +57,10 @@ export interface BotMetricsSnapshot {
   readonly liquidationsExecuted: number;
   readonly totalProfitEth: number;
   readonly errorsTotal: number;
+  readonly arbitrageOpportunitiesScanned: number;
+  readonly arbitrageApproved: number;
+  readonly arbitrageExecuted: number;
+  readonly netProfitUsd: number;
 }
 
 export interface BotMetrics {
@@ -65,6 +69,10 @@ export interface BotMetrics {
   recordLiquidationAttempt(): void;
   recordLiquidationExecuted(): void;
   recordProfit(profitWei: bigint): void;
+  recordArbitrageOpportunityScanned(count: number): void;
+  recordArbitrageApproved(count: number): void;
+  recordArbitrageExecuted(count: number): void;
+  recordNetProfitUsd(amountUsd: number): void;
   recordError(): void;
   recordLatency(stage: BotLatencyStage, durationSeconds: number, labels?: { readonly chain?: string }): void;
   snapshot(): BotMetricsSnapshot;
@@ -198,12 +206,20 @@ export function createBotMetrics(): BotMetrics {
     liquidationsExecuted: number;
     totalProfitEth: number;
     errorsTotal: number;
+    arbitrageOpportunitiesScanned: number;
+    arbitrageApproved: number;
+    arbitrageExecuted: number;
+    netProfitUsd: number;
   } = {
     positionsScanned: 0,
     liquidationsAttempted: 0,
     liquidationsExecuted: 0,
     totalProfitEth: 0,
     errorsTotal: 0,
+    arbitrageOpportunitiesScanned: 0,
+    arbitrageApproved: 0,
+    arbitrageExecuted: 0,
+    netProfitUsd: 0,
   };
   const positionsScannedTotal = new client.Counter({
     name: "positions_scanned_total",
@@ -228,6 +244,26 @@ export function createBotMetrics(): BotMetrics {
   const errorsTotal = new client.Counter({
     name: "errors_total",
     help: "Total bot errors",
+    registers: [registry],
+  });
+  const arbitrageScanned = new client.Counter({
+    name: "arb_opportunities_scanned",
+    help: "Total arbitrage opportunities scanned",
+    registers: [registry],
+  });
+  const arbitrageApproved = new client.Counter({
+    name: "arb_approved",
+    help: "Total arbitrage opportunities approved by profitability",
+    registers: [registry],
+  });
+  const arbitrageExecuted = new client.Counter({
+    name: "arb_executed",
+    help: "Total arbitrage executions sent",
+    registers: [registry],
+  });
+  const netProfitUsd = new client.Gauge({
+    name: "net_profit_usd",
+    help: "Cumulative projected net profit in USD",
     registers: [registry],
   });
   const latencySeconds = new client.Histogram({
@@ -255,6 +291,22 @@ export function createBotMetrics(): BotMetrics {
       const profitEth = Number(formatEther(profitWei));
       snapshot.totalProfitEth += profitEth;
       totalProfitEth.set(snapshot.totalProfitEth);
+    },
+    recordArbitrageOpportunityScanned(count) {
+      snapshot.arbitrageOpportunitiesScanned += count;
+      arbitrageScanned.inc(count);
+    },
+    recordArbitrageApproved(count) {
+      snapshot.arbitrageApproved += count;
+      arbitrageApproved.inc(count);
+    },
+    recordArbitrageExecuted(count) {
+      snapshot.arbitrageExecuted += count;
+      arbitrageExecuted.inc(count);
+    },
+    recordNetProfitUsd(amountUsd) {
+      snapshot.netProfitUsd += amountUsd;
+      netProfitUsd.set(snapshot.netProfitUsd);
     },
     recordError() {
       snapshot.errorsTotal += 1;

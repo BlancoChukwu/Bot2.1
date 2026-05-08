@@ -16,7 +16,12 @@ describe("chain configuration", () => {
     expect(parseSupportedChain(undefined)).toBe("optimism");
   });
 
+  it("supports Base for arbitration rollout", () => {
+    expect(getChainConfig("base").chainId).toBe(8453);
+    expect(parseSupportedChain("base")).toBe("base");
+  });
+
   it("rejects unsupported chains before startup", () => {
-    expect(() => parseSupportedChain("base")).toThrow(/Unsupported chain/);
+    expect(() => parseSupportedChain("polygon")).toThrow(/Unsupported chain/);
   });
 });

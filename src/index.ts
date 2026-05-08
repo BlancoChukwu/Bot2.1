@@ -1,11 +1,12 @@
 import "dotenv/config";
-import { parseEther, type Hex } from "viem";
+import { parseEther, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { z } from "zod";
 import {
   createBotMetrics,
   createLogger,
   LiquidationBot,
+  type PollingLoopOptions,
   startMetricsServer,
   type BotMetrics,
   type LoggerLike,
@@ -19,12 +20,28 @@ import {
   parseSupportedChain,
   type SupportedChain,
 } from "./config/chains";
+import { createChainRegistry } from "./config/chainRegistry";
 import { createLiquidationActions, LiquidationExecutor } from "./executors/liquidationExecutor";
+import { buildArbitrageExecutionRequest } from "./executors/arbitrageExecutorAdapter";
+import { buildLiquidationExecutionRequest } from "./executors/liquidationExecutionAdapter";
+import { LocalNonceManager } from "./executors/nonceManager";
+import { SafeTransactionExecutor } from "./executors/safeTransactionExecutor";
+import { ViemExecutionClient } from "./executors/viemExecutionClient";
+import { createDexesPerChainMap, createMonitoredPairsPerChainMap } from "./config/dexRegistry";
 import { HealthFactorMonitor } from "./monitors/healthFactorMonitor";
+import { ArbitrageOpportunityQueue } from "./monitors/arbitrageOpportunityQueue";
+import { ArbitrageScanner } from "./monitors/arbitrageScanner";
+import { PipelineDetectionAdapter } from "./orchestrator/pipelineDetectionAdapter";
+import { PipelineDeadLetterQueue, PipelineOrchestrator } from "./orchestrator/pipelineOrchestrator";
 import { buildLiquidationCallParams, ViemAaveV3Protocol } from "./protocols/aaveV3";
+import { FlashLoanProviderRouter } from "./profitability/flashLoanProviderRouter";
+import { ProfitabilityEngine } from "./profitability/profitabilityEngine";
 import { MIN_PROFIT_THRESHOLD_WEI } from "./utils/evCalculator";
-import { sendLiquidationAlert } from "./utils/telegramAlert";
+import { createAsset, createAssetAmount } from "./utils/typedAssetMath";
+import { sendDailyPnlSummary, sendLiquidationAlert } from "./utils/telegramAlert";
 import { DeploymentSafetyGate, type DeploymentGateResult, type DryRunValidationReceipt } from "./production/productionReadiness";
+import { PnlTracker } from "./production/pnlTracker";
+import type { Opportunity } from "./types/opportunity";
 
 export interface RuntimeConfig {
   readonly chain: SupportedChain;
@@ -47,6 +64,13 @@ export interface RuntimeConfig {
   readonly pagerDutyRoutingKey: string | undefined;
   readonly dryRunValidation: DryRunValidationReceipt | undefined;
   readonly logLevel: string;
+  readonly usePipelineOrchestrator: boolean;
+  readonly arbitrageReceiverAddress: Address | undefined;
+  readonly dailyPnlCsvPath: string | undefined;
+}
+
+export interface BotRunner {
+  runPollingLoop(options: PollingLoopOptions): Promise<void>;
 }
 
 type Env = Record<string, string | undefined>;
@@ -93,6 +117,9 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     pagerDutyRoutingKey: optionalEnv(parsedEnv, "PAGERDUTY_ROUTING_KEY"),
     dryRunValidation: parseDryRunValidation(parsedEnv, chains, privateKey, aaveSubgraphUrl),
     logLevel: parsedEnv.LOG_LEVEL ?? "info",
+    usePipelineOrchestrator: parseBoolean(parsedEnv.USE_PIPELINE_ORCHESTRATOR, false),
+    arbitrageReceiverAddress: parseAddress(optionalEnv(parsedEnv, "ARBITRAGE_RECEIVER_ADDRESS")),
+    dailyPnlCsvPath: optionalEnv(parsedEnv, "DAILY_PNL_CSV_PATH"),
   };
 }
 
@@ -107,7 +134,11 @@ export function evaluateRuntimeDeploymentSafety(config: RuntimeConfig): Deployme
   });
 }
 
-export function buildBot(config: RuntimeConfig, metrics: BotMetrics = createBotMetrics()): LiquidationBot {
+export function buildBot(config: RuntimeConfig, metrics: BotMetrics = createBotMetrics()): BotRunner {
+  if (config.usePipelineOrchestrator) {
+    return buildPipelineBot(config, metrics);
+  }
+
   const chainConfig = getChainConfig(config.chain);
   const logger = createLogger(config.logLevel);
   const publicClient = createFailoverPublicClient({
@@ -179,6 +210,190 @@ export function buildBot(config: RuntimeConfig, metrics: BotMetrics = createBotM
         ...(event.txHash === undefined ? {} : { txHash: event.txHash }),
       }),
   });
+}
+
+function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner {
+  const logger = createLogger(config.logLevel);
+  const account = privateKeyToAccount(config.privateKey);
+  const publicClient = createFailoverPublicClient({
+    chain: config.chain,
+    rpcUrl: config.rpcUrl,
+    fallbackRpcUrls: config.fallbackRpcUrls,
+  });
+  const walletClient = createFailoverWalletClient({
+    chain: config.chain,
+    rpcUrl: config.rpcUrl,
+    fallbackRpcUrls: config.fallbackRpcUrls,
+    privateKey: config.privateKey,
+  });
+  const eventClient = config.wsRpcUrl === undefined
+    ? publicClient
+    : createChainWebSocketPublicClient({ chain: config.chain, wsRpcUrl: config.wsRpcUrl });
+  const protocol = new ViemAaveV3Protocol(
+    publicClient,
+    getChainConfig(config.chain),
+    createGraphClient(config.aaveSubgraphUrl),
+    eventClient,
+  );
+  const monitor = new HealthFactorMonitor({
+    protocol,
+    pollIntervalMs: config.pollIntervalMs,
+    candidateCooldownMs: config.candidateCooldownMs,
+    minProfitUsd: config.minProfitUsd,
+    gasCostUsd: config.gasCostUsd,
+    slippageBps: config.slippageBps,
+    logger,
+  });
+
+  const registry = createChainRegistry({
+    chains: config.chains.map((chain) => ({
+      chain,
+      rpcUrl: config.rpcUrl,
+      fallbackRpcUrls: config.fallbackRpcUrls,
+      ...(config.wsRpcUrl === undefined ? {} : { wsRpcUrl: config.wsRpcUrl }),
+      aaveSubgraphUrl: config.aaveSubgraphUrl,
+      flashLoanProviders: ["aaveV3"],
+    })),
+  });
+
+  const usd = createAsset({ symbol: "USD", decimals: 8 });
+  const simulator = {
+    simulate: async (input: {
+      revenue: { raw: bigint };
+      gas: { raw: bigint };
+      swapCost: { raw: bigint };
+    }) => ({
+      success: true as const,
+      revenue: createAssetAmount(usd, input.revenue.raw),
+      gas: createAssetAmount(usd, input.gas.raw),
+      swapCost: createAssetAmount(usd, input.swapCost.raw),
+    }),
+  };
+  const router = new FlashLoanProviderRouter({
+    registry,
+    logger,
+    metrics,
+    simulator,
+    providerFees: {
+      aaveV3: createAssetAmount(usd, 9_000_000n),
+    },
+  });
+  const executor = new SafeTransactionExecutor({
+    registry,
+    router,
+    nonceManager: new LocalNonceManager(),
+    client: new ViemExecutionClient({ publicClient, walletClient }),
+    logger,
+    metrics,
+    dryRunMode: config.simulationMode,
+    privateBundleRiskThresholdBps: 7_000,
+    allowPublicFallbackAfterBundleFailure: true,
+  });
+  const arbQueue = new ArbitrageOpportunityQueue();
+  const detection = new PipelineDetectionAdapter({
+    chain: config.chain,
+    monitor,
+    arbitrageQueue: arbQueue,
+  });
+  const arbScannerEngine = new ProfitabilityEngine({
+    registry,
+    logger,
+    metrics,
+    simulator,
+  });
+  const pnlTracker = config.dailyPnlCsvPath === undefined ? undefined : new PnlTracker(config.dailyPnlCsvPath);
+  let lastSummaryDay = "";
+  const arbitrageScanner = new ArbitrageScanner({
+    registry,
+    profitabilityEngine: arbScannerEngine,
+    logger,
+    metrics,
+    publicClientFactory: (chain) =>
+      createFailoverPublicClient({
+        chain,
+        rpcUrl: config.rpcUrl,
+        fallbackRpcUrls: config.fallbackRpcUrls,
+      }),
+    defaultFlashLoanProvider: "aaveV3",
+    monitoredPairs: createMonitoredPairsPerChainMap(config.chains),
+    dexesPerChain: createDexesPerChainMap(config.chains),
+    opportunitySink: arbQueue,
+  });
+  const orchestrator = new PipelineOrchestrator({
+    registry,
+    detection,
+    executor,
+    deadLetters: new PipelineDeadLetterQueue(),
+    logger,
+    metrics,
+    cycleObserver: async () => {
+      const snapshot = metrics.snapshot();
+      if (pnlTracker !== undefined) {
+        pnlTracker.append({
+          timestampIso: new Date().toISOString(),
+          netProfitUsd: snapshot.netProfitUsd,
+          arbitrageExecuted: snapshot.arbitrageExecuted,
+          liquidationsExecuted: snapshot.liquidationsExecuted,
+        });
+      }
+      const now = new Date();
+      const dayKey = now.toISOString().slice(0, 10);
+      if (now.getUTCHours() === 0 && now.getUTCMinutes() < 5 && lastSummaryDay !== dayKey) {
+        lastSummaryDay = dayKey;
+        await sendDailyPnlSummary({
+          token: config.telegramBotToken,
+          chatId: config.telegramChatId,
+          netProfitUsd: snapshot.netProfitUsd,
+          arbitrageExecuted: snapshot.arbitrageExecuted,
+          liquidationsExecuted: snapshot.liquidationsExecuted,
+        });
+      }
+    },
+    buildExecutionRequest: (candidate) =>
+      buildLiquidationExecutionRequest(config.chain, candidate, {
+        account: account.address,
+        minProfitUsd: config.minProfitUsd,
+        gasCostUsd: config.gasCostUsd,
+        slippageBps: config.slippageBps,
+        minimumMarginBps: config.minProfitMarginBps,
+      }),
+    buildExecutionRequestForOpportunity: (opportunity: Opportunity) => {
+      if (opportunity.kind === "liquidation") {
+        return buildLiquidationExecutionRequest(config.chain, opportunity.candidate, {
+          account: account.address,
+          minProfitUsd: config.minProfitUsd,
+          gasCostUsd: config.gasCostUsd,
+          slippageBps: config.slippageBps,
+          minimumMarginBps: config.minProfitMarginBps,
+        });
+      }
+      if (config.arbitrageReceiverAddress === undefined) {
+        return undefined;
+      }
+      return buildArbitrageExecutionRequest(opportunity.candidate, {
+        receiverAddress: config.arbitrageReceiverAddress,
+        operatorAddress: account.address,
+      });
+    },
+  });
+
+  return new PipelineBotRunner(orchestrator, arbitrageScanner);
+}
+
+class PipelineBotRunner implements BotRunner {
+  public constructor(
+    private readonly orchestrator: PipelineOrchestrator,
+    private readonly arbitrageScanner: ArbitrageScanner,
+  ) {}
+
+  public async runPollingLoop(options: PollingLoopOptions): Promise<void> {
+    this.arbitrageScanner.start();
+    try {
+      await this.orchestrator.runLoop(options);
+    } finally {
+      this.arbitrageScanner.stop();
+    }
+  }
 }
 
 async function main(): Promise<void> {
@@ -256,6 +471,16 @@ function parsePrivateKey(value: string): Hex {
   }
 
   return value as Hex;
+}
+
+function parseAddress(value: string | undefined): Address | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!/^0x[a-fA-F0-9]{40}$/.test(value)) {
+    throw new Error("ARBITRAGE_RECEIVER_ADDRESS must be a 20-byte hex address");
+  }
+  return value as Address;
 }
 
 function parseList(value: string | undefined): string[] {

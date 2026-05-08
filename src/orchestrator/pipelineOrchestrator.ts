@@ -6,6 +6,8 @@ import type { SafeExecutionRequest, SafeExecutionResult } from "../executors/saf
 import { ReserveAwareBorrowerCache, createReserveAwareCandidates } from "../monitors/reserveAwareBorrowerCache";
 import type { LiquidationCandidate } from "../protocols/aaveV3";
 import type { RouteSelectionInput } from "../profitability/flashLoanProviderRouter";
+import type { Opportunity } from "../types/opportunity";
+import { fromLiquidationCandidate } from "../types/opportunity";
 
 export interface PipelineLoopOptions {
   readonly pollIntervalMs: number;
@@ -18,6 +20,7 @@ export interface PipelineDetection {
   stop(): void;
   pollFallback(chain: SupportedChain): Promise<void>;
   getCircuitBreakerState(chain: SupportedChain, name: CircuitBreakerName): CircuitBreakerState;
+  collectExtraOpportunities?(chain: SupportedChain): Promise<readonly Opportunity[]>;
 }
 
 export interface SafeExecutionClient {
@@ -30,7 +33,8 @@ export interface PipelineOpportunityRanker {
 
 export interface PipelineExecutionPlan {
   readonly chain: SupportedChain;
-  readonly candidate: LiquidationCandidate;
+  readonly opportunity: Opportunity;
+  readonly candidate?: LiquidationCandidate;
   readonly request: SafeExecutionRequest;
 }
 
@@ -56,7 +60,9 @@ export interface PipelineOrchestratorConfig {
   readonly maxCacheAgeMs?: number;
   readonly opportunityRanker?: PipelineOpportunityRanker;
   readonly outcomeObserver?: PipelineOutcomeObserver;
+  readonly cycleObserver?: (summary: PipelineRunSummary) => void | Promise<void>;
   buildExecutionRequest(candidate: LiquidationCandidate): SafeExecutionRequest | undefined;
+  buildExecutionRequestForOpportunity?(opportunity: Opportunity): SafeExecutionRequest | undefined;
 }
 
 export interface PipelineRunSummary {
@@ -149,8 +155,10 @@ export class PipelineOrchestrator {
       for (const chain of this.config.registry.listChains()) {
         await this.runChain(chain, summary);
       }
-      this.config.logger.info("pipeline_cycle_complete", summary);
-      return freezeSummary(summary);
+      const frozen = freezeSummary(summary);
+      this.config.logger.info("pipeline_cycle_complete", frozen);
+      await this.config.cycleObserver?.(frozen);
+      return frozen;
     } finally {
       this.config.metrics.recordLatency("poll_cycle", (Date.now() - startedAt) / 1_000);
     }
@@ -174,7 +182,9 @@ export class PipelineOrchestrator {
     const baseCandidates = degraded
       ? this.createFreshCandidates(chain)
       : createReserveAwareCandidates(this.config.detection.cache, chain);
-    const plans = await this.buildExecutionPlans(chain, baseCandidates, summary);
+    const baseOpportunities = baseCandidates.map((candidate) => fromLiquidationCandidate(candidate));
+    const extraOpportunities = await this.config.detection.collectExtraOpportunities?.(chain) ?? [];
+    const plans = await this.buildExecutionPlans(chain, [...baseOpportunities, ...extraOpportunities], summary);
     const rankedPlans = await this.rankPlans(chain, plans);
     summary.scanned += rankedPlans.length;
     this.config.metrics.recordPositionsScanned(rankedPlans.length);
@@ -197,23 +207,30 @@ export class PipelineOrchestrator {
 
   private async buildExecutionPlans(
     chain: SupportedChain,
-    candidates: readonly LiquidationCandidate[],
+    opportunities: readonly Opportunity[],
     summary: MutablePipelineRunSummary,
   ): Promise<PipelineExecutionPlan[]> {
     const plans: PipelineExecutionPlan[] = [];
-    for (const candidate of candidates) {
+    for (const opportunity of opportunities) {
       try {
-        const request = this.config.buildExecutionRequest(candidate);
+        const request = this.buildExecutionRequest(opportunity);
         if (request !== undefined) {
-          plans.push({ chain, candidate, request });
+          plans.push({
+            chain,
+            opportunity,
+            ...(opportunity.kind === "liquidation" ? { candidate: opportunity.candidate } : {}),
+            request,
+          });
         }
       } catch (error) {
         summary.failed += 1;
         this.config.metrics.recordError();
-        this.deadLetterCandidate(chain, candidate, "request_builder_exception");
+        this.deadLetterOpportunity(chain, opportunity, "request_builder_exception");
         this.config.logger.error("pipeline_request_builder_failed", {
           chain,
-          account: candidate.account,
+          opportunityId: opportunity.kind === "liquidation"
+            ? `${chain}:${opportunity.candidate.account}:${opportunity.candidate.debtAsset}`
+            : opportunity.candidate.opportunityId,
           error,
         });
       }
@@ -237,7 +254,7 @@ export class PipelineOrchestrator {
 
     try {
       const result = await this.config.executor.execute(request);
-      this.recordExecutionResult(request, result, summary);
+      this.recordExecutionResult(plan, request, result, summary);
       await this.recordLearningOutcome(plan, toLearningOutcome(result));
     } catch (error) {
       summary.failed += 1;
@@ -253,13 +270,18 @@ export class PipelineOrchestrator {
   }
 
   private recordExecutionResult(
+    plan: PipelineExecutionPlan,
     request: SafeExecutionRequest,
     result: SafeExecutionResult,
     summary: MutablePipelineRunSummary,
   ): void {
     if (result.status === "sent") {
       summary.sent += 1;
-      this.config.metrics.recordLiquidationExecuted();
+      if (plan.opportunity.kind === "arbitrage") {
+        this.config.metrics.recordArbitrageExecuted(1);
+      } else {
+        this.config.metrics.recordLiquidationExecuted();
+      }
       this.config.logger.info("pipeline_execution_sent", {
         chain: request.chain,
         opportunityId: request.opportunityId,
@@ -309,6 +331,24 @@ export class PipelineOrchestrator {
       chain,
       opportunityId: `${chain}:${candidate.account}:${candidate.debtAsset}`,
       account: candidate.account,
+      reason,
+    });
+  }
+
+  private deadLetterOpportunity(
+    chain: SupportedChain,
+    opportunity: Opportunity,
+    reason: string,
+  ): void {
+    if (opportunity.kind === "liquidation") {
+      this.deadLetterCandidate(chain, opportunity.candidate, reason);
+      return;
+    }
+    this.config.deadLetters.enqueue({
+      chain,
+      opportunityId: opportunity.candidate.opportunityId,
+      // SafeExecutionRequest requires an account. For arbitrage we use tokenIn as a deterministic identifier.
+      account: opportunity.candidate.tokenIn,
       reason,
     });
   }
@@ -368,7 +408,7 @@ export class PipelineOrchestrator {
       await this.config.outcomeObserver.recordOutcome({
         chain: plan.chain,
         opportunityId: plan.request.opportunityId,
-        features: opportunityFeatures(plan.candidate),
+        features: opportunityFeatures(plan.opportunity),
         expectedProfitBps: expectedProfitBps(plan.request.routeInput),
         outcome,
       });
@@ -381,12 +421,31 @@ export class PipelineOrchestrator {
       });
     }
   }
+
+  private buildExecutionRequest(opportunity: Opportunity): SafeExecutionRequest | undefined {
+    if (this.config.buildExecutionRequestForOpportunity !== undefined) {
+      return this.config.buildExecutionRequestForOpportunity(opportunity);
+    }
+    if (opportunity.kind === "liquidation") {
+      return this.config.buildExecutionRequest(opportunity.candidate);
+    }
+    return undefined;
+  }
 }
 
-function opportunityFeatures(candidate: LiquidationCandidate): string[] {
+function opportunityFeatures(opportunity: Opportunity): string[] {
+  if (opportunity.kind === "liquidation") {
+    return [
+      "type:liquidation",
+      `collateral:${opportunity.candidate.collateralAsset.toLowerCase()}`,
+      `debt:${opportunity.candidate.debtAsset.toLowerCase()}`,
+    ];
+  }
   return [
-    `collateral:${candidate.collateralAsset.toLowerCase()}`,
-    `debt:${candidate.debtAsset.toLowerCase()}`,
+    "type:arbitrage",
+    `buyDex:${opportunity.candidate.buyDex.name}`,
+    `sellDex:${opportunity.candidate.sellDex.name}`,
+    `pair:${opportunity.candidate.tokenIn.toLowerCase()}:${opportunity.candidate.tokenOut.toLowerCase()}`,
   ];
 }
 
