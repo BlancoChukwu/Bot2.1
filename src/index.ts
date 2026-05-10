@@ -79,7 +79,11 @@ export interface BotRunner {
 type Env = Record<string, string | undefined>;
 
 const runtimeEnvSchema = z.record(z.string(), z.string().optional());
-const minimumProfitMarginBps = 50;
+/** Live mode: Aave-style risk floor (0.5%). */
+const minimumProfitMarginBpsLive = 50;
+/** Simulation: lower floor so quotes / approvals are easier to observe (raise before live). */
+const minimumProfitMarginBpsSimulation = 40;
+const defaultProfitMarginBps = 50;
 const placeholderPrivateKey = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 export function parseRuntimeConfig(env: Env): RuntimeConfig {
@@ -98,6 +102,8 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     throw new Error("PRIVATE_KEY uses the placeholder private key and cannot run in live mode");
   }
 
+  const minProfitMarginFloorBps = simulationMode ? minimumProfitMarginBpsSimulation : minimumProfitMarginBpsLive;
+
   return {
     chain,
     chains,
@@ -115,8 +121,8 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     slippageBps: parseMinNumber(parsedEnv.SLIPPAGE_BPS, 50, 0, "SLIPPAGE_BPS"),
     minProfitMarginBps: parseMinNumber(
       parsedEnv.MIN_PROFIT_MARGIN_BPS,
-      minimumProfitMarginBps,
-      minimumProfitMarginBps,
+      defaultProfitMarginBps,
+      minProfitMarginFloorBps,
       "MIN_PROFIT_MARGIN_BPS",
     ),
     simulationMode,
@@ -325,7 +331,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     getDexesForChain,
     getMonitoredPairsForChain,
     defaultFlashLoanProvider: "aaveV3",
-    minProfitMarginBps: 120,
+    minProfitMarginBps: config.minProfitMarginBps,
     opportunitySink: arbQueue,
   });
   const orchestrator = new PipelineOrchestrator({
@@ -648,7 +654,7 @@ function runtimeConfigHash(
     minProfitUsd: env.MIN_PROFIT_USD ?? "10",
     gasCostUsd: env.GAS_COST_USD ?? "0",
     slippageBps: env.SLIPPAGE_BPS ?? "50",
-    minProfitMarginBps: env.MIN_PROFIT_MARGIN_BPS ?? "50",
+    minProfitMarginBps: env.MIN_PROFIT_MARGIN_BPS ?? String(defaultProfitMarginBps),
     simulationMode: env.SIMULATION_MODE ?? "true",
   };
   return JSON.stringify(safetyRelevantConfig);

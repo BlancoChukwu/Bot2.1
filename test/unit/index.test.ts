@@ -163,15 +163,39 @@ describe("parseRuntimeConfig", () => {
     ).toThrow(/placeholder private key/i);
   });
 
-  it("rejects a profit margin below 0.5 percent", () => {
+  it("rejects profit margin below live floor (50 bps)", () => {
     expect(() =>
       parseRuntimeConfig({
         RPC_URL: "https://optimism.example",
         AAVE_SUBGRAPH_URL: "https://subgraph.example",
         PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+        SIMULATION_MODE: "false",
         MIN_PROFIT_MARGIN_BPS: "49",
       }),
     ).toThrow(/MIN_PROFIT_MARGIN_BPS/);
+  });
+
+  it("rejects profit margin below simulation floor (40 bps)", () => {
+    expect(() =>
+      parseRuntimeConfig({
+        RPC_URL: "https://optimism.example",
+        AAVE_SUBGRAPH_URL: "https://subgraph.example",
+        PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+        SIMULATION_MODE: "true",
+        MIN_PROFIT_MARGIN_BPS: "39",
+      }),
+    ).toThrow(/MIN_PROFIT_MARGIN_BPS/);
+  });
+
+  it("allows 40 bps margin in simulation", () => {
+    const config = parseRuntimeConfig({
+      RPC_URL: "https://optimism.example",
+      AAVE_SUBGRAPH_URL: "https://subgraph.example",
+      PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+      SIMULATION_MODE: "true",
+      MIN_PROFIT_MARGIN_BPS: "40",
+    });
+    expect(config.minProfitMarginBps).toBe(40);
   });
 
   it("blocks live startup through the runtime deployment safety gate", () => {

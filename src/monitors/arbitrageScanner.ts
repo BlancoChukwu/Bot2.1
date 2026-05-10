@@ -311,6 +311,8 @@ export class ArbitrageScanner {
     tokenOut: Address,
     amountIn: bigint,
   ): Promise<bigint> {
+    let amountOut: bigint;
+    let quoteSource: "quoterV2" | "getAmountsOut";
     if (dex.quoterV2 !== undefined) {
       const quoted = await client.readContract({
         address: dex.quoterV2,
@@ -324,19 +326,32 @@ export class ArbitrageScanner {
           sqrtPriceLimitX96: 0n,
         }],
       }) as readonly [bigint, bigint, number, bigint];
-      return quoted[0];
+      amountOut = quoted[0];
+      quoteSource = "quoterV2";
+    } else {
+      const amounts = await client.readContract({
+        address: dex.router,
+        abi: ROUTER_ABI,
+        functionName: "getAmountsOut",
+        args: [amountIn, [tokenIn, tokenOut]],
+      }) as readonly bigint[];
+      const out = amounts[1];
+      if (out === undefined) {
+        throw new Error("Malformed getAmountsOut output");
+      }
+      amountOut = out;
+      quoteSource = "getAmountsOut";
     }
-    const amounts = await client.readContract({
-      address: dex.router,
-      abi: ROUTER_ABI,
-      functionName: "getAmountsOut",
-      args: [amountIn, [tokenIn, tokenOut]],
-    }) as readonly bigint[];
-    const out = amounts[1];
-    if (out === undefined) {
-      throw new Error("Malformed getAmountsOut output");
-    }
-    return out;
+    this.config.logger.info("arbitrage_quote_debug", {
+      dex: dex.name,
+      quoteSource,
+      tokenIn,
+      tokenOut,
+      amountIn: amountIn.toString(),
+      amountOut: amountOut.toString(),
+      ...(quoteSource === "quoterV2" ? { quoterPoolFee: dex.quoterPoolFee ?? 3_000 } : {}),
+    });
+    return amountOut;
   }
 
   private pruneDedupe(nowMs: number): void {

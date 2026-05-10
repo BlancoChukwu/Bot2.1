@@ -109,7 +109,7 @@ npm run build
 When `SIMULATION_MODE=false`, startup **fails** unless **all** of the following are satisfied:
 
 1. **At least one chain** is registered (`CHAIN` or `CHAINS`).
-2. `**MIN_PROFIT_MARGIN_BPS`** is **≥ 50** (0.5% — enforced in code and config).
+2. `**MIN_PROFIT_MARGIN_BPS`** is **≥ 50** (0.5% — enforced for **live** mode; simulation allows **≥ 40** for quote smoke tests).
 3. `**PAGERDUTY_ROUTING_KEY`** is set — so critical failures can alert operations (Events API v2 routing key from PagerDuty).
 4. **Dry-run validation receipt** — environment variables proving a **recent, successful** dry run **against the same config** the bot would use live:
   - `DRY_RUN_SUCCESS=true`
@@ -144,7 +144,7 @@ If live startup is **blocked**, logs show `deployment_safety_gate_blocked` with 
 | `MIN_PROFIT_USD`                          | No       | Minimum EV in USD before deeper work (default `10`).                                                                 |
 | `GAS_COST_USD`                            | No       | Conservative gas dollar estimate for EV (default `0`).                                                               |
 | `SLIPPAGE_BPS`                            | No       | Haircut in basis points (default `50`).                                                                              |
-| `MIN_PROFIT_MARGIN_BPS`                   | No       | Minimum margin; **cannot be below `50`** (0.5%).                                                                     |
+| `MIN_PROFIT_MARGIN_BPS`                   | No       | Minimum margin: **≥ 40** when `SIMULATION_MODE=true`, **≥ 50** when live (default `50`).                                                            |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | No       | Optional alerts for simulated/executed liquidations.                                                                 |
 | `LOG_LEVEL`                               | No       | `debug`, `info`, `warn`, `error` (default `info`).                                                                   |
 | `PAGERDUTY_ROUTING_KEY`                   | Live     | Required when `SIMULATION_MODE=false`.                                                                               |

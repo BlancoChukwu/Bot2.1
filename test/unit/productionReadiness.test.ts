@@ -46,6 +46,55 @@ describe("DeploymentSafetyGate", () => {
     }).status).toBe("allowed");
   });
 
+  it("allows simulation at 40 bps margin (quote smoke tuning)", () => {
+    const gate = new DeploymentSafetyGate();
+    expect(gate.evaluate({
+      simulationMode: true,
+      hasPagerDutyRoutingKey: false,
+      hasMetricsEndpoint: true,
+      registeredChains: ["optimism"],
+      minProfitMarginBps: 40,
+    }).status).toBe("allowed");
+  });
+
+  it("blocks simulation when margin is below 40 bps", () => {
+    const gate = new DeploymentSafetyGate();
+    const result = gate.evaluate({
+      simulationMode: true,
+      hasPagerDutyRoutingKey: false,
+      hasMetricsEndpoint: true,
+      registeredChains: ["optimism"],
+      minProfitMarginBps: 39,
+    });
+    expect(result.status).toBe("blocked");
+    if (result.status === "blocked") {
+      expect(result.reasons).toContain("MIN_PROFIT_MARGIN_BPS must be at least 40 in simulation mode");
+    }
+  });
+
+  it("blocks live mode when margin is below 50 bps", () => {
+    const gate = new DeploymentSafetyGate();
+    const result = gate.evaluate({
+      simulationMode: false,
+      hasPagerDutyRoutingKey: true,
+      hasMetricsEndpoint: true,
+      registeredChains: ["optimism"],
+      minProfitMarginBps: 45,
+      dryRunValidation: {
+        success: true,
+        validatedAtMs: Date.now(),
+        configHash: "cfg",
+        expectedConfigHash: "cfg",
+        chains: ["optimism"],
+        expectedChains: ["optimism"],
+      },
+    });
+    expect(result.status).toBe("blocked");
+    if (result.status === "blocked") {
+      expect(result.reasons).toContain("MIN_PROFIT_MARGIN_BPS must be at least 50 in live mode");
+    }
+  });
+
   it("blocks live mode when dry-run validation is stale or for the wrong config", () => {
     const gate = new DeploymentSafetyGate({ dryRunValidationTtlMs: 1_000 });
 

@@ -29,8 +29,11 @@ export class DeploymentSafetyGate {
     if (!input.hasMetricsEndpoint) {
       reasons.push("Metrics endpoint is required");
     }
-    if (input.minProfitMarginBps < 50) {
-      reasons.push("MIN_PROFIT_MARGIN_BPS must be at least 50");
+    if (!input.simulationMode && input.minProfitMarginBps < 50) {
+      reasons.push("MIN_PROFIT_MARGIN_BPS must be at least 50 in live mode");
+    }
+    if (input.simulationMode && input.minProfitMarginBps < 40) {
+      reasons.push("MIN_PROFIT_MARGIN_BPS must be at least 40 in simulation mode");
     }
     if (!input.simulationMode && !input.hasPagerDutyRoutingKey) {
       reasons.push("PAGERDUTY_ROUTING_KEY is required for live mode");
