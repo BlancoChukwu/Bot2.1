@@ -27,7 +27,7 @@ import { buildLiquidationExecutionRequest } from "./executors/liquidationExecuti
 import { LocalNonceManager } from "./executors/nonceManager";
 import { SafeTransactionExecutor } from "./executors/safeTransactionExecutor";
 import { ViemExecutionClient } from "./executors/viemExecutionClient";
-import { createDexesPerChainMap, createMonitoredPairsPerChainMap } from "./config/dexRegistry";
+import { getDexesForChain, getMonitoredPairsForChain } from "./config/dexRegistry";
 import { HealthFactorMonitor } from "./monitors/healthFactorMonitor";
 import { ArbitrageOpportunityQueue } from "./monitors/arbitrageOpportunityQueue";
 import { ArbitrageScanner } from "./monitors/arbitrageScanner";
@@ -49,7 +49,10 @@ export interface RuntimeConfig {
   readonly rpcUrl: string;
   readonly fallbackRpcUrls: readonly string[];
   readonly wsRpcUrl: string | undefined;
+  /** Resolved subgraph URL for `chain` (first entry in `chains`). */
   readonly aaveSubgraphUrl: string;
+  /** Resolved Aave V3 subgraph GraphQL URL for each configured chain (pipeline / per-chain RPC). */
+  readonly aaveSubgraphByChain: ReadonlyMap<SupportedChain, string>;
   readonly privateKey: Hex;
   readonly pollIntervalMs: number;
   readonly candidateCooldownMs: number;
@@ -84,7 +87,11 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
   const chains = parseSupportedChains(parsedEnv);
   const chain = firstSupportedChain(chains);
   const rpcUrl = requireEnv(parsedEnv, "RPC_URL");
-  const aaveSubgraphUrl = resolveAaveSubgraphUrl(parsedEnv, chain);
+  const aaveSubgraphByChain = new Map(
+    chains.map((c) => [c, resolveAaveSubgraphUrlForChain(parsedEnv, c)] as const),
+  );
+  const aaveSubgraphUrl = aaveSubgraphByChain.get(chain)!;
+  const subgraphFingerprint = buildAaveSubgraphFingerprint(chains, aaveSubgraphByChain);
   const privateKey = parsePrivateKey(requireEnv(parsedEnv, "PRIVATE_KEY"));
   const simulationMode = parseBoolean(parsedEnv.SIMULATION_MODE, true);
   if (!simulationMode && privateKey.toLowerCase() === placeholderPrivateKey) {
@@ -96,6 +103,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     chains,
     rpcUrl,
     aaveSubgraphUrl,
+    aaveSubgraphByChain,
     privateKey,
     fallbackRpcUrls: parseList(parsedEnv.FALLBACK_RPC_URLS),
     wsRpcUrl: optionalEnv(parsedEnv, "WS_RPC_URL"),
@@ -115,7 +123,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     telegramBotToken: optionalEnv(parsedEnv, "TELEGRAM_BOT_TOKEN"),
     telegramChatId: optionalEnv(parsedEnv, "TELEGRAM_CHAT_ID"),
     pagerDutyRoutingKey: optionalEnv(parsedEnv, "PAGERDUTY_ROUTING_KEY"),
-    dryRunValidation: parseDryRunValidation(parsedEnv, chains, privateKey, aaveSubgraphUrl),
+    dryRunValidation: parseDryRunValidation(parsedEnv, chains, privateKey, subgraphFingerprint),
     logLevel: parsedEnv.LOG_LEVEL ?? "info",
     usePipelineOrchestrator: parseBoolean(parsedEnv.USE_PIPELINE_ORCHESTRATOR, false),
     arbitrageReceiverAddress: parseAddress(optionalEnv(parsedEnv, "ARBITRAGE_RECEIVER_ADDRESS")),
@@ -246,12 +254,12 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   });
 
   const registry = createChainRegistry({
-    chains: config.chains.map((chain) => ({
-      chain,
+    chains: config.chains.map((chainName) => ({
+      chain: chainName,
       rpcUrl: config.rpcUrl,
       fallbackRpcUrls: config.fallbackRpcUrls,
       ...(config.wsRpcUrl === undefined ? {} : { wsRpcUrl: config.wsRpcUrl }),
-      aaveSubgraphUrl: config.aaveSubgraphUrl,
+      aaveSubgraphUrl: config.aaveSubgraphByChain.get(chainName)!,
       flashLoanProviders: ["aaveV3"],
     })),
   });
@@ -314,9 +322,10 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         rpcUrl: config.rpcUrl,
         fallbackRpcUrls: config.fallbackRpcUrls,
       }),
+    getDexesForChain,
+    getMonitoredPairsForChain,
     defaultFlashLoanProvider: "aaveV3",
-    monitoredPairs: createMonitoredPairsPerChainMap(config.chains),
-    dexesPerChain: createDexesPerChainMap(config.chains),
+    minProfitMarginBps: 120,
     opportunitySink: arbQueue,
   });
   const orchestrator = new PipelineOrchestrator({
@@ -448,21 +457,65 @@ function optionalEnv(env: Env, name: string): string | undefined {
   return value === undefined || value.length === 0 ? undefined : value;
 }
 
-function resolveAaveSubgraphUrl(env: Env, chain: SupportedChain): string {
-  const explicit = optionalEnv(env, "AAVE_SUBGRAPH_URL");
-  if (explicit !== undefined) {
-    return explicit;
+function resolveAaveSubgraphUrlForChain(env: Env, chain: SupportedChain): string {
+  const globalExplicit = optionalEnv(env, "AAVE_SUBGRAPH_URL");
+  let url: string;
+  if (globalExplicit !== undefined) {
+    url = globalExplicit;
+  } else {
+    const baseOnly = chain === "base" ? optionalEnv(env, "BASE_AAVE_SUBGRAPH_URL") : undefined;
+    if (baseOnly !== undefined) {
+      url = baseOnly;
+    } else {
+      const apiKey = optionalEnv(env, "THE_GRAPH_API_KEY");
+      if (apiKey !== undefined) {
+        const id = aaveV3TheGraphSubgraphIds[chain];
+        url = `https://gateway.thegraph.com/api/${apiKey}/subgraphs/id/${id}`;
+      } else {
+        throw new Error(
+          "Configure subgraph access: set AAVE_SUBGRAPH_URL, or THE_GRAPH_API_KEY, or (when using Base) BASE_AAVE_SUBGRAPH_URL. See README.",
+        );
+      }
+    }
   }
 
-  const apiKey = optionalEnv(env, "THE_GRAPH_API_KEY");
-  if (apiKey !== undefined) {
-    const id = aaveV3TheGraphSubgraphIds[chain];
-    return `https://gateway.thegraph.com/api/${apiKey}/subgraphs/id/${id}`;
+  assertSubgraphBorrowerDiscoveryUrl(url);
+  return url;
+}
+
+/** Stable string for dry-run hashing: single URL when one chain; sorted `chain:url` when several. */
+function buildAaveSubgraphFingerprint(
+  chains: readonly SupportedChain[],
+  byChain: ReadonlyMap<SupportedChain, string>,
+): string {
+  if (chains.length === 1) {
+    const only = chains[0];
+    if (only === undefined) {
+      throw new Error("At least one supported chain is required");
+    }
+    return byChain.get(only)!;
+  }
+  return [...chains]
+    .map((c) => `${c}:${byChain.get(c)!}`)
+    .sort()
+    .join("|");
+}
+
+/** The liquidator pages borrowers via subgraph-style `positions` / `users` queries; AaveKit’s API is user-scoped only. */
+function assertSubgraphBorrowerDiscoveryUrl(url: string): void {
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    throw new Error(`Aave subgraph URL is not valid: ${url}`);
   }
 
-  throw new Error(
-    "AAVE_SUBGRAPH_URL is required unless THE_GRAPH_API_KEY is set (free key: https://thegraph.com/docs/en/subgraphs/querying/managing-api-keys/)",
-  );
+  if (hostname === "api.v3.aave.com") {
+    throw new Error(
+      "Subgraph URL points to the AaveKit GraphQL API (api.v3.aave.com), which does not support subgraph-style borrower paging (`positions`). " +
+        "Use an Aave V3 indexing subgraph (AAVE_SUBGRAPH_URL, BASE_AAVE_SUBGRAPH_URL, or THE_GRAPH_API_KEY). See README.",
+    );
+  }
 }
 
 function parsePrivateKey(value: string): Hex {
@@ -547,7 +600,7 @@ function parseDryRunValidation(
   env: Env,
   chains: readonly SupportedChain[],
   privateKey: Hex,
-  aaveSubgraphUrl: string,
+  subgraphFingerprint: string,
 ): DryRunValidationReceipt | undefined {
   const configHash = optionalEnv(env, "DRY_RUN_CONFIG_HASH");
   const validatedAtMs = optionalEnv(env, "DRY_RUN_VALIDATED_AT_MS");
@@ -559,7 +612,7 @@ function parseDryRunValidation(
     success: parseBoolean(env.DRY_RUN_SUCCESS, false),
     validatedAtMs: Number(validatedAtMs),
     configHash,
-    expectedConfigHash: runtimeConfigHash(env, chains, privateKey, aaveSubgraphUrl),
+    expectedConfigHash: runtimeConfigHash(env, chains, privateKey, subgraphFingerprint),
     chains: parseDryRunChains(env.DRY_RUN_CHAINS, chains),
     expectedChains: chains,
   };
@@ -580,14 +633,14 @@ function runtimeConfigHash(
   env: Env,
   chains: readonly SupportedChain[],
   privateKey: Hex,
-  aaveSubgraphUrl: string,
+  subgraphFingerprint: string,
 ): string {
   const safetyRelevantConfig = {
     chains,
     rpcUrl: optionalEnv(env, "RPC_URL"),
     fallbackRpcUrls: parseList(env.FALLBACK_RPC_URLS),
     wsRpcUrl: optionalEnv(env, "WS_RPC_URL"),
-    aaveSubgraphUrl,
+    aaveSubgraphUrl: subgraphFingerprint,
     account: privateKeyToAccount(privateKey).address,
     pollIntervalMs: env.POLL_INTERVAL_MS ?? "400",
     candidateCooldownMs: env.CANDIDATE_COOLDOWN_MS ?? "30000",

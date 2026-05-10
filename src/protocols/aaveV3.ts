@@ -70,6 +70,16 @@ interface AaveGraphClient {
   request<T>(query: string, variables: Record<string, number>): Promise<T>;
 }
 
+/** Many hosted Aave V3 subgraphs expose `users` + `userReserves` instead of Messari-style `positions`. */
+const borrowerQueryModeByClient = new WeakMap<AaveGraphClient, "positions" | "users">();
+
+function isSubgraphMissingPositionsError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return error.message.includes("positions") && error.message.includes("no field");
+}
+
 export interface AavePositionScannerClient {
   readonly chain: ChainConfig;
   readonly publicClient: AaveReadClient;
@@ -341,7 +351,26 @@ async function fetchAllBorrowers(graphClient: AaveGraphClient, pageSize: number)
 }
 
 async function fetchBorrowerPage(graphClient: AaveGraphClient, pageSize: number, skip: number): Promise<BorrowerPage> {
-  return graphClient.request<BorrowerPage>(borrowerQuery, { first: pageSize, skip });
+  const variables = { first: pageSize, skip };
+  const mode = borrowerQueryModeByClient.get(graphClient);
+  if (mode === "users") {
+    return graphClient.request<BorrowerPage>(borrowerQueryUsers, variables);
+  }
+  if (mode === "positions") {
+    return graphClient.request<BorrowerPage>(borrowerQueryPositions, variables);
+  }
+
+  try {
+    const page = await graphClient.request<BorrowerPage>(borrowerQueryPositions, variables);
+    borrowerQueryModeByClient.set(graphClient, "positions");
+    return page;
+  } catch (error) {
+    if (!isSubgraphMissingPositionsError(error)) {
+      throw error;
+    }
+    borrowerQueryModeByClient.set(graphClient, "users");
+    return graphClient.request<BorrowerPage>(borrowerQueryUsers, variables);
+  }
 }
 
 function borrowerPageRowCount(page: BorrowerPage): number {
@@ -392,14 +421,28 @@ function firstReservePair(chain: ChainConfig): AaveReservePair {
   return pair;
 }
 
-const borrowerQuery = `
-  query AaveV3Borrowers($first: Int!, $skip: Int!) {
+const borrowerQueryPositions = `
+  query AaveV3BorrowersPositions($first: Int!, $skip: Int!) {
     positions(
       first: $first
       skip: $skip
       orderBy: id
       orderDirection: asc
       where: { side: BORROWER, balance_gt: 0 }
+    ) {
+      id
+    }
+  }
+`;
+
+const borrowerQueryUsers = `
+  query AaveV3BorrowersUsers($first: Int!, $skip: Int!) {
+    users(
+      first: $first
+      skip: $skip
+      orderBy: id
+      orderDirection: asc
+      where: { borrowedReservesCount_gt: 0 }
     ) {
       id
     }

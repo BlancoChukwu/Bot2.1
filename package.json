@@ -7,7 +7,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "dev": "ts-node src/index.ts",
-    "start": "node dist/index.js",
+    "start": "node dist/src/index.js",
     "start:sim": "ts-node src/index.ts",
     "start:live": "cross-env SIMULATION_MODE=false ts-node src/index.ts",
     "test": "vitest run",

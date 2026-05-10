@@ -140,6 +140,55 @@ describe("ViemAaveV3Protocol", () => {
     expect(positions[0]?.account).toBe("0x0000000000000000000000000000000000000001");
   });
 
+  it("falls back to legacy `users` paging when the subgraph has no `positions` field", async () => {
+    const chain = getChainConfig("optimism");
+    const readAccounts: string[] = [];
+    let callCount = 0;
+
+    const positions = await getLiquidatablePositions({
+      chain,
+      pageSize: 2,
+      graphClient: {
+        request: async <T>(query: string, variables: Record<string, number>): Promise<T> => {
+          callCount += 1;
+          if (query.includes("positions") && variables.skip === 0) {
+            throw new Error(
+              'Aave subgraph GraphQL errors: [{"message":"Type `Query` has no field `positions`"}]',
+            );
+          }
+          if (query.includes("users") && variables.skip === 0) {
+            return {
+              users: [{ id: "0x0000000000000000000000000000000000000001" }, { id: "0x0000000000000000000000000000000000000002" }],
+            } as T;
+          }
+          if (query.includes("users") && variables.skip === 2) {
+            return { users: [] } as T;
+          }
+          throw new Error(`unexpected query in test: ${query.slice(0, 40)}`);
+        },
+      },
+      publicClient: {
+        readContract: async ({ args }) => {
+          readAccounts.push(args[0]);
+          const isLiquidatable = args[0].endsWith("1");
+          return [
+            2_000n,
+            1_000n,
+            0n,
+            isLiquidatable ? 4_000n : 8_000n,
+            7_500n,
+            isLiquidatable ? 800_000_000_000_000_000n : 1_600_000_000_000_000_000n,
+          ] as const;
+        },
+      },
+    });
+
+    expect(callCount).toBeGreaterThanOrEqual(2);
+    expect(readAccounts).toHaveLength(2);
+    expect(positions).toHaveLength(1);
+    expect(positions[0]?.account).toBe("0x0000000000000000000000000000000000000001");
+  });
+
   it("derives borrower addresses from Messari position ids when account resolver is unavailable", async () => {
     const chain = getChainConfig("optimism");
     const readAccounts: string[] = [];

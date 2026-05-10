@@ -56,7 +56,12 @@ const baseWeth = "0x4200000000000000000000000000000000000006";
 
 const sharedAavePool = "0x794a61358d6845594f94dc1db02a252b5b4814ad";
 const sharedProvider = "0xa97684ead0e402dc232d5a977953df7ecbab3cdb";
-const uiPoolDataProvider = "0x86B0521f92a554057e54B93098BA2A6Aaa6514AB";
+const sharedUiPoolDataProvider = "0x86B0521f92a554057e54B93098BA2A6Aaa6514AB";
+
+/** Base mainnet — Aave V3 addresses from bgd-labs/aave-address-book `AaveV3Base`. */
+const baseAavePool = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5";
+const basePoolAddressesProvider = "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D";
+const baseUiPoolDataProvider = "0xb84A20e848baE3e13897934bB4e74E2225f4546B";
 
 export const chainConfigs: Record<SupportedChain, ChainConfig> = {
   optimism: {
@@ -66,7 +71,7 @@ export const chainConfigs: Record<SupportedChain, ChainConfig> = {
     aave: {
       pool: sharedAavePool,
       poolAddressesProvider: sharedProvider,
-      uiPoolDataProvider,
+      uiPoolDataProvider: sharedUiPoolDataProvider,
       reservePairs: [
         {
           collateralAsset: optimismWeth,
@@ -85,7 +90,7 @@ export const chainConfigs: Record<SupportedChain, ChainConfig> = {
     aave: {
       pool: sharedAavePool,
       poolAddressesProvider: sharedProvider,
-      uiPoolDataProvider,
+      uiPoolDataProvider: sharedUiPoolDataProvider,
       reservePairs: [
         {
           collateralAsset: arbitrumWeth,
@@ -102,9 +107,9 @@ export const chainConfigs: Record<SupportedChain, ChainConfig> = {
     chainId: 8453,
     blockExplorerUrl: "https://basescan.org",
     aave: {
-      pool: sharedAavePool,
-      poolAddressesProvider: sharedProvider,
-      uiPoolDataProvider,
+      pool: baseAavePool,
+      poolAddressesProvider: basePoolAddressesProvider,
+      uiPoolDataProvider: baseUiPoolDataProvider,
       reservePairs: [
         {
           collateralAsset: baseWeth,

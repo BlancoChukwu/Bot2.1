@@ -67,7 +67,7 @@ Copy-Item .env.example .env
 Edit `.env` and set at least:
 
 - `RPC_URL` — your primary HTTP RPC.
-- Either `AAVE_SUBGRAPH_URL` **or** `THE_GRAPH_API_KEY` (see comments in `.env.example`).
+- Either an Aave V3 **indexing subgraph** `AAVE_SUBGRAPH_URL`, or `THE_GRAPH_API_KEY`, or for Base-only setups `BASE_AAVE_SUBGRAPH_URL` (see `.env.example`). The hosted AaveKit URL `https://api.v3.aave.com/graphql` is **not** valid for subgraph settings.
 - `PRIVATE_KEY` — **only** a burner hot wallet (never the `.example` all-zeros key in production).
 
 ### 3. Run in simulation (safe default)
@@ -133,8 +133,9 @@ If live startup is **blocked**, logs show `deployment_safety_gate_blocked` with 
 | `RPC_URL`                                 | Yes      | Primary HTTP RPC.                                                                                                    |
 | `FALLBACK_RPC_URLS`                       | No       | Comma-separated backup RPCs.                                                                                         |
 | `WS_RPC_URL`                              | No       | WebSocket RPC for `ReserveDataUpdated` subscription (falls back to polling if omitted).                              |
-| `AAVE_SUBGRAPH_URL`                       | Yes†     | Full GraphQL URL for Aave V3 subgraph. †Not required if `THE_GRAPH_API_KEY` is set.                                  |
-| `THE_GRAPH_API_KEY`                       | No       | If set and subgraph URL empty, builds gateway URL using built-in subgraph id for `CHAIN`.                            |
+| `AAVE_SUBGRAPH_URL`                       | Conditional | Global subgraph URL for all configured chains. If unset, use `THE_GRAPH_API_KEY` and/or `BASE_AAVE_SUBGRAPH_URL` so every chain has a resolver (see README env section above). Not the AaveKit API (`api.v3.aave.com`). |
+| `BASE_AAVE_SUBGRAPH_URL`                  | No       | When `CHAIN` / `CHAINS` includes **Base** and `AAVE_SUBGRAPH_URL` is unset, use this full gateway URL for Base (other chains still use `THE_GRAPH_API_KEY` if set). |
+| `THE_GRAPH_API_KEY`                       | No       | If set and per-chain subgraph URLs are not fully specified, builds gateway URLs from built-in subgraph ids.          |
 | `PRIVATE_KEY`                             | Yes      | `0x` + 64 hex chars. **Placeholder key is rejected in live mode.**                                                   |
 | `SIMULATION_MODE`                         | No       | `true` / `false` (default `true`).                                                                                   |
 | `POLL_INTERVAL_MS`                        | No       | **Must be exactly `400`** if set (validator enforces).                                                               |
@@ -213,7 +214,10 @@ npm run build
 
 ## Troubleshooting (beginners)
 
-- **“AAVE_SUBGRAPH_URL is required unless THE_GRAPH_API_KEY…”** — Provide a full subgraph URL or a Graph API key.
+- **“Configure subgraph access…”** — Set `AAVE_SUBGRAPH_URL`, or `THE_GRAPH_API_KEY`, or for Base `BASE_AAVE_SUBGRAPH_URL` (or a combination that covers each chain in `CHAINS`).
+- **Startup error mentioning `api.v3.aave.com` or `positions`** — `https://api.v3.aave.com/graphql` is the [AaveKit GraphQL](https://aave.com/docs/aave-v3/getting-started/graphql) product API (markets, `userBorrows`, etc.), not an indexer subgraph. Point `AAVE_SUBGRAPH_URL` at your chain’s Aave V3 subgraph (or use `THE_GRAPH_API_KEY`).
+- **`auth error: API key not found` while using `BASE_AAVE_SUBGRAPH_URL`** — `AAVE_SUBGRAPH_URL` wins over `BASE_AAVE_SUBGRAPH_URL` when set (including a **machine-wide** or CI environment variable). Unset the global URL so Base uses your gateway URL, or put the same key in `AAVE_SUBGRAPH_URL`.
+- **`THE_GRAPH_API_KEY`** must be **only** the gateway API key string (e.g. `cd30ae42…`), not a full `https://gateway.thegraph.com/api/...` URL. If you already use a full subgraph URL, set `AAVE_SUBGRAPH_URL` or `BASE_AAVE_SUBGRAPH_URL` to that URL and remove the mistaken `THE_GRAPH_API_KEY` value.
 - `**deployment_safety_gate_blocked`** — You are in live mode without PagerDuty, dry-run receipt, margin, or chain registration. Read the `reasons` in the log.
 - `**PRIVATE_KEY uses the placeholder…`** — Replace the sample key in `.env` for live mode.
 - `**POLL_INTERVAL_MS must be exactly 400`** — Remove the variable to use default or set it to `400` only.
