@@ -13,6 +13,15 @@ export interface DexEntry {
 export const DEX_REGISTRY: Record<SupportedChain, readonly DexEntry[]> = {
   base: [
     {
+      name: "PancakeSmartRouter",
+      // Base PancakeSwap Smart Router
+      router: "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86",
+      // Base QuoterV2 (shared interface with Uniswap V3 path in scanner)
+      quoter: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
+      type: "pancake-v3",
+      feeTiers: [100, 500, 3_000, 10_000],
+    },
+    {
       name: "UniswapV3",
       router: "0x2626664c2603336E57B271c5C0b26F421741e481",
       // Base Uniswap V3 QuoterV2
@@ -43,7 +52,8 @@ const BASE_PAIRS: readonly TokenPairConfig[] = [
     decimalsOut: 6,
   },
   {
-    tokenIn: "0xcbB7C0000aB88B473b1f5aFe3b2b1C9A6D9a4fA0",
+    // Base cbBTC (Coinbase wrapped BTC)
+    tokenIn: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
     tokenOut: "0x4200000000000000000000000000000000000006",
     symbolIn: "cbBTC",
     symbolOut: "WETH",

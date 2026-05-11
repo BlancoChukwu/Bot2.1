@@ -1,9 +1,18 @@
-import { parseUnits, type Address } from "viem";
+import { encodeFunctionData, parseUnits, type Address } from "viem";
 import type { BotMetrics, LoggerLike } from "../bot";
 import type { ChainRegistry, FlashLoanProviderId } from "../config/chainRegistry";
 import type { SupportedChain } from "../config/chains";
+import { aavePoolAbi } from "../protocols/aaveV3";
+import { encodeArbitrageRoute } from "../protocols/arbitrageFlashLoanReceiver";
 import type { Asset, AssetAmount } from "../utils/typedAssetMath";
 import { createAssetAmount } from "../utils/typedAssetMath";
+import {
+  AAVE_V3_BASE_FLASH_FEE_BPS,
+  calculateFlashLoanArbitrageEV,
+  MIN_PROFIT_THRESHOLD_BNB,
+  MIN_PROFIT_THRESHOLD_WEI,
+  simulateFullFlashLoanArbPath,
+} from "../utils/evCalculator";
 import {
   ProfitabilityEngine,
   type ProfitSimulationInput,
@@ -73,6 +82,7 @@ export interface ArbitrageOpportunity {
   readonly tokenIn: Address;
   readonly tokenOut: Address;
   readonly amountIn: bigint;
+  readonly expectedIntermediateOut: bigint;
   readonly expectedAmountOut: bigint;
   readonly expectedRevenue: AssetAmount;
   readonly estimatedGas: AssetAmount;
@@ -90,6 +100,13 @@ export interface ArbitrageOpportunitySink {
 
 interface ReadOnlyClient {
   readContract(args: Record<string, unknown>): Promise<unknown>;
+  getGasPrice(): Promise<bigint>;
+  call(args: Record<string, unknown>): Promise<unknown>;
+  estimateGas?(args: Record<string, unknown>): Promise<bigint>;
+}
+
+interface DebugCapableLogger extends LoggerLike {
+  debug?(message: string, meta?: unknown): void;
 }
 
 export interface ArbitrageScannerConfig {
@@ -107,6 +124,14 @@ export interface ArbitrageScannerConfig {
   readonly dedupeWindowMs?: number;
   readonly defaultFlashLoanProvider: FlashLoanProviderId;
   readonly opportunitySink?: ArbitrageOpportunitySink;
+  readonly flashLoanReceiverAddress?: Address;
+  readonly operatorAddress?: Address;
+  readonly baseStableProbeSizes?: readonly bigint[];
+  readonly baseStableExpandedProbeSize?: bigint;
+  readonly flashLoanGasEstimate?: bigint;
+  readonly flashFeeBps?: number;
+  readonly baseMinProfitThreshold?: bigint;
+  readonly arbitrageSlippageBps?: number;
 }
 
 export class ArbitrageScanner {
@@ -116,6 +141,12 @@ export class ArbitrageScanner {
     readonly stablePairProbeSize: bigint;
     readonly volatilePairProbeSize: bigint;
     readonly dedupeWindowMs: number;
+    readonly baseStableProbeSizes: readonly bigint[];
+    readonly baseStableExpandedProbeSize: bigint;
+    readonly flashLoanGasEstimate: bigint;
+    readonly flashFeeBps: number;
+    readonly baseMinProfitThreshold: bigint;
+    readonly arbitrageSlippageBps: number;
   };
   private readonly activePolls = new Map<SupportedChain, NodeJS.Timeout>();
   private readonly dedupe = new Map<string, number>();
@@ -128,6 +159,12 @@ export class ArbitrageScanner {
       stablePairProbeSize: config.stablePairProbeSize ?? 50_000n,
       volatilePairProbeSize: config.volatilePairProbeSize ?? 10n,
       dedupeWindowMs: config.dedupeWindowMs ?? 60_000,
+      baseStableProbeSizes: config.baseStableProbeSizes ?? [10_000n, 25_000n, 50_000n],
+      baseStableExpandedProbeSize: config.baseStableExpandedProbeSize ?? 500_000n,
+      flashLoanGasEstimate: config.flashLoanGasEstimate ?? 500_000n,
+      flashFeeBps: config.flashFeeBps ?? AAVE_V3_BASE_FLASH_FEE_BPS,
+      baseMinProfitThreshold: config.baseMinProfitThreshold ?? MIN_PROFIT_THRESHOLD_BNB,
+      arbitrageSlippageBps: config.arbitrageSlippageBps ?? 100,
       ...config,
     };
   }
@@ -177,12 +214,44 @@ export class ArbitrageScanner {
     const client = this.config.publicClientFactory(chain);
     const dexes = this.config.getDexesForChain(chain);
     const pairs = this.config.getMonitoredPairsForChain(chain);
-    if (dexes.length < 2 || pairs.length === 0) {
+    this.logDebug("arbitrage_poll_start", {
+      chain,
+      dexCount: dexes.length,
+      pairCount: pairs.length,
+    });
+    // TODO: Restore original < 2 once PancakeSmartRouter has proper QuoterV2 path
+    // (single-DEX is fine for now to unblock Base simulation)
+    if (dexes.length < 1 || pairs.length === 0) {
+      this.logDebug("arbitrage_poll_skipped", {
+        reason: "insufficient_dexes_or_pairs",
+        dexCount: dexes.length,
+      });
       return;
     }
 
     let scanned = 0;
     let approvedCount = 0;
+    const gasPrice = await this.resolveGasPrice(client);
+    if (dexes.length === 1) {
+      const onlyDex = dexes[0];
+      if (onlyDex === undefined) {
+        return;
+      }
+      for (const pair of pairs) {
+        scanned += 1;
+        const attempt = await this.checkSingleDirection(client, chain, buySell(onlyDex), pair, gasPrice);
+        if (attempt !== null && (await this.evaluateOpportunity(attempt)).status === "approved") {
+          approvedCount += 1;
+        }
+      }
+      this.config.metrics.recordLatency("scan", (Date.now() - startedAt) / 1_000, { chain });
+      this.config.metrics.recordArbitrageOpportunityScanned(scanned);
+      if (approvedCount > 0) {
+        this.config.metrics.recordArbitrageApproved(approvedCount);
+        this.config.logger.info("arbitrage_profitable_opportunities_found", { chain, scanned, approved: approvedCount });
+      }
+      return;
+    }
     for (const pair of pairs) {
       for (let i = 0; i < dexes.length; i++) {
         for (let j = i + 1; j < dexes.length; j++) {
@@ -193,12 +262,12 @@ export class ArbitrageScanner {
           }
           scanned += 2;
 
-          const first = await this.checkSingleDirection(client, chain, buyDex, sellDex, pair);
+          const first = await this.checkSingleDirection(client, chain, buySell(buyDex, sellDex), pair, gasPrice);
           if (first !== null && (await this.evaluateOpportunity(first)).status === "approved") {
             approvedCount += 1;
           }
 
-          const second = await this.checkSingleDirection(client, chain, sellDex, buyDex, pair);
+          const second = await this.checkSingleDirection(client, chain, buySell(sellDex, buyDex), pair, gasPrice);
           if (second !== null && (await this.evaluateOpportunity(second)).status === "approved") {
             approvedCount += 1;
           }
@@ -214,53 +283,113 @@ export class ArbitrageScanner {
     }
   }
 
+  private logDebug(message: string, meta?: unknown): void {
+    const logger = this.config.logger as DebugCapableLogger;
+    if (typeof logger.debug === "function") {
+      logger.debug(message, meta);
+      return;
+    }
+    this.config.logger.info(message, meta);
+  }
+
   private async checkSingleDirection(
     client: ReadOnlyClient,
     chain: SupportedChain,
-    buyDex: DexConfig,
-    sellDex: DexConfig,
+    route: { readonly buyDex: DexConfig; readonly sellDex: DexConfig },
     pair: TokenPairConfig,
+    gasPrice: bigint,
   ): Promise<ArbitrageOpportunity | null> {
     try {
-      const amountIn = this.probeAmountIn(pair);
-      const intermediate = await this.quoteAmountOut(client, buyDex, pair.tokenIn, pair.tokenOut, amountIn);
-      const finalAmountOut = await this.quoteAmountOut(client, sellDex, pair.tokenOut, pair.tokenIn, intermediate);
-      if (finalAmountOut <= amountIn) {
-        return null;
+      let best: ArbitrageOpportunity | null = null;
+      for (const amountIn of this.probeAmountsIn(chain, pair, true)) {
+        const intermediate = await this.quoteAmountOut(client, route.buyDex, pair.tokenIn, pair.tokenOut, amountIn);
+        const finalAmountOut = await this.quoteAmountOut(client, route.sellDex, pair.tokenOut, pair.tokenIn, intermediate);
+        if (finalAmountOut <= amountIn) {
+          continue;
+        }
+
+        const simulation = await this.simulateCandidatePath(
+          client,
+          chain,
+          route.buyDex,
+          route.sellDex,
+          pair,
+          amountIn,
+          intermediate,
+          finalAmountOut,
+          gasPrice,
+        );
+        if (!simulation.success) {
+          continue;
+        }
+
+        const gasEstimate = simulation.gasUsed > 0n ? simulation.gasUsed : this.config.flashLoanGasEstimate;
+        const ev = calculateFlashLoanArbitrageEV({
+          amountIn,
+          amountOutFinal: finalAmountOut,
+          flashFeeBps: this.config.flashFeeBps,
+          gasEstimate,
+          gasPrice,
+          slippageBps: this.config.arbitrageSlippageBps,
+          minProfitThreshold: this.minProfitThresholdForPair(chain, pair),
+        });
+        this.logDebug("arbitrage_ev_debug", {
+          chain,
+          buyDex: route.buyDex.name,
+          sellDex: route.sellDex.name,
+          pair: `${pair.symbolIn}-${pair.symbolOut}`,
+          amountIn: amountIn.toString(),
+          rawProfitWei: ev.rawProfitWei.toString(),
+          flashFeeWei: ev.flashFeeWei.toString(),
+          gasCostWei: ev.gasCostWei.toString(),
+          slippageBufferWei: ev.slippageBufferWei.toString(),
+          gasEstimate: gasEstimate.toString(),
+          isProfitable: ev.isProfitable,
+        });
+        if (!ev.isProfitable) {
+          continue;
+        }
+
+        const signature = `${chain}:${route.buyDex.name}:${route.sellDex.name}:${pair.symbolIn}-${pair.symbolOut}:${amountIn.toString()}`;
+        const now = Date.now();
+        this.pruneDedupe(now);
+        if (this.dedupe.has(signature)) {
+          continue;
+        }
+        this.dedupe.set(signature, now);
+
+        const revenueRaw = finalAmountOut - amountIn;
+        const candidate: ArbitrageOpportunity = {
+          chain,
+          opportunityId: `arb:${signature}:${now}`,
+          buyDex: route.buyDex,
+          sellDex: route.sellDex,
+          tokenIn: pair.tokenIn,
+          tokenOut: pair.tokenOut,
+          amountIn,
+          expectedIntermediateOut: intermediate,
+          expectedAmountOut: finalAmountOut,
+          expectedRevenue: tokenAmount(pair, revenueRaw),
+          estimatedGas: createAssetAmount(this.usdAsset, gasEstimate),
+          flashLoanFee: tokenAmount(pair, (amountIn * BigInt(this.config.flashFeeBps)) / 10_000n),
+          slippageBuffer: tokenAmount(pair, (revenueRaw * BigInt(this.config.arbitrageSlippageBps)) / 10_000n),
+          safetyBuffer: tokenAmount(pair, (revenueRaw * 50n) / 10_000n),
+          capitalAtRisk: tokenAmount(pair, amountIn),
+          provider: this.config.defaultFlashLoanProvider,
+          minimumMarginBps: this.config.minProfitMarginBps,
+        };
+
+        if (best === null || candidate.expectedRevenue.raw > best.expectedRevenue.raw) {
+          best = candidate;
+        }
       }
 
-      const signature = `${chain}:${buyDex.name}:${sellDex.name}:${pair.symbolIn}-${pair.symbolOut}:${amountIn.toString()}`;
-      const now = Date.now();
-      this.pruneDedupe(now);
-      if (this.dedupe.has(signature)) {
-        return null;
-      }
-      this.dedupe.set(signature, now);
-
-      const revenueRaw = finalAmountOut - amountIn;
-      return {
-        chain,
-        opportunityId: `arb:${signature}:${now}`,
-        buyDex,
-        sellDex,
-        tokenIn: pair.tokenIn,
-        tokenOut: pair.tokenOut,
-        amountIn,
-        expectedAmountOut: finalAmountOut,
-        expectedRevenue: tokenAmount(pair, revenueRaw),
-        estimatedGas: createAssetAmount(this.usdAsset, 25_000_000n),
-        flashLoanFee: tokenAmount(pair, (amountIn * 9n) / 10_000n),
-        slippageBuffer: tokenAmount(pair, (revenueRaw * 150n) / 10_000n),
-        safetyBuffer: tokenAmount(pair, (revenueRaw * 50n) / 10_000n),
-        capitalAtRisk: tokenAmount(pair, amountIn),
-        provider: this.config.defaultFlashLoanProvider,
-        minimumMarginBps: this.config.minProfitMarginBps,
-      };
+      return best;
     } catch (error) {
       this.config.logger.info("arbitrage_quote_failed", {
         chain,
-        buyDex: buyDex.name,
-        sellDex: sellDex.name,
+        buyDex: route.buyDex.name,
+        sellDex: route.sellDex.name,
         error: String(error),
       });
       return null;
@@ -302,6 +431,103 @@ export class ArbitrageScanner {
     const stablePair = pair.symbolIn.startsWith("US") && pair.symbolOut.startsWith("US");
     const units = stablePair ? this.config.stablePairProbeSize : this.config.volatilePairProbeSize;
     return parseUnits(units.toString(), pair.decimalsIn);
+  }
+
+  private probeAmountsIn(
+    chain: SupportedChain,
+    pair: TokenPairConfig,
+    includeExpandedProbe: boolean,
+  ): readonly bigint[] {
+    const stablePair = pair.symbolIn.startsWith("US") && pair.symbolOut.startsWith("US");
+    if (!stablePair) {
+      const base = this.probeAmountIn(pair);
+      return [base, base * 2n, base * 3n, base * 5n];
+    }
+    if (chain !== "base") {
+      return [this.probeAmountIn(pair)];
+    }
+
+    const sizes = this.config.baseStableProbeSizes.map((size) => parseUnits(size.toString(), pair.decimalsIn));
+    if (!includeExpandedProbe) {
+      return sizes;
+    }
+    return [...sizes, parseUnits(this.config.baseStableExpandedProbeSize.toString(), pair.decimalsIn)];
+  }
+
+  private minProfitThresholdForPair(chain: SupportedChain, pair: TokenPairConfig): bigint {
+    if (chain !== "base") {
+      return MIN_PROFIT_THRESHOLD_WEI;
+    }
+    if (pair.decimalsIn === 18) {
+      return this.config.baseMinProfitThreshold;
+    }
+    if (pair.decimalsIn > 18) {
+      return this.config.baseMinProfitThreshold * (10n ** BigInt(pair.decimalsIn - 18));
+    }
+    return this.config.baseMinProfitThreshold / (10n ** BigInt(18 - pair.decimalsIn));
+  }
+
+  private async resolveGasPrice(client: ReadOnlyClient): Promise<bigint> {
+    try {
+      return await client.getGasPrice();
+    } catch {
+      return 1n;
+    }
+  }
+
+  private async simulateCandidatePath(
+    client: ReadOnlyClient,
+    chain: SupportedChain,
+    buyDex: DexConfig,
+    sellDex: DexConfig,
+    pair: TokenPairConfig,
+    amountIn: bigint,
+    intermediate: bigint,
+    finalAmountOut: bigint,
+    gasPrice: bigint,
+  ): Promise<{ readonly success: boolean; readonly gasUsed: bigint }> {
+    if (this.config.flashLoanReceiverAddress === undefined || this.config.operatorAddress === undefined) {
+      return { success: true, gasUsed: this.config.flashLoanGasEstimate };
+    }
+
+    const route = encodeArbitrageRoute({
+      buyRouter: buyDex.router,
+      sellRouter: sellDex.router,
+      tokenIn: pair.tokenIn,
+      tokenOut: pair.tokenOut,
+      amountIn,
+      minBuyOut: intermediate,
+      minSellOut: finalAmountOut,
+    });
+    const data = encodeFunctionData({
+      abi: aavePoolAbi,
+      functionName: "flashLoanSimple",
+      args: [
+        this.config.flashLoanReceiverAddress,
+        pair.tokenIn,
+        amountIn,
+        route,
+        0,
+      ],
+    });
+    const simulation = await simulateFullFlashLoanArbPath(client, {
+      to: aavePoolAddress(chain),
+      data,
+      from: this.config.operatorAddress,
+      gasPrice,
+    });
+    if (!simulation.success) {
+      this.config.logger.info("arbitrage_path_simulation_failed", {
+        chain,
+        buyDex: buyDex.name,
+        sellDex: sellDex.name,
+        pair: `${pair.symbolIn}-${pair.symbolOut}`,
+        amountIn: amountIn.toString(),
+        error: simulation.error,
+      });
+      return { success: false, gasUsed: 0n };
+    }
+    return { success: true, gasUsed: simulation.gasUsed };
   }
 
   private async quoteAmountOut(
@@ -366,4 +592,18 @@ export class ArbitrageScanner {
 
 function tokenAmount(pair: TokenPairConfig, raw: bigint): AssetAmount {
   return createAssetAmount({ symbol: pair.symbolIn, decimals: pair.decimalsIn }, raw);
+}
+
+function buySell(
+  buyDex: DexConfig,
+  sellDex?: DexConfig,
+): { readonly buyDex: DexConfig; readonly sellDex: DexConfig } {
+  return {
+    buyDex,
+    sellDex: sellDex ?? buyDex,
+  };
+}
+
+function aavePoolAddress(_chain: SupportedChain): Address {
+  return "0x794a61358d6845594f94dc1db02a252b5b4814ad";
 }

@@ -333,6 +333,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     defaultFlashLoanProvider: "aaveV3",
     minProfitMarginBps: config.minProfitMarginBps,
     opportunitySink: arbQueue,
+    ...(config.arbitrageReceiverAddress === undefined
+      ? {}
+      : { flashLoanReceiverAddress: config.arbitrageReceiverAddress, operatorAddress: account.address }),
   });
   const orchestrator = new PipelineOrchestrator({
     registry,

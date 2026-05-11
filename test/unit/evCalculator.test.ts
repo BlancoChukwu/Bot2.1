@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  AAVE_V3_BASE_FLASH_FEE_BPS,
+  calculateFlashLoanArbitrageEV,
   calculateLiquidationEV,
   calculateLiquidationEv,
+  MIN_PROFIT_THRESHOLD_BNB,
   MIN_PROFIT_THRESHOLD_WEI,
+  simulateFullFlashLoanArbPath,
 } from "../../src/utils/evCalculator";
 
 describe("calculateLiquidationEv", () => {
@@ -68,5 +72,55 @@ describe("calculateLiquidationEv", () => {
         minProfitUsd: 10,
       }),
     ).toThrow(/repayValueUsd/);
+  });
+
+  it("calculates flash-loan arbitrage EV with fee, gas, and slippage buffers", () => {
+    const ev = calculateFlashLoanArbitrageEV({
+      amountIn: 1_000_000_000_000_000_000n,
+      amountOutFinal: 1_030_000_000_000_000_000n,
+      flashFeeBps: AAVE_V3_BASE_FLASH_FEE_BPS,
+      gasEstimate: 500_000n,
+      gasPrice: 1_000_000_000n,
+      slippageBps: 100,
+      minProfitThreshold: 1n,
+    });
+
+    expect(ev.flashFeeWei).toBe(500_000_000_000_000n);
+    expect(ev.gasCostWei).toBe(500_000_000_000_000n);
+    expect(ev.slippageBufferWei).toBe(10_300_000_000_000_000n);
+    expect(ev.isProfitable).toBe(true);
+    expect(MIN_PROFIT_THRESHOLD_BNB).toBe(150_000_000_000_000_000n);
+  });
+
+  it("returns unprofitable flash-loan EV when below threshold", () => {
+    const ev = calculateFlashLoanArbitrageEV({
+      amountIn: 1_000_000n,
+      amountOutFinal: 1_001_000n,
+      flashFeeBps: AAVE_V3_BASE_FLASH_FEE_BPS,
+      gasEstimate: 500_000n,
+      gasPrice: 1_000_000_000n,
+      minProfitThreshold: MIN_PROFIT_THRESHOLD_WEI,
+    });
+
+    expect(ev.isProfitable).toBe(false);
+    expect(ev.profitWei).toBe(0n);
+  });
+
+  it("simulates full flash-loan path and returns gas usage", async () => {
+    const result = await simulateFullFlashLoanArbPath(
+      {
+        call: async () => undefined,
+        estimateGas: async () => 444_000n,
+      },
+      {
+        from: "0x0000000000000000000000000000000000000001",
+        to: "0x0000000000000000000000000000000000000002",
+        data: "0x1234",
+        gasPrice: 1_000_000_000n,
+      },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.gasUsed).toBe(444_000n);
   });
 });

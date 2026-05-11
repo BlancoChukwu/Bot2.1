@@ -24,7 +24,7 @@ export function buildArbitrageExecutionRequest(
     tokenIn: opportunity.tokenIn,
     tokenOut: opportunity.tokenOut,
     amountIn: opportunity.amountIn,
-    minBuyOut: opportunity.expectedAmountOut,
+    minBuyOut: opportunity.expectedIntermediateOut,
     minSellOut: minAmountOut(opportunity.expectedAmountOut, opportunity.minimumMarginBps),
   });
   return {

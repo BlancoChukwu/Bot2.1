@@ -16,6 +16,7 @@ function opportunity(): ArbitrageOpportunity {
     tokenIn: "0x3333333333333333333333333333333333333333",
     tokenOut: "0x4444444444444444444444444444444444444444",
     amountIn: 1_000_000n,
+    expectedIntermediateOut: 1_100_000n,
     expectedAmountOut: 1_050_000n,
     expectedRevenue: createAssetAmount(usdc, 50_000n),
     estimatedGas: createAssetAmount(usd, 100_000n),
