@@ -38,11 +38,17 @@ import { FlashLoanProviderRouter } from "./profitability/flashLoanProviderRouter
 import { ProfitabilityEngine } from "./profitability/profitabilityEngine";
 import { MIN_PROFIT_THRESHOLD_WEI } from "./utils/evCalculator";
 import { createAsset, createAssetAmount } from "./utils/typedAssetMath";
+import { PriceOracleCache, type OracleFeedRegistry } from "./utils/priceOracleCache";
 import { sendDailyPnlSummary, sendLiquidationAlert } from "./utils/telegramAlert";
 import { DeploymentSafetyGate, type DeploymentGateResult, type DryRunValidationReceipt } from "./production/productionReadiness";
 import { PnlTracker } from "./production/pnlTracker";
 import type { Opportunity } from "./types/opportunity";
 
+/**
+ * Live arbitrage startup guards:
+ * 1) Feed coverage guard: required token feeds must exist in registry config.
+ * 2) Feed value guard: required token feeds must return positive, non-stale prices at startup.
+ */
 export interface RuntimeConfig {
   readonly chain: SupportedChain;
   readonly chains: readonly SupportedChain[];
@@ -70,6 +76,8 @@ export interface RuntimeConfig {
   readonly usePipelineOrchestrator: boolean;
   readonly arbitrageReceiverAddress: Address | undefined;
   readonly dailyPnlCsvPath: string | undefined;
+  readonly arbitrageMinProfitUsd: number;
+  readonly priceFeedRegistry: OracleFeedRegistry | undefined;
 }
 
 export interface BotRunner {
@@ -85,6 +93,12 @@ const minimumProfitMarginBpsLive = 50;
 const minimumProfitMarginBpsSimulation = 40;
 const defaultProfitMarginBps = 50;
 const placeholderPrivateKey = "0x0000000000000000000000000000000000000000000000000000000000000000";
+const canonicalBaseUsdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
+const canonicalBaseWeth = "0x4200000000000000000000000000000000000006" as Address;
+const canonicalBaseCbBtc = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
+const canonicalBaseUsdcUsdFeed = "0x7e860098F58bBFC8648a4311b374B1D669a2bc6B" as Address;
+const canonicalBaseEthUsdFeed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70" as Address;
+const canonicalBaseCbBtcUsdFeed = "0x07DA0E54543a844a80ABE69c8A12F22B3aA59f9D" as Address;
 
 export function parseRuntimeConfig(env: Env): RuntimeConfig {
   const parsedEnv = parseRuntimeEnv(env);
@@ -104,7 +118,9 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
 
   const minProfitMarginFloorBps = simulationMode ? minimumProfitMarginBpsSimulation : minimumProfitMarginBpsLive;
 
-  return {
+  const usePipelineOrchestrator = parseBoolean(parsedEnv.USE_PIPELINE_ORCHESTRATOR, false);
+  const priceFeedRegistry = parsePriceFeedRegistry(parsedEnv.PRICE_FEED_REGISTRY_JSON) ?? defaultPriceFeedRegistry();
+  const config: RuntimeConfig = {
     chain,
     chains,
     rpcUrl,
@@ -131,10 +147,14 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     pagerDutyRoutingKey: optionalEnv(parsedEnv, "PAGERDUTY_ROUTING_KEY"),
     dryRunValidation: parseDryRunValidation(parsedEnv, chains, privateKey, subgraphFingerprint),
     logLevel: parsedEnv.LOG_LEVEL ?? "info",
-    usePipelineOrchestrator: parseBoolean(parsedEnv.USE_PIPELINE_ORCHESTRATOR, false),
+    usePipelineOrchestrator,
     arbitrageReceiverAddress: parseAddress(optionalEnv(parsedEnv, "ARBITRAGE_RECEIVER_ADDRESS")),
     dailyPnlCsvPath: optionalEnv(parsedEnv, "DAILY_PNL_CSV_PATH"),
+    arbitrageMinProfitUsd: parseMinNumber(parsedEnv.ARBITRAGE_MIN_PROFIT_USD, 0.15, 0, "ARBITRAGE_MIN_PROFIT_USD"),
+    priceFeedRegistry,
   };
+  assertArbitragePriceFeedCoverage(config);
+  return config;
 }
 
 export function evaluateRuntimeDeploymentSafety(config: RuntimeConfig): DeploymentGateResult {
@@ -316,6 +336,14 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     simulator,
   });
   const pnlTracker = config.dailyPnlCsvPath === undefined ? undefined : new PnlTracker(config.dailyPnlCsvPath);
+  const priceOracleCache = config.priceFeedRegistry === undefined
+    ? undefined
+    : new PriceOracleCache({
+      publicClient,
+      chain: config.chain,
+      feedRegistry: config.priceFeedRegistry,
+      logger,
+    });
   let lastSummaryDay = "";
   const arbitrageScanner = new ArbitrageScanner({
     registry,
@@ -333,10 +361,17 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     defaultFlashLoanProvider: "aaveV3",
     minProfitMarginBps: config.minProfitMarginBps,
     opportunitySink: arbQueue,
+    ...(priceOracleCache === undefined ? {} : { exactUsdPriceCache: priceOracleCache }),
+    exactUsdMinProfitRaw: BigInt(Math.trunc(config.arbitrageMinProfitUsd * 1e8)),
     ...(config.arbitrageReceiverAddress === undefined
       ? {}
       : { flashLoanReceiverAddress: config.arbitrageReceiverAddress, operatorAddress: account.address }),
   });
+  const startupGuard = async () => {
+    if (priceOracleCache !== undefined) {
+      await assertArbitrageOracleReadiness(config, priceOracleCache);
+    }
+  };
   const orchestrator = new PipelineOrchestrator({
     registry,
     detection,
@@ -395,16 +430,20 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     },
   });
 
-  return new PipelineBotRunner(orchestrator, arbitrageScanner);
+  return new PipelineBotRunner(orchestrator, arbitrageScanner, startupGuard);
 }
 
 class PipelineBotRunner implements BotRunner {
   public constructor(
     private readonly orchestrator: PipelineOrchestrator,
     private readonly arbitrageScanner: ArbitrageScanner,
+    private readonly startupGuard?: () => Promise<void>,
   ) {}
 
   public async runPollingLoop(options: PollingLoopOptions): Promise<void> {
+    if (this.startupGuard !== undefined) {
+      await this.startupGuard();
+    }
     this.arbitrageScanner.start();
     try {
       await this.orchestrator.runLoop(options);
@@ -545,6 +584,134 @@ function parseAddress(value: string | undefined): Address | undefined {
   return value as Address;
 }
 
+function parsePriceFeedRegistry(value: string | undefined): OracleFeedRegistry | undefined {
+  if (value === undefined || value.trim() === "") {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (error) {
+    throw new Error(`PRICE_FEED_REGISTRY_JSON must be valid JSON: ${String(error)}`);
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("PRICE_FEED_REGISTRY_JSON must be an object");
+  }
+
+  const output: Record<SupportedChain, Partial<Record<Address, { feed: Address; priceDecimals?: number }>>> = {
+    optimism: {},
+    arbitrum: {},
+    base: {},
+  };
+  for (const chain of ["optimism", "arbitrum", "base"] as const) {
+    const chainValue = (parsed as Record<string, unknown>)[chain];
+    if (chainValue === undefined) {
+      continue;
+    }
+    if (typeof chainValue !== "object" || chainValue === null) {
+      throw new Error(`PRICE_FEED_REGISTRY_JSON.${chain} must be an object`);
+    }
+    for (const [token, config] of Object.entries(chainValue)) {
+      if (!/^0x[a-fA-F0-9]{40}$/.test(token)) {
+        throw new Error(`Invalid token address in PRICE_FEED_REGISTRY_JSON.${chain}: ${token}`);
+      }
+      if (typeof config !== "object" || config === null) {
+        throw new Error(`PRICE_FEED_REGISTRY_JSON.${chain}.${token} must be an object`);
+      }
+      const feed = (config as Record<string, unknown>).feed;
+      if (typeof feed !== "string" || !/^0x[a-fA-F0-9]{40}$/.test(feed)) {
+        throw new Error(`PRICE_FEED_REGISTRY_JSON.${chain}.${token}.feed must be a 20-byte hex address`);
+      }
+      const priceDecimals = (config as Record<string, unknown>).priceDecimals;
+      if (priceDecimals !== undefined && (!Number.isInteger(priceDecimals) || Number(priceDecimals) < 0)) {
+        throw new Error(`PRICE_FEED_REGISTRY_JSON.${chain}.${token}.priceDecimals must be a non-negative integer`);
+      }
+      output[chain][token as Address] = {
+        feed: feed as Address,
+        ...(priceDecimals === undefined ? {} : { priceDecimals: Number(priceDecimals) }),
+      };
+    }
+  }
+
+  return output;
+}
+
+function defaultPriceFeedRegistry(): OracleFeedRegistry {
+  return {
+    optimism: {},
+    arbitrum: {},
+    base: {
+      [canonicalBaseUsdc]: { feed: canonicalBaseUsdcUsdFeed, priceDecimals: 8 },
+      [canonicalBaseWeth]: { feed: canonicalBaseEthUsdFeed, priceDecimals: 8 },
+      [canonicalBaseCbBtc]: { feed: canonicalBaseCbBtcUsdFeed, priceDecimals: 8 },
+    },
+  };
+}
+
+function assertArbitragePriceFeedCoverage(config: RuntimeConfig): void {
+  if (config.simulationMode || !config.usePipelineOrchestrator) {
+    return;
+  }
+  const missing: string[] = [];
+  for (const chain of config.chains) {
+    const required = new Set<Address>();
+    for (const pair of getMonitoredPairsForChain(chain)) {
+      required.add(pair.tokenIn);
+    }
+    required.add(nativeGasTokenForChain(chain));
+    const chainFeeds = config.priceFeedRegistry?.[chain] ?? {};
+    for (const token of required) {
+      if (chainFeeds[token] === undefined) {
+        missing.push(`${chain}:${token}`);
+      }
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `Live arbitrage requires Chainlink feed coverage for tokenIn assets. Missing feeds: ${missing.join(", ")}`,
+    );
+  }
+}
+
+export async function assertArbitrageOracleReadiness(
+  config: RuntimeConfig,
+  priceOracleCache: Pick<PriceOracleCache, "batchGetUsdPrices">,
+): Promise<void> {
+  if (config.simulationMode || !config.usePipelineOrchestrator) {
+    return;
+  }
+
+  const failures: string[] = [];
+  for (const chain of config.chains) {
+    const required = new Set<Address>();
+    for (const pair of getMonitoredPairsForChain(chain)) {
+      required.add(pair.tokenIn);
+    }
+    required.add(nativeGasTokenForChain(chain));
+
+    const prices = await priceOracleCache.batchGetUsdPrices([...required]);
+    for (const token of required) {
+      const price = prices[token] ?? 0n;
+      if (price <= 0n) {
+        failures.push(`${chain}:${token}`);
+      }
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new Error(
+      `Live arbitrage startup rejected: missing/stale/non-positive oracle prices for ${failures.join(", ")}`,
+    );
+  }
+}
+
+function nativeGasTokenForChain(chain: SupportedChain): Address {
+  if (chain === "arbitrum") {
+    return "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
+  }
+  return "0x4200000000000000000000000000000000000006";
+}
+
 function parseList(value: string | undefined): string[] {
   return (value ?? "")
     .split(",")
@@ -655,9 +822,11 @@ function runtimeConfigHash(
     candidateCooldownMs: env.CANDIDATE_COOLDOWN_MS ?? "30000",
     minProfitThresholdEth: env.MIN_PROFIT_THRESHOLD_ETH ?? "0.01",
     minProfitUsd: env.MIN_PROFIT_USD ?? "10",
+    arbitrageMinProfitUsd: env.ARBITRAGE_MIN_PROFIT_USD ?? "0.15",
     gasCostUsd: env.GAS_COST_USD ?? "0",
     slippageBps: env.SLIPPAGE_BPS ?? "50",
     minProfitMarginBps: env.MIN_PROFIT_MARGIN_BPS ?? String(defaultProfitMarginBps),
+    priceFeedRegistryJson: env.PRICE_FEED_REGISTRY_JSON ?? "",
     simulationMode: env.SIMULATION_MODE ?? "true",
   };
   return JSON.stringify(safetyRelevantConfig);

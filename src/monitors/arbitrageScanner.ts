@@ -8,11 +8,13 @@ import type { Asset, AssetAmount } from "../utils/typedAssetMath";
 import { createAssetAmount } from "../utils/typedAssetMath";
 import {
   AAVE_V3_BASE_FLASH_FEE_BPS,
+  calculateExactUsdEV,
   calculateFlashLoanArbitrageEV,
   MIN_PROFIT_THRESHOLD_BNB,
   MIN_PROFIT_THRESHOLD_WEI,
   simulateFullFlashLoanArbPath,
 } from "../utils/evCalculator";
+import type { PriceOracleCache } from "../utils/priceOracleCache";
 import {
   ProfitabilityEngine,
   type ProfitSimulationInput,
@@ -132,6 +134,10 @@ export interface ArbitrageScannerConfig {
   readonly flashFeeBps?: number;
   readonly baseMinProfitThreshold?: bigint;
   readonly arbitrageSlippageBps?: number;
+  readonly exactUsdPriceCache?: Pick<PriceOracleCache, "batchGetUsdPrices">;
+  readonly nativeGasTokenByChain?: Readonly<Record<SupportedChain, Address>>;
+  readonly nativeGasTokenDecimalsByChain?: Readonly<Record<SupportedChain, number>>;
+  readonly exactUsdMinProfitRaw?: bigint;
 }
 
 export class ArbitrageScanner {
@@ -147,6 +153,9 @@ export class ArbitrageScanner {
     readonly flashFeeBps: number;
     readonly baseMinProfitThreshold: bigint;
     readonly arbitrageSlippageBps: number;
+    readonly nativeGasTokenByChain: Readonly<Record<SupportedChain, Address>>;
+    readonly nativeGasTokenDecimalsByChain: Readonly<Record<SupportedChain, number>>;
+    readonly exactUsdMinProfitRaw: bigint;
   };
   private readonly activePolls = new Map<SupportedChain, NodeJS.Timeout>();
   private readonly dedupe = new Map<string, number>();
@@ -165,6 +174,17 @@ export class ArbitrageScanner {
       flashFeeBps: config.flashFeeBps ?? AAVE_V3_BASE_FLASH_FEE_BPS,
       baseMinProfitThreshold: config.baseMinProfitThreshold ?? MIN_PROFIT_THRESHOLD_BNB,
       arbitrageSlippageBps: config.arbitrageSlippageBps ?? 100,
+      nativeGasTokenByChain: config.nativeGasTokenByChain ?? {
+        optimism: "0x4200000000000000000000000000000000000006",
+        arbitrum: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+        base: "0x4200000000000000000000000000000000000006",
+      },
+      nativeGasTokenDecimalsByChain: config.nativeGasTokenDecimalsByChain ?? {
+        optimism: 18,
+        arbitrum: 18,
+        base: 18,
+      },
+      exactUsdMinProfitRaw: config.exactUsdMinProfitRaw ?? 15_000_000n,
       ...config,
     };
   }
@@ -348,6 +368,38 @@ export class ArbitrageScanner {
         });
         if (!ev.isProfitable) {
           continue;
+        }
+        if (this.config.exactUsdPriceCache !== undefined) {
+          const exactUsd = await calculateExactUsdEV(
+            {
+              amountIn,
+              amountOutFinal: finalAmountOut,
+              flashFeeBps: this.config.flashFeeBps,
+              gasEstimate,
+              gasPrice,
+              slippageBps: this.config.arbitrageSlippageBps,
+              minProfitThreshold: this.minProfitThresholdForPair(chain, pair),
+              tokenIn: pair.tokenIn,
+              tokenInDecimals: pair.decimalsIn,
+              nativeGasToken: this.config.nativeGasTokenByChain[chain],
+              nativeGasTokenDecimals: this.config.nativeGasTokenDecimalsByChain[chain],
+              minProfitUsdRaw: this.config.exactUsdMinProfitRaw,
+            },
+            this.config.exactUsdPriceCache,
+          );
+          this.logDebug("arbitrage_exact_usd_ev_debug", {
+            chain,
+            pair: `${pair.symbolIn}-${pair.symbolOut}`,
+            amountIn: amountIn.toString(),
+            isPriceAvailable: exactUsd.isPriceAvailable,
+            revenueUsdRaw: exactUsd.revenueUsdRaw.toString(),
+            costUsdRaw: exactUsd.costUsdRaw.toString(),
+            netProfitUsdRaw: exactUsd.netProfitUsdRaw.toString(),
+            isProfitable: exactUsd.isProfitable,
+          });
+          if (exactUsd.isPriceAvailable && !exactUsd.isProfitable) {
+            continue;
+          }
         }
 
         const signature = `${chain}:${route.buyDex.name}:${route.sellDex.name}:${pair.symbolIn}-${pair.symbolOut}:${amountIn.toString()}`;

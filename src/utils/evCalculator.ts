@@ -1,3 +1,6 @@
+import type { Address } from "viem";
+import type { PriceOracleCache } from "./priceOracleCache";
+
 export interface LiquidationEvInput {
   readonly repayValueUsd: number;
   readonly liquidationBonusBps: number;
@@ -130,6 +133,77 @@ export function calculateFlashLoanArbitrageEV(input: FlashLoanArbitrageInput): F
   };
 }
 
+export interface ExactUsdEVInput extends FlashLoanArbitrageInput {
+  readonly tokenIn: Address;
+  readonly tokenInDecimals: number;
+  readonly nativeGasToken: Address;
+  readonly nativeGasTokenDecimals?: number;
+  readonly minProfitUsdRaw?: bigint;
+}
+
+export interface ExactUsdEV {
+  readonly netProfitUsdRaw: bigint;
+  readonly revenueUsdRaw: bigint;
+  readonly costUsdRaw: bigint;
+  readonly isPriceAvailable: boolean;
+  readonly isProfitable: boolean;
+}
+
+export async function calculateExactUsdEV(
+  input: ExactUsdEVInput,
+  priceCache: Pick<PriceOracleCache, "batchGetUsdPrices">,
+): Promise<ExactUsdEV> {
+  assertNonNegativeBigint("amountIn", input.amountIn);
+  assertNonNegativeBigint("amountOutFinal", input.amountOutFinal);
+  assertNonNegative("tokenInDecimals", input.tokenInDecimals);
+  if (!Number.isInteger(input.tokenInDecimals)) {
+    throw new Error("tokenInDecimals must be an integer");
+  }
+
+  const threshold = input.minProfitUsdRaw ?? 15_000_000n;
+  assertNonNegativeBigint("minProfitUsdRaw", threshold);
+  const nativeGasTokenDecimals = input.nativeGasTokenDecimals ?? 18;
+  assertNonNegative("nativeGasTokenDecimals", nativeGasTokenDecimals);
+  if (!Number.isInteger(nativeGasTokenDecimals)) {
+    throw new Error("nativeGasTokenDecimals must be an integer");
+  }
+
+  const prices = await priceCache.batchGetUsdPrices([input.tokenIn, input.nativeGasToken]);
+  const tokenInUsdPriceRaw = prices[input.tokenIn] ?? 0n;
+  const nativeGasUsdPriceRaw = prices[input.nativeGasToken] ?? 0n;
+  if (tokenInUsdPriceRaw <= 0n || nativeGasUsdPriceRaw <= 0n) {
+    return {
+      netProfitUsdRaw: 0n,
+      revenueUsdRaw: 0n,
+      costUsdRaw: 0n,
+      isPriceAvailable: false,
+      isProfitable: false,
+    };
+  }
+
+  const ev = calculateFlashLoanArbitrageEV(input);
+  const revenueUsdRaw = tokenAmountToUsdRaw(
+    input.amountOutFinal,
+    input.tokenInDecimals,
+    tokenInUsdPriceRaw,
+  );
+  const costTokenRaw = input.amountIn + ev.flashFeeWei + ev.slippageBufferWei;
+  const costUsdRaw = tokenAmountToUsdRaw(costTokenRaw, input.tokenInDecimals, tokenInUsdPriceRaw) + weiToUsdRaw(
+    ev.gasCostWei,
+    nativeGasUsdPriceRaw,
+    nativeGasTokenDecimals,
+  );
+
+  const netProfitUsdRaw = revenueUsdRaw - costUsdRaw;
+  return {
+    netProfitUsdRaw,
+    revenueUsdRaw,
+    costUsdRaw,
+    isPriceAvailable: true,
+    isProfitable: netProfitUsdRaw >= threshold,
+  };
+}
+
 export interface FullFlashLoanSimulationClient {
   call(args: Record<string, unknown>): Promise<unknown>;
   estimateGas?(args: Record<string, unknown>): Promise<bigint>;
@@ -201,4 +275,12 @@ function toErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function tokenAmountToUsdRaw(amountRaw: bigint, tokenDecimals: number, tokenUsdPriceRaw: bigint): bigint {
+  return (amountRaw * tokenUsdPriceRaw) / 10n ** BigInt(tokenDecimals);
+}
+
+function weiToUsdRaw(weiAmount: bigint, nativeUsdPriceRaw: bigint, nativeTokenDecimals: number): bigint {
+  return (weiAmount * nativeUsdPriceRaw) / 10n ** BigInt(nativeTokenDecimals);
 }

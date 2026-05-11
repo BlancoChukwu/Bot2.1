@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AAVE_V3_BASE_FLASH_FEE_BPS,
+  calculateExactUsdEV,
   calculateFlashLoanArbitrageEV,
   calculateLiquidationEV,
   calculateLiquidationEv,
@@ -122,5 +123,34 @@ describe("calculateLiquidationEv", () => {
 
     expect(result.success).toBe(true);
     expect(result.gasUsed).toBe(444_000n);
+  });
+
+  it("calculates exact USD EV using token price normalization", async () => {
+    const result = await calculateExactUsdEV(
+      {
+        tokenIn: "0x0000000000000000000000000000000000000001",
+        tokenInDecimals: 6,
+        nativeGasToken: "0x0000000000000000000000000000000000000002",
+        amountIn: 1_000_000_000n,
+        amountOutFinal: 1_008_000_000n,
+        flashFeeBps: 5,
+        gasEstimate: 500_000n,
+        gasPrice: 1_000_000_000n,
+        slippageBps: 50,
+        minProfitUsdRaw: 10_000n,
+      },
+      {
+        batchGetUsdPrices: async () => ({
+          "0x0000000000000000000000000000000000000001": 100_000_000n,
+          "0x0000000000000000000000000000000000000002": 200_000_000_000n,
+        }),
+      },
+    );
+
+    expect(result.revenueUsdRaw).toBe(100_800_000_000n);
+    expect(result.costUsdRaw).toBe(100_654_000_000n);
+    expect(result.netProfitUsdRaw).toBe(146_000_000n);
+    expect(result.isPriceAvailable).toBe(true);
+    expect(result.isProfitable).toBe(true);
   });
 });
