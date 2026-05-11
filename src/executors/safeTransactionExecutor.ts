@@ -295,6 +295,7 @@ export class SafeTransactionExecutor {
         riskBps: risk.riskBps,
         observedCompetitors: risk.observedCompetitors,
       });
+      this.config.metrics.recordBundleSubmission("private_bundle");
       return this.config.bundleRouter.send({
         route: "private_bundle",
         request,
@@ -304,6 +305,7 @@ export class SafeTransactionExecutor {
       }).catch((error) => this.handleBundleFailure(request, transaction, overrides, error));
     }
 
+    this.config.metrics.recordBundleSubmission("public_rpc");
     return this.config.client.send(transaction, overrides);
   }
 
@@ -324,6 +326,7 @@ export class SafeTransactionExecutor {
         chain: request.chain,
         opportunityId: request.opportunityId,
       });
+      this.config.metrics.recordBundleSubmission("public_rpc");
       return this.config.client.send(transaction, overrides);
     }
 

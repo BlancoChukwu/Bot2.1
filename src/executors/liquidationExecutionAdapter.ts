@@ -1,6 +1,7 @@
 import { encodeFunctionData, type Address } from "viem";
 import type { LiquidationCandidate } from "../protocols/aaveV3";
 import { aavePoolAbi } from "../protocols/aaveV3";
+import { encodeLiquidationRoute } from "../protocols/liquidationFlashLoanReceiver";
 import type { SafeExecutionRequest } from "./safeTransactionExecutor";
 import { createAssetAmount, type Asset } from "../utils/typedAssetMath";
 import { getChainConfig } from "../config/chains";
@@ -14,6 +15,8 @@ export interface LiquidationExecutionAdapterConfig {
   readonly gasCostUsd: number;
   readonly slippageBps: number;
   readonly minimumMarginBps: number;
+  readonly flashLoanReceiverAddress?: Address;
+  readonly flashLoanReferralCode?: number;
 }
 
 export function buildLiquidationExecutionRequest(
@@ -34,6 +37,7 @@ export function buildLiquidationExecutionRequest(
   const slippageBuffer = usdRaw((candidate.repayValueUsd * config.slippageBps) / 10_000);
   const safetyBuffer = usdRaw(config.minProfitUsd / 4);
   const pool = getChainConfig(chain).aave.pool;
+  const capitalAtRisk = config.flashLoanReceiverAddress === undefined ? debt : gas;
 
   return {
     chain,
@@ -49,22 +53,40 @@ export function buildLiquidationExecutionRequest(
       swapCost: usdRaw(0),
       slippageBuffer,
       safetyBuffer,
-      capitalAtRisk: debt,
+      capitalAtRisk,
       minimumMarginBps: config.minimumMarginBps,
     },
     buildTransaction: (route) => ({
       to: pool,
-      data: encodeFunctionData({
-        abi: aavePoolAbi,
-        functionName: "liquidationCall",
-        args: [
-          candidate.collateralAsset,
-          candidate.debtAsset,
-          candidate.account,
-          candidate.debtToCover,
-          false,
-        ],
-      }),
+      data: config.flashLoanReceiverAddress === undefined
+        ? encodeFunctionData({
+          abi: aavePoolAbi,
+          functionName: "liquidationCall",
+          args: [
+            candidate.collateralAsset,
+            candidate.debtAsset,
+            candidate.account,
+            candidate.debtToCover,
+            false,
+          ],
+        })
+        : encodeFunctionData({
+          abi: aavePoolAbi,
+          functionName: "flashLoanSimple",
+          args: [
+            config.flashLoanReceiverAddress,
+            candidate.debtAsset,
+            candidate.debtToCover,
+            encodeLiquidationRoute({
+              collateralAsset: candidate.collateralAsset,
+              debtAsset: candidate.debtAsset,
+              user: candidate.account,
+              debtToCover: candidate.debtToCover,
+              receiveAToken: false,
+            }),
+            config.flashLoanReferralCode ?? 0,
+          ],
+        }),
       provider: route.provider,
     }),
   };

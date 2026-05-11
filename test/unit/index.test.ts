@@ -108,6 +108,7 @@ describe("parseRuntimeConfig", () => {
         PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
         USE_PIPELINE_ORCHESTRATOR: "true",
         SIMULATION_MODE: "false",
+        LIQUIDATION_RECEIVER_ADDRESS: "0x00000000000000000000000000000000000000A1",
         PRICE_FEED_REGISTRY_JSON: JSON.stringify({
           base: {
             "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913": {
@@ -129,6 +130,7 @@ describe("parseRuntimeConfig", () => {
       PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
       USE_PIPELINE_ORCHESTRATOR: "true",
       SIMULATION_MODE: "false",
+      LIQUIDATION_RECEIVER_ADDRESS: "0x00000000000000000000000000000000000000A1",
     });
 
     await expect(assertArbitrageOracleReadiness(config, {
@@ -223,13 +225,24 @@ describe("parseRuntimeConfig", () => {
     ).toThrow(/api\.v3\.aave\.com/);
   });
 
-  it("rejects polling intervals other than exactly 400ms", () => {
+  it("allows polling intervals above the latency floor", () => {
+    const config = parseRuntimeConfig({
+      RPC_URL: "https://optimism.example",
+      AAVE_SUBGRAPH_URL: "https://subgraph.example",
+      PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+      POLL_INTERVAL_MS: "401",
+    });
+
+    expect(config.pollIntervalMs).toBe(401);
+  });
+
+  it("rejects polling intervals below the latency floor", () => {
     expect(() =>
       parseRuntimeConfig({
         RPC_URL: "https://optimism.example",
         AAVE_SUBGRAPH_URL: "https://subgraph.example",
         PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
-        POLL_INTERVAL_MS: "401",
+        POLL_INTERVAL_MS: "99",
       }),
     ).toThrow(/POLL_INTERVAL_MS/);
   });
@@ -243,6 +256,19 @@ describe("parseRuntimeConfig", () => {
         SIMULATION_MODE: "false",
       }),
     ).toThrow(/placeholder private key/i);
+  });
+
+  it("requires LIQUIDATION_RECEIVER_ADDRESS in live pipeline mode", () => {
+    expect(() =>
+      parseRuntimeConfig({
+        CHAIN: "optimism",
+        RPC_URL: "https://optimism.example",
+        AAVE_SUBGRAPH_URL: "https://subgraph.example",
+        PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+        USE_PIPELINE_ORCHESTRATOR: "true",
+        SIMULATION_MODE: "false",
+      }),
+    ).toThrow(/LIQUIDATION_RECEIVER_ADDRESS/);
   });
 
   it("rejects profit margin below live floor (50 bps)", () => {

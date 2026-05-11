@@ -43,8 +43,12 @@ export interface AaveScanStats {
 
 export interface AaveV3Protocol {
   getLiquidatablePositions(): Promise<LiquidationCandidate[]>;
+  getUserAccount?(account: Address): Promise<AaveUserAccount>;
+  getBestLiquidationPair?(
+    account: AaveUserAccount,
+  ): Promise<Omit<LiquidationCandidate, "account" | "healthFactor">>;
   getLastScanStats?(): AaveScanStats;
-  subscribeToReserveDataUpdated?(onEvent: () => void): Promise<() => void>;
+  subscribeToReserveDataUpdated?(onEvent: (reserve?: Address) => void): Promise<() => void>;
 }
 
 interface AaveReadClient {
@@ -61,7 +65,7 @@ interface AaveEventClient {
     readonly address: Address;
     readonly abi: typeof aavePoolAbi;
     readonly eventName: "ReserveDataUpdated";
-    readonly onLogs: () => void;
+    readonly onLogs: (logs: readonly unknown[]) => void;
     readonly onError?: (error: Error) => void;
   }): () => void;
 }
@@ -252,9 +256,9 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
   }
 
   public async getBestLiquidationPair(
-    _account: AaveUserAccount,
+    account: AaveUserAccount,
   ): Promise<Omit<LiquidationCandidate, "account" | "healthFactor">> {
-    const pair = firstReservePair(this.chain);
+    const pair = selectBestReservePairForAccount(this.chain, account);
     return {
       collateralAsset: pair.collateralAsset,
       debtAsset: pair.debtAsset,
@@ -289,7 +293,7 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
     return this.lastScanStats;
   }
 
-  public async subscribeToReserveDataUpdated(onEvent: () => void): Promise<() => void> {
+  public async subscribeToReserveDataUpdated(onEvent: (reserve?: Address) => void): Promise<() => void> {
     if (this.eventClient.watchContractEvent === undefined) {
       return () => undefined;
     }
@@ -298,7 +302,12 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
       address: this.chain.aave.pool,
       abi: aavePoolAbi,
       eventName: "ReserveDataUpdated",
-      onLogs: onEvent,
+      onLogs: (logs) => {
+        for (const log of logs) {
+          const reserve = (log as { readonly args?: { readonly reserve?: Address } }).args?.reserve;
+          onEvent(reserve);
+        }
+      },
     });
   }
 
@@ -419,6 +428,28 @@ function firstReservePair(chain: ChainConfig): AaveReservePair {
   }
 
   return pair;
+}
+
+function selectBestReservePairForAccount(chain: ChainConfig, account: AaveUserAccount): AaveReservePair {
+  const pairs = chain.aave.reservePairs;
+  const first = pairs[0];
+  if (first === undefined) {
+    throw new Error(`No Aave reserve pairs configured for ${chain.name}`);
+  }
+
+  const collateralHeavy = account.totalCollateralBase > account.totalDebtBase * 2n;
+  const sorted = [...pairs].sort((left, right) => {
+    const bonusDiff = right.liquidationBonusBps - left.liquidationBonusBps;
+    if (bonusDiff !== 0) {
+      return bonusDiff;
+    }
+    const repayDiff = right.repayValueUsd - left.repayValueUsd;
+    if (repayDiff !== 0) {
+      return repayDiff;
+    }
+    return 0;
+  });
+  return collateralHeavy ? sorted[0] ?? first : first;
 }
 
 const borrowerQueryPositions = `

@@ -31,8 +31,11 @@ import { getDexesForChain, getMonitoredPairsForChain } from "./config/dexRegistr
 import { HealthFactorMonitor } from "./monitors/healthFactorMonitor";
 import { ArbitrageOpportunityQueue } from "./monitors/arbitrageOpportunityQueue";
 import { ArbitrageScanner } from "./monitors/arbitrageScanner";
+import { AaveSnapshotProvider } from "./monitors/aaveSnapshotProvider";
+import { HybridDetectionPipeline } from "./monitors/hybridDetectionPipeline";
 import { PipelineDetectionAdapter } from "./orchestrator/pipelineDetectionAdapter";
 import { PipelineDeadLetterQueue, PipelineOrchestrator } from "./orchestrator/pipelineOrchestrator";
+import { BayesianHazardModel, NoRegretOpportunityRanker } from "./optimization/hazardPrediction";
 import { buildLiquidationCallParams, ViemAaveV3Protocol } from "./protocols/aaveV3";
 import { FlashLoanProviderRouter } from "./profitability/flashLoanProviderRouter";
 import { ProfitabilityEngine } from "./profitability/profitabilityEngine";
@@ -75,6 +78,7 @@ export interface RuntimeConfig {
   readonly logLevel: string;
   readonly usePipelineOrchestrator: boolean;
   readonly arbitrageReceiverAddress: Address | undefined;
+  readonly liquidationReceiverAddress: Address | undefined;
   readonly dailyPnlCsvPath: string | undefined;
   readonly arbitrageMinProfitUsd: number;
   readonly priceFeedRegistry: OracleFeedRegistry | undefined;
@@ -129,7 +133,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     privateKey,
     fallbackRpcUrls: parseList(parsedEnv.FALLBACK_RPC_URLS),
     wsRpcUrl: optionalEnv(parsedEnv, "WS_RPC_URL"),
-    pollIntervalMs: parseExactNumber(parsedEnv.POLL_INTERVAL_MS, 400, "POLL_INTERVAL_MS"),
+    pollIntervalMs: parseMinNumber(parsedEnv.POLL_INTERVAL_MS, 400, 100, "POLL_INTERVAL_MS"),
     candidateCooldownMs: parseMinNumber(parsedEnv.CANDIDATE_COOLDOWN_MS, 30_000, 0, "CANDIDATE_COOLDOWN_MS"),
     minProfitWei: parseEthThreshold(parsedEnv.MIN_PROFIT_THRESHOLD_ETH),
     minProfitUsd: parseMinNumber(parsedEnv.MIN_PROFIT_USD, 10, 0, "MIN_PROFIT_USD"),
@@ -149,10 +153,12 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     logLevel: parsedEnv.LOG_LEVEL ?? "info",
     usePipelineOrchestrator,
     arbitrageReceiverAddress: parseAddress(optionalEnv(parsedEnv, "ARBITRAGE_RECEIVER_ADDRESS")),
+    liquidationReceiverAddress: parseAddress(optionalEnv(parsedEnv, "LIQUIDATION_RECEIVER_ADDRESS")),
     dailyPnlCsvPath: optionalEnv(parsedEnv, "DAILY_PNL_CSV_PATH"),
     arbitrageMinProfitUsd: parseMinNumber(parsedEnv.ARBITRAGE_MIN_PROFIT_USD, 0.15, 0, "ARBITRAGE_MIN_PROFIT_USD"),
     priceFeedRegistry,
   };
+  assertPipelineFlashLiquidationReadiness(config);
   assertArbitragePriceFeedCoverage(config);
   return config;
 }
@@ -169,6 +175,9 @@ export function evaluateRuntimeDeploymentSafety(config: RuntimeConfig): Deployme
 }
 
 export function buildBot(config: RuntimeConfig, metrics: BotMetrics = createBotMetrics()): BotRunner {
+  if (!config.usePipelineOrchestrator && !config.simulationMode) {
+    throw new Error("Live mode requires USE_PIPELINE_ORCHESTRATOR=true to enforce flash-loan-first execution");
+  }
   if (config.usePipelineOrchestrator) {
     return buildPipelineBot(config, metrics);
   }
@@ -269,13 +278,52 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     createGraphClient(config.aaveSubgraphUrl),
     eventClient,
   );
+  const priceOracleCache = config.priceFeedRegistry === undefined
+    ? undefined
+    : new PriceOracleCache({
+      publicClient,
+      chain: config.chain,
+      feedRegistry: config.priceFeedRegistry,
+      logger,
+    });
+  const resolveDynamicGasCostUsd = async (): Promise<number> => {
+    if (priceOracleCache === undefined) {
+      return config.gasCostUsd;
+    }
+    const gasPrice = await publicClient.getGasPrice();
+    const nativeToken = nativeGasTokenForChain(config.chain);
+    const prices = await priceOracleCache.batchGetUsdPrices([nativeToken]);
+    const nativePriceRaw = prices[nativeToken] ?? 0n;
+    if (nativePriceRaw <= 0n) {
+      return config.gasCostUsd;
+    }
+    const gasCostWei = gasPrice * 500_000n;
+    const gasCostUsdRaw = (gasCostWei * nativePriceRaw) / 1_000_000_000_000_000_000n;
+    return Number(gasCostUsdRaw) / 1e8;
+  };
+  const resolveDynamicSlippageBps = async (): Promise<number> => {
+    const gasPrice = await publicClient.getGasPrice();
+    const gasGwei = Number(gasPrice) / 1e9;
+    if (!Number.isFinite(gasGwei)) {
+      return config.slippageBps;
+    }
+    if (gasGwei >= 10) {
+      return config.slippageBps + 120;
+    }
+    if (gasGwei >= 3) {
+      return config.slippageBps + 60;
+    }
+    return config.slippageBps;
+  };
   const monitor = new HealthFactorMonitor({
     protocol,
     pollIntervalMs: config.pollIntervalMs,
     candidateCooldownMs: config.candidateCooldownMs,
     minProfitUsd: config.minProfitUsd,
     gasCostUsd: config.gasCostUsd,
+    resolveDynamicGasCostUsd,
     slippageBps: config.slippageBps,
+    resolveDynamicSlippageBps,
     logger,
   });
 
@@ -324,9 +372,27 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     allowPublicFallbackAfterBundleFailure: true,
   });
   const arbQueue = new ArbitrageOpportunityQueue();
+  const hybridDetection = new HybridDetectionPipeline({
+    registry,
+    eventSource: {
+      start: async (handlers) => {
+        const stop = await protocol.subscribeToReserveDataUpdated?.((reserve) => {
+          if (reserve === undefined) {
+            return;
+          }
+          handlers.onReserveUpdated({ chain: config.chain, reserve });
+        });
+        return stop ?? (() => undefined);
+      },
+    },
+    provider: new AaveSnapshotProvider(config.chain, protocol),
+    logger,
+    metrics,
+  });
   const detection = new PipelineDetectionAdapter({
     chain: config.chain,
     monitor,
+    hybridDetection,
     arbitrageQueue: arbQueue,
   });
   const arbScannerEngine = new ProfitabilityEngine({
@@ -336,14 +402,6 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     simulator,
   });
   const pnlTracker = config.dailyPnlCsvPath === undefined ? undefined : new PnlTracker(config.dailyPnlCsvPath);
-  const priceOracleCache = config.priceFeedRegistry === undefined
-    ? undefined
-    : new PriceOracleCache({
-      publicClient,
-      chain: config.chain,
-      feedRegistry: config.priceFeedRegistry,
-      logger,
-    });
   let lastSummaryDay = "";
   const arbitrageScanner = new ArbitrageScanner({
     registry,
@@ -372,6 +430,8 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       await assertArbitrageOracleReadiness(config, priceOracleCache);
     }
   };
+  const hazardModel = new BayesianHazardModel();
+  const noRegretRanker = new NoRegretOpportunityRanker({ model: hazardModel });
   const orchestrator = new PipelineOrchestrator({
     registry,
     detection,
@@ -402,6 +462,27 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         });
       }
     },
+    opportunityRanker: {
+      rank: async (_chain, plans) => noRegretRanker.rank(
+        plans.map((plan) => ({
+          chain: plan.chain,
+          opportunityId: plan.request.opportunityId,
+          features: opportunityFeatures(plan.opportunity),
+          expectedProfitBps: estimateOpportunityProfitBps(plan.opportunity),
+          plan,
+        })),
+      ).map((entry) => entry.plan),
+    },
+    outcomeObserver: {
+      recordOutcome: async (outcome) => {
+        noRegretRanker.recordOutcome(outcome);
+        logger.info("no_regret_outcome_recorded", {
+          opportunityId: outcome.opportunityId,
+          outcome: outcome.outcome,
+          cumulativeRegret: noRegretRanker.cumulativeRegret(),
+        });
+      },
+    },
     buildExecutionRequest: (candidate) =>
       buildLiquidationExecutionRequest(config.chain, candidate, {
         account: account.address,
@@ -409,6 +490,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         gasCostUsd: config.gasCostUsd,
         slippageBps: config.slippageBps,
         minimumMarginBps: config.minProfitMarginBps,
+        ...(config.liquidationReceiverAddress === undefined ? {} : { flashLoanReceiverAddress: config.liquidationReceiverAddress }),
       }),
     buildExecutionRequestForOpportunity: (opportunity: Opportunity) => {
       if (opportunity.kind === "liquidation") {
@@ -418,6 +500,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
           gasCostUsd: config.gasCostUsd,
           slippageBps: config.slippageBps,
           minimumMarginBps: config.minProfitMarginBps,
+          ...(config.liquidationReceiverAddress === undefined ? {} : { flashLoanReceiverAddress: config.liquidationReceiverAddress }),
         });
       }
       if (config.arbitrageReceiverAddress === undefined) {
@@ -584,6 +667,36 @@ function parseAddress(value: string | undefined): Address | undefined {
   return value as Address;
 }
 
+function opportunityFeatures(opportunity: Opportunity): string[] {
+  if (opportunity.kind === "liquidation") {
+    return [
+      "liquidation",
+      `debt:${opportunity.candidate.debtAsset.toLowerCase()}`,
+      `collateral:${opportunity.candidate.collateralAsset.toLowerCase()}`,
+    ];
+  }
+  return [
+    "arbitrage",
+    `buy:${opportunity.candidate.buyDex.name}`,
+    `sell:${opportunity.candidate.sellDex.name}`,
+    `${opportunity.candidate.tokenIn.toLowerCase()}:${opportunity.candidate.tokenOut.toLowerCase()}`,
+  ];
+}
+
+function estimateOpportunityProfitBps(opportunity: Opportunity): number {
+  if (opportunity.kind === "liquidation") {
+    const repayUsd = Math.max(1, opportunity.candidate.repayValueUsd);
+    const grossUsd = repayUsd * (opportunity.candidate.liquidationBonusBps / 10_000);
+    return Math.max(1, Math.round((grossUsd / repayUsd) * 10_000));
+  }
+  const base = opportunity.candidate.amountIn;
+  if (base <= 0n) {
+    return 1;
+  }
+  const raw = (opportunity.candidate.expectedAmountOut - base) * 10_000n / base;
+  return Number(raw > 0n ? raw : 1n);
+}
+
 function parsePriceFeedRegistry(value: string | undefined): OracleFeedRegistry | undefined {
   if (value === undefined || value.trim() === "") {
     return undefined;
@@ -673,6 +786,17 @@ function assertArbitragePriceFeedCoverage(config: RuntimeConfig): void {
   }
 }
 
+function assertPipelineFlashLiquidationReadiness(config: RuntimeConfig): void {
+  if (!config.usePipelineOrchestrator || config.simulationMode) {
+    return;
+  }
+  if (config.liquidationReceiverAddress === undefined) {
+    throw new Error(
+      "LIQUIDATION_RECEIVER_ADDRESS is required for live pipeline mode to enforce flash-loan-first liquidations",
+    );
+  }
+}
+
 export async function assertArbitrageOracleReadiness(
   config: RuntimeConfig,
   priceOracleCache: Pick<PriceOracleCache, "batchGetUsdPrices">,
@@ -717,15 +841,6 @@ function parseList(value: string | undefined): string[] {
     .split(",")
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
-}
-
-function parseExactNumber(value: string | undefined, expected: number, name: string): number {
-  const parsed = value === undefined || value.trim() === "" ? expected : Number(value);
-  if (parsed !== expected) {
-    throw new Error(`${name} must be exactly ${expected}`);
-  }
-
-  return parsed;
 }
 
 function parseMinNumber(value: string | undefined, fallback: number, min: number, name: string): number {
@@ -826,6 +941,7 @@ function runtimeConfigHash(
     gasCostUsd: env.GAS_COST_USD ?? "0",
     slippageBps: env.SLIPPAGE_BPS ?? "50",
     minProfitMarginBps: env.MIN_PROFIT_MARGIN_BPS ?? String(defaultProfitMarginBps),
+    liquidationReceiverAddress: env.LIQUIDATION_RECEIVER_ADDRESS ?? "",
     priceFeedRegistryJson: env.PRICE_FEED_REGISTRY_JSON ?? "",
     simulationMode: env.SIMULATION_MODE ?? "true",
   };

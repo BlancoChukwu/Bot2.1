@@ -1,3 +1,4 @@
+import type { Address } from "viem";
 import type { AaveV3Protocol, LiquidationCandidate } from "../protocols/aaveV3";
 import { calculateLiquidationEv } from "../utils/evCalculator";
 
@@ -13,7 +14,10 @@ export interface HealthFactorMonitorConfig {
   readonly candidateCooldownMs: number;
   readonly minProfitUsd: number;
   readonly gasCostUsd: number;
+  readonly resolveDynamicGasCostUsd?: () => Promise<number>;
   readonly slippageBps: number;
+  readonly resolveDynamicSlippageBps?: () => Promise<number>;
+  readonly onReserveDataUpdated?: (reserve?: Address) => void;
   readonly logger: MonitorLogger;
 }
 
@@ -24,15 +28,13 @@ export class HealthFactorMonitor {
   private reserveSubscriptionStop: (() => void) | undefined;
   private lastScanStats = { scanned: 0, liquidatable: 0 };
 
-  public constructor(private readonly config: HealthFactorMonitorConfig) {
-    if (config.pollIntervalMs !== 400) {
-      throw new Error("pollIntervalMs must be exactly 400ms");
-    }
-  }
+  public constructor(private readonly config: HealthFactorMonitorConfig) {}
 
   public async scanOnce(now = Date.now()): Promise<LiquidationCandidate[]> {
+    const gasCostUsd = await this.resolveGasCostUsd();
+    const slippageBps = await this.resolveSlippageBps();
     const positions = await this.config.protocol.getLiquidatablePositions();
-    const candidates = positions.filter((position) => this.isExecutableCandidate(position, now));
+    const candidates = positions.filter((position) => this.isExecutableCandidate(position, now, gasCostUsd, slippageBps));
     const stats = this.config.protocol.getLastScanStats?.() ?? {
       scanned: positions.length,
       liquidatable: positions.length,
@@ -60,8 +62,9 @@ export class HealthFactorMonitor {
       return;
     }
 
-    this.reserveSubscriptionStop = await this.config.protocol.subscribeToReserveDataUpdated?.(() => {
-      this.config.logger.info("reserve_data_updated_event");
+    this.reserveSubscriptionStop = await this.config.protocol.subscribeToReserveDataUpdated?.((reserve) => {
+      this.config.logger.info("reserve_data_updated_event", { reserve });
+      this.config.onReserveDataUpdated?.(reserve);
     });
   }
 
@@ -70,7 +73,12 @@ export class HealthFactorMonitor {
     this.reserveSubscriptionStop = undefined;
   }
 
-  private isExecutableCandidate(candidate: LiquidationCandidate, now: number): boolean {
+  private isExecutableCandidate(
+    candidate: LiquidationCandidate,
+    now: number,
+    gasCostUsd: number,
+    slippageBps: number,
+  ): boolean {
     if (candidate.healthFactor >= liquidationHealthFactor || this.isCoolingDown(candidate, now)) {
       return false;
     }
@@ -78,8 +86,8 @@ export class HealthFactorMonitor {
     const ev = calculateLiquidationEv({
       repayValueUsd: candidate.repayValueUsd,
       liquidationBonusBps: candidate.liquidationBonusBps,
-      gasCostUsd: this.config.gasCostUsd,
-      slippageBps: this.config.slippageBps,
+      gasCostUsd,
+      slippageBps,
       minProfitUsd: this.config.minProfitUsd,
     });
 
@@ -93,5 +101,31 @@ export class HealthFactorMonitor {
 
   private candidateKey(candidate: LiquidationCandidate): string {
     return `${candidate.account}:${candidate.collateralAsset}:${candidate.debtAsset}`;
+  }
+
+  private async resolveGasCostUsd(): Promise<number> {
+    if (this.config.resolveDynamicGasCostUsd === undefined) {
+      return this.config.gasCostUsd;
+    }
+    try {
+      const resolved = await this.config.resolveDynamicGasCostUsd();
+      return Number.isFinite(resolved) && resolved >= 0 ? resolved : this.config.gasCostUsd;
+    } catch (error) {
+      this.config.logger.warn("dynamic_gas_cost_resolution_failed", { error: String(error) });
+      return this.config.gasCostUsd;
+    }
+  }
+
+  private async resolveSlippageBps(): Promise<number> {
+    if (this.config.resolveDynamicSlippageBps === undefined) {
+      return this.config.slippageBps;
+    }
+    try {
+      const resolved = await this.config.resolveDynamicSlippageBps();
+      return Number.isFinite(resolved) && resolved >= 0 ? resolved : this.config.slippageBps;
+    } catch (error) {
+      this.config.logger.warn("dynamic_slippage_resolution_failed", { error: String(error) });
+      return this.config.slippageBps;
+    }
   }
 }

@@ -104,13 +104,23 @@ export class HybridDetectionPipeline {
   private async handleReserveUpdated(event: DetectionReserveEvent): Promise<void> {
     const startedAt = Date.now();
     try {
-      const borrowers = await this.config.provider.getBorrowersForReserve(event.chain, event.reserve);
-      const snapshots = await this.config.provider.refreshBorrowers(event.chain, borrowers);
+      const borrowers = this.getCachedBorrowersForReserve(event.chain, event.reserve);
+      const targetBorrowers = borrowers.length > 0
+        ? borrowers
+        : await this.config.provider.getBorrowersForReserve(event.chain, event.reserve);
+      if (targetBorrowers.length === 0) {
+        this.config.logger.info("reserve_event_refresh_skipped_no_borrowers", {
+          chain: event.chain,
+          reserve: event.reserve,
+        });
+        return;
+      }
+      const snapshots = await this.config.provider.refreshBorrowers(event.chain, targetBorrowers);
       this.upsertSnapshots(snapshots);
       this.config.logger.info("reserve_event_refresh_complete", {
         chain: event.chain,
         reserve: event.reserve,
-        borrowers: borrowers.length,
+        borrowers: targetBorrowers.length,
       });
     } catch (error) {
       this.recordFailure(event.chain, "rpc", error);
@@ -138,6 +148,20 @@ export class HybridDetectionPipeline {
     for (const snapshot of snapshots) {
       this.cache.upsert(snapshot);
     }
+  }
+
+  private getCachedBorrowersForReserve(chain: SupportedChain, reserve: Address): Address[] {
+    const lowerReserve = reserve.toLowerCase();
+    const unique = new Set<Address>();
+    for (const snapshot of this.cache.listSnapshots(chain)) {
+      const touchesReserve = snapshot.reserves.some(
+        (entry) => entry.assetAddress.toLowerCase() === lowerReserve,
+      );
+      if (touchesReserve) {
+        unique.add(snapshot.account);
+      }
+    }
+    return [...unique];
   }
 }
 

@@ -112,7 +112,7 @@ describe("HealthFactorMonitor", () => {
     expect(messages).toContainEqual({ scanned: 1, liquidatable: 1 });
   });
 
-  it("requires the exact 400ms polling cadence", () => {
+  it("accepts configurable polling cadence for adaptive backpressure", () => {
     const protocol: AaveV3Protocol = {
       getLiquidatablePositions: async () => [],
     };
@@ -127,7 +127,7 @@ describe("HealthFactorMonitor", () => {
         slippageBps: 50,
         logger,
       }),
-    ).toThrow(/exactly 400ms/);
+    ).not.toThrow();
   });
 
   it("starts and stops ReserveDataUpdated subscriptions when supported", async () => {

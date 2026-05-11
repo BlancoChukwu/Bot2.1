@@ -138,6 +138,7 @@ export interface ArbitrageScannerConfig {
   readonly nativeGasTokenByChain?: Readonly<Record<SupportedChain, Address>>;
   readonly nativeGasTokenDecimalsByChain?: Readonly<Record<SupportedChain, number>>;
   readonly exactUsdMinProfitRaw?: bigint;
+  readonly quoteConcurrency?: number;
 }
 
 export class ArbitrageScanner {
@@ -156,6 +157,7 @@ export class ArbitrageScanner {
     readonly nativeGasTokenByChain: Readonly<Record<SupportedChain, Address>>;
     readonly nativeGasTokenDecimalsByChain: Readonly<Record<SupportedChain, number>>;
     readonly exactUsdMinProfitRaw: bigint;
+    readonly quoteConcurrency: number;
   };
   private readonly activePolls = new Map<SupportedChain, NodeJS.Timeout>();
   private readonly dedupe = new Map<string, number>();
@@ -185,6 +187,7 @@ export class ArbitrageScanner {
         base: 18,
       },
       exactUsdMinProfitRaw: config.exactUsdMinProfitRaw ?? 15_000_000n,
+      quoteConcurrency: Math.max(1, config.quoteConcurrency ?? 4),
       ...config,
     };
   }
@@ -257,13 +260,15 @@ export class ArbitrageScanner {
       if (onlyDex === undefined) {
         return;
       }
-      for (const pair of pairs) {
-        scanned += 1;
+      scanned = pairs.length;
+      const singleResults = await this.runBounded(pairs, async (pair) => {
         const attempt = await this.checkSingleDirection(client, chain, buySell(onlyDex), pair, gasPrice);
         if (attempt !== null && (await this.evaluateOpportunity(attempt)).status === "approved") {
-          approvedCount += 1;
+          return 1;
         }
-      }
+        return 0;
+      });
+      approvedCount = singleResults.reduce<number>((sum, value) => sum + Number(value), 0);
       this.config.metrics.recordLatency("scan", (Date.now() - startedAt) / 1_000, { chain });
       this.config.metrics.recordArbitrageOpportunityScanned(scanned);
       if (approvedCount > 0) {
@@ -272,6 +277,7 @@ export class ArbitrageScanner {
       }
       return;
     }
+    const routeChecks: Array<{ readonly pair: TokenPairConfig; readonly route: { readonly buyDex: DexConfig; readonly sellDex: DexConfig } }> = [];
     for (const pair of pairs) {
       for (let i = 0; i < dexes.length; i++) {
         for (let j = i + 1; j < dexes.length; j++) {
@@ -280,20 +286,20 @@ export class ArbitrageScanner {
           if (buyDex === undefined || sellDex === undefined) {
             continue;
           }
-          scanned += 2;
-
-          const first = await this.checkSingleDirection(client, chain, buySell(buyDex, sellDex), pair, gasPrice);
-          if (first !== null && (await this.evaluateOpportunity(first)).status === "approved") {
-            approvedCount += 1;
-          }
-
-          const second = await this.checkSingleDirection(client, chain, buySell(sellDex, buyDex), pair, gasPrice);
-          if (second !== null && (await this.evaluateOpportunity(second)).status === "approved") {
-            approvedCount += 1;
-          }
+          routeChecks.push({ pair, route: buySell(buyDex, sellDex) });
+          routeChecks.push({ pair, route: buySell(sellDex, buyDex) });
         }
       }
     }
+    scanned = routeChecks.length;
+    const multiResults = await this.runBounded(routeChecks, async ({ pair, route }) => {
+      const candidate = await this.checkSingleDirection(client, chain, route, pair, gasPrice);
+      if (candidate !== null && (await this.evaluateOpportunity(candidate)).status === "approved") {
+        return 1;
+      }
+      return 0;
+    });
+    approvedCount = multiResults.reduce<number>((sum, value) => sum + Number(value), 0);
 
     this.config.metrics.recordLatency("scan", (Date.now() - startedAt) / 1_000, { chain });
     this.config.metrics.recordArbitrageOpportunityScanned(scanned);
@@ -639,6 +645,25 @@ export class ArbitrageScanner {
         this.dedupe.delete(signature);
       }
     }
+  }
+
+  private async runBounded<TItem, TResult>(
+    items: readonly TItem[],
+    worker: (item: TItem) => Promise<TResult>,
+  ): Promise<TResult[]> {
+    const queue = [...items];
+    const results: TResult[] = [];
+    const workers = Array.from({ length: Math.min(this.config.quoteConcurrency, queue.length) }, async () => {
+      while (queue.length > 0) {
+        const item = queue.shift();
+        if (item === undefined) {
+          continue;
+        }
+        results.push(await worker(item));
+      }
+    });
+    await Promise.all(workers);
+    return results;
   }
 }
 

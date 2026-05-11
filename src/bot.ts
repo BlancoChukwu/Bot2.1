@@ -61,6 +61,8 @@ export interface BotMetricsSnapshot {
   readonly arbitrageApproved: number;
   readonly arbitrageExecuted: number;
   readonly netProfitUsd: number;
+  readonly publicRpcSubmissions: number;
+  readonly privateBundleSubmissions: number;
 }
 
 export interface BotMetrics {
@@ -73,6 +75,7 @@ export interface BotMetrics {
   recordArbitrageApproved(count: number): void;
   recordArbitrageExecuted(count: number): void;
   recordNetProfitUsd(amountUsd: number): void;
+  recordBundleSubmission(route: "public_rpc" | "private_bundle"): void;
   recordError(): void;
   recordLatency(stage: BotLatencyStage, durationSeconds: number, labels?: { readonly chain?: string }): void;
   snapshot(): BotMetricsSnapshot;
@@ -210,6 +213,8 @@ export function createBotMetrics(): BotMetrics {
     arbitrageApproved: number;
     arbitrageExecuted: number;
     netProfitUsd: number;
+    publicRpcSubmissions: number;
+    privateBundleSubmissions: number;
   } = {
     positionsScanned: 0,
     liquidationsAttempted: 0,
@@ -220,6 +225,8 @@ export function createBotMetrics(): BotMetrics {
     arbitrageApproved: 0,
     arbitrageExecuted: 0,
     netProfitUsd: 0,
+    publicRpcSubmissions: 0,
+    privateBundleSubmissions: 0,
   };
   const positionsScannedTotal = new client.Counter({
     name: "positions_scanned_total",
@@ -272,6 +279,12 @@ export function createBotMetrics(): BotMetrics {
     labelNames: ["stage", "chain"],
     registers: [registry],
   });
+  const bundleRouteSubmissions = new client.Counter({
+    name: "bundle_route_submissions_total",
+    help: "Execution submissions by route type",
+    labelNames: ["route"],
+    registers: [registry],
+  });
 
   return {
     registry,
@@ -307,6 +320,14 @@ export function createBotMetrics(): BotMetrics {
     recordNetProfitUsd(amountUsd) {
       snapshot.netProfitUsd += amountUsd;
       netProfitUsd.set(snapshot.netProfitUsd);
+    },
+    recordBundleSubmission(route) {
+      if (route === "private_bundle") {
+        snapshot.privateBundleSubmissions += 1;
+      } else {
+        snapshot.publicRpcSubmissions += 1;
+      }
+      bundleRouteSubmissions.inc({ route });
     },
     recordError() {
       snapshot.errorsTotal += 1;

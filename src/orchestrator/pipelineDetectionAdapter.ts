@@ -1,5 +1,6 @@
 import type { Address } from "viem";
 import type { HealthFactorMonitor } from "../monitors/healthFactorMonitor";
+import type { HybridDetectionPipeline } from "../monitors/hybridDetectionPipeline";
 import { ArbitrageOpportunityQueue } from "../monitors/arbitrageOpportunityQueue";
 import { ReserveAwareBorrowerCache, type BorrowerSnapshot } from "../monitors/reserveAwareBorrowerCache";
 import type { LiquidationCandidate } from "../protocols/aaveV3";
@@ -15,26 +16,43 @@ const usdc = createAsset({ symbol: "USDC", decimals: 6 });
 
 export interface PipelineDetectionAdapterConfig {
   readonly chain: SupportedChain;
-  readonly monitor: HealthFactorMonitor;
+  readonly monitor?: HealthFactorMonitor;
+  readonly hybridDetection?: HybridDetectionPipeline;
   readonly arbitrageQueue: ArbitrageOpportunityQueue;
 }
 
 export class PipelineDetectionAdapter {
-  public readonly cache = new ReserveAwareBorrowerCache();
+  public readonly cache: ReserveAwareBorrowerCache;
 
-  public constructor(private readonly config: PipelineDetectionAdapterConfig) {}
+  public constructor(private readonly config: PipelineDetectionAdapterConfig) {
+    this.cache = config.hybridDetection?.cache ?? new ReserveAwareBorrowerCache();
+  }
 
   public async start(): Promise<void> {
+    if (this.config.hybridDetection !== undefined) {
+      await this.config.hybridDetection.start();
+      await this.config.hybridDetection.pollFallback(this.config.chain);
+      return;
+    }
     await this.refreshCandidates();
   }
 
-  public stop(): void {}
+  public stop(): void {
+    this.config.hybridDetection?.stop();
+  }
 
-  public async pollFallback(_chain: SupportedChain): Promise<void> {
+  public async pollFallback(chain: SupportedChain): Promise<void> {
+    if (this.config.hybridDetection !== undefined) {
+      await this.config.hybridDetection.pollFallback(chain);
+      return;
+    }
     await this.refreshCandidates();
   }
 
-  public getCircuitBreakerState(_chain: SupportedChain, _name: CircuitBreakerName): CircuitBreakerState {
+  public getCircuitBreakerState(chain: SupportedChain, name: CircuitBreakerName): CircuitBreakerState {
+    if (this.config.hybridDetection !== undefined) {
+      return this.config.hybridDetection.getCircuitBreakerState(chain, name);
+    }
     return { status: "closed", failures: 0 };
   }
 
@@ -43,6 +61,9 @@ export class PipelineDetectionAdapter {
   }
 
   private async refreshCandidates(): Promise<void> {
+    if (this.config.monitor === undefined) {
+      return;
+    }
     const candidates = await this.config.monitor.scanOnce();
     for (const candidate of candidates) {
       this.cache.upsert(toSnapshot(this.config.chain, candidate));
