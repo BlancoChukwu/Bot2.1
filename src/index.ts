@@ -43,6 +43,7 @@ import { MIN_PROFIT_THRESHOLD_WEI } from "./utils/evCalculator";
 import { createAsset, createAssetAmount } from "./utils/typedAssetMath";
 import { PriceOracleCache, type OracleFeedRegistry } from "./utils/priceOracleCache";
 import { sendDailyPnlSummary, sendLiquidationAlert } from "./utils/telegramAlert";
+import { assertLiquidationReceiverReadiness } from "./production/liquidationReceiverReadiness";
 import { DeploymentSafetyGate, type DeploymentGateResult, type DryRunValidationReceipt } from "./production/productionReadiness";
 import { PnlTracker } from "./production/pnlTracker";
 import type { Opportunity } from "./types/opportunity";
@@ -425,7 +426,34 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       ? {}
       : { flashLoanReceiverAddress: config.arbitrageReceiverAddress, operatorAddress: account.address }),
   });
+  const liquidationReceiver = config.liquidationReceiverAddress;
+  const liquidationReceiverExpectedSwapRouter = parseAddress(
+    process.env.LIQUIDATION_RECEIVER_EXPECTED_SWAP_ROUTER?.trim(),
+  );
+  const validateLiquidationReceiverRpc =
+    liquidationReceiver !== undefined
+    && parseBoolean(process.env.VALIDATE_LIQUIDATION_RECEIVER_RPC, !config.simulationMode);
   const startupGuard = async () => {
+    if (validateLiquidationReceiverRpc) {
+      const registryUniswap = getDexesForChain(config.chain).find((dex) => dex.name === "UniswapV3");
+      const expectedSwapRouter = liquidationReceiverExpectedSwapRouter ?? registryUniswap?.router;
+      if (expectedSwapRouter === undefined) {
+        throw new Error(
+          "Liquidation receiver RPC validation needs a swap router: set LIQUIDATION_RECEIVER_EXPECTED_SWAP_ROUTER or add UniswapV3 to dexRegistry for this chain",
+        );
+      }
+      await assertLiquidationReceiverReadiness(publicClient, {
+        chain: config.chain,
+        receiver: liquidationReceiver,
+        expectedSwapRouter,
+      });
+      logger.info("liquidation_receiver_startup_verified", {
+        chain: config.chain,
+        receiver: liquidationReceiver,
+        swapRouter: expectedSwapRouter,
+        swapRouterSource: liquidationReceiverExpectedSwapRouter !== undefined ? "env" : "dex_registry",
+      });
+    }
     if (priceOracleCache !== undefined) {
       await assertArbitrageOracleReadiness(config, priceOracleCache);
     }
