@@ -43,9 +43,15 @@ export interface FlashLoanProviderRouterConfig {
 
 export class FlashLoanProviderRouter {
   private readonly engine: ProfitabilityEngine;
+  private readonly providerFees: Partial<Record<FlashLoanProviderId, AssetAmount>>;
 
   public constructor(private readonly config: FlashLoanProviderRouterConfig) {
+    this.providerFees = { ...config.providerFees };
     this.engine = new ProfitabilityEngine(config);
+  }
+
+  public setProviderFee(provider: FlashLoanProviderId, fee: AssetAmount): void {
+    this.providerFees[provider] = fee;
   }
 
   public async selectBestRoute(input: RouteSelectionInput): Promise<RouteSelectionResult> {
@@ -90,7 +96,7 @@ export class FlashLoanProviderRouter {
     input: RouteSelectionInput,
     provider: FlashLoanProviderId,
   ): ProfitSimulationInput {
-    const flashLoanFee = this.config.providerFees[provider];
+    const flashLoanFee = this.providerFees[provider];
     if (flashLoanFee === undefined) {
       throw new Error(`Missing flash-loan fee quote for provider: ${provider}`);
     }

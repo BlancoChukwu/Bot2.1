@@ -9,6 +9,10 @@ export interface LiquidationEvInput {
   readonly minProfitUsd: number;
 }
 
+export interface FlashWrappedLiquidationEvInput extends LiquidationEvInput {
+  readonly flashFeeBps: number;
+}
+
 export interface LiquidationEv {
   readonly expectedProfitUsd: number;
   readonly isProfitable: boolean;
@@ -24,7 +28,8 @@ export interface LiquidationEV {
 
 export const MIN_PROFIT_THRESHOLD_WEI = 10_000_000_000_000_000n;
 export const MIN_PROFIT_THRESHOLD_BNB = 150_000_000_000_000_000n;
-export const AAVE_V3_BASE_FLASH_FEE_BPS = 5;
+/** Aave V3 Base flash-loan fee baseline: 0.09% */
+export const AAVE_V3_BASE_FLASH_FEE_BPS = 9;
 
 const bpsDenominator = 10_000;
 const bpsDenominatorWei = 10_000n;
@@ -77,6 +82,18 @@ export function calculateLiquidationEv(input: LiquidationEvInput): LiquidationEv
     expectedProfitUsd,
     isProfitable: expectedProfitUsd >= input.minProfitUsd,
   };
+}
+
+export function calculateFlashWrappedLiquidationEv(input: FlashWrappedLiquidationEvInput): LiquidationEv {
+  assertNonNegative("flashFeeBps", input.flashFeeBps);
+  const flashFeeUsd = input.repayValueUsd * (input.flashFeeBps / bpsDenominator);
+  return calculateLiquidationEv({
+    repayValueUsd: input.repayValueUsd,
+    liquidationBonusBps: input.liquidationBonusBps,
+    gasCostUsd: input.gasCostUsd + flashFeeUsd,
+    slippageBps: input.slippageBps,
+    minProfitUsd: input.minProfitUsd,
+  });
 }
 
 export interface FlashLoanArbitrageInput {

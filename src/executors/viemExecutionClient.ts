@@ -7,6 +7,7 @@ export interface ViemExecutionClientConfig {
     getGasPrice(): Promise<bigint>;
     getTransactionCount(args: Record<string, unknown>): Promise<number>;
     call(args: Record<string, unknown>): Promise<unknown>;
+    simulateContract?(args: Record<string, unknown>): Promise<unknown>;
     waitForTransactionReceipt(args: Record<string, unknown>): Promise<{ status: "success" | "reverted" }>;
   };
   readonly walletClient: {
@@ -37,11 +38,23 @@ export class ViemExecutionClient implements ExecutionPreflightClient {
     });
   }
 
-  public async simulate(
+  public async simulateContract(
     transaction: TransactionEnvelope,
     overrides: TransactionOverrides,
   ): Promise<FinalSimulationResult> {
     try {
+      if (this.config.publicClient.simulateContract !== undefined && transaction.contractCall !== undefined) {
+        await this.config.publicClient.simulateContract({
+          account: this.requireAccount(),
+          address: transaction.to,
+          abi: transaction.contractCall.abi,
+          functionName: transaction.contractCall.functionName,
+          args: transaction.contractCall.args,
+          gas: overrides.gas,
+          gasPrice: overrides.gasPrice,
+        });
+        return { success: true };
+      }
       await this.config.publicClient.call({
         account: this.requireAccount(),
         to: transaction.to,

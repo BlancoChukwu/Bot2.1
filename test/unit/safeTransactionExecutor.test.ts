@@ -87,7 +87,7 @@ describe("SafeTransactionExecutor", () => {
         calls.push("nonce:end");
         return 5;
       },
-      simulate: async (_transaction, overrides) => {
+      simulateContract: async (_transaction, overrides) => {
         calls.push(`simulate:${overrides.nonce}`);
         return { success: true };
       },
@@ -135,7 +135,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 3,
-        simulate: async () => ({ success: false, reason: "dry-run-revert" }),
+        simulateContract: async () => ({ success: false, reason: "dry-run-revert" }),
         send: async () => {
           sends += 1;
           return "0xabc";
@@ -152,6 +152,42 @@ describe("SafeTransactionExecutor", () => {
     expect(sends).toBe(0);
   });
 
+  it("runs flash-loan preview simulation before final simulation when provided", async () => {
+    const calls: string[] = [];
+    const req = {
+      ...request(),
+      buildFlashLoanPreviewTransaction: () => ({
+        to: "0x0000000000000000000000000000000000000003" as const,
+        data: "0x99" as const,
+        provider: "aaveV3" as const,
+      }),
+    };
+    const executor = new SafeTransactionExecutor({
+      registry: registry(),
+      router: { selectBestRoute: async () => routeSelected() },
+      nonceManager: new LocalNonceManager(),
+      client: {
+        estimateGas: async () => 900_000n,
+        getGasPrice: async () => 1_000_000_000n,
+        getPendingNonce: async () => 3,
+        simulateContract: async (transaction) => {
+          calls.push(transaction.data);
+          return { success: true };
+        },
+        send: async () => "0xabc",
+        waitForReceipt: async () => ({ status: "included" }),
+      },
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      dryRunMode: true,
+    });
+
+    const result = await executor.execute(req);
+
+    expect(result).toEqual({ status: "simulated" });
+    expect(calls).toEqual(["0x99", "0x1234"]);
+  });
+
   it("returns simulated without submitting when dry-run mode is enabled", async () => {
     let sends = 0;
     const executor = new SafeTransactionExecutor({
@@ -162,7 +198,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 3,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => {
           sends += 1;
           return "0xabc";
@@ -193,7 +229,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 3,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => "0xabc",
         waitForReceipt: async () => ({ status: "included" }),
       },
@@ -221,7 +257,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 3,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => "0xabc",
         waitForReceipt: async () => ({ status: "included" }),
       },
@@ -248,7 +284,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 3,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => "0xabc",
         waitForReceipt: async () => ({ status: "included" }),
       },
@@ -276,7 +312,7 @@ describe("SafeTransactionExecutor", () => {
         },
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 3,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => "0xabc",
         waitForReceipt: async () => ({ status: "included" }),
       },
@@ -301,7 +337,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 12,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async (_transaction, overrides) => {
           gasPrices.push(overrides.gasPrice);
           return gasPrices.length === 1 ? "0xunderpriced" : "0xbumped";
@@ -332,7 +368,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 12,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async (_transaction, overrides) => {
           gasPrices.push(overrides.gasPrice);
           if (gasPrices.length === 1) {
@@ -364,7 +400,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 12,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => {
           publicSends += 1;
           return "0xpublic";
@@ -403,7 +439,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 12,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => {
           publicSends += 1;
           return "0xpublic";
@@ -439,7 +475,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 12,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => {
           publicSends += 1;
           return "0xpublic";
@@ -467,6 +503,42 @@ describe("SafeTransactionExecutor", () => {
     expect(publicSends).toBe(1);
   });
 
+  it("forces private-first routing for configured chains", async () => {
+    let publicSends = 0;
+    let privateSends = 0;
+    const executor = new SafeTransactionExecutor({
+      registry: registry(),
+      router: { selectBestRoute: async () => routeSelected() },
+      nonceManager: new LocalNonceManager(),
+      client: {
+        estimateGas: async () => 900_000n,
+        getGasPrice: async () => 1_000_000_000n,
+        getPendingNonce: async () => 12,
+        simulateContract: async () => ({ success: true }),
+        send: async () => {
+          publicSends += 1;
+          return "0xpublic";
+        },
+        waitForReceipt: async () => ({ status: "included" }),
+      },
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      privateFirstChains: ["optimism"],
+      bundleRouter: {
+        send: async () => {
+          privateSends += 1;
+          return "0xprivate";
+        },
+      },
+    });
+
+    const result = await executor.execute(request());
+
+    expect(result).toEqual({ status: "sent", txHash: "0xprivate" });
+    expect(privateSends).toBe(1);
+    expect(publicSends).toBe(0);
+  });
+
   it("resyncs the nonce manager after an unknown first-send failure", async () => {
     const nonceManager = new LocalNonceManager();
     const executor = new SafeTransactionExecutor({
@@ -477,7 +549,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 12,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => {
           throw new Error("rpc disconnected");
         },
@@ -504,7 +576,7 @@ describe("SafeTransactionExecutor", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 12,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => {
           sends += 1;
           if (sends === 1) {
@@ -523,5 +595,130 @@ describe("SafeTransactionExecutor", () => {
 
     expect(result).toEqual({ status: "failed", reason: "send_failed" });
     expect(sends).toBe(2);
+  });
+
+  it("rejects immediately when execution circuit breaker is open", async () => {
+    const openRegistry = createChainRegistry({
+      chains: [{
+        chain: "optimism",
+        rpcUrl: "https://optimism.example",
+        fallbackRpcUrls: [],
+        aaveSubgraphUrl: "https://subgraph.example",
+      }],
+    });
+    openRegistry.setCircuitBreakerState("optimism", "execution", {
+      status: "open",
+      failures: 5,
+      openedAtMs: 1_000,
+    });
+    const executor = new SafeTransactionExecutor({
+      registry: openRegistry,
+      router: { selectBestRoute: async () => routeSelected() },
+      nonceManager: new LocalNonceManager(),
+      client: {
+        estimateGas: async () => 900_000n,
+        getGasPrice: async () => 1_000_000_000n,
+        getPendingNonce: async () => 12,
+        simulateContract: async () => ({ success: true }),
+        send: async () => "0xpublic",
+        waitForReceipt: async () => ({ status: "included" }),
+      },
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+    });
+
+    await expect(executor.execute(request())).resolves.toEqual({
+      status: "rejected",
+      reason: "execution_circuit_open",
+    });
+  });
+
+  it("propagates private bundle failure when public fallback is disabled", async () => {
+    const executor = new SafeTransactionExecutor({
+      registry: registry(),
+      router: { selectBestRoute: async () => routeSelected() },
+      nonceManager: new LocalNonceManager(),
+      client: {
+        estimateGas: async () => 900_000n,
+        getGasPrice: async () => 1_000_000_000n,
+        getPendingNonce: async () => 12,
+        simulateContract: async () => ({ success: true }),
+        send: async () => "0xpublic",
+        waitForReceipt: async () => ({ status: "included" }),
+      },
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      privateFirstChains: ["optimism"],
+      bundleRouter: {
+        send: async () => {
+          throw new Error("bundle down");
+        },
+      },
+      allowPublicFallbackAfterBundleFailure: false,
+    });
+
+    await expect(executor.execute(request())).resolves.toEqual({
+      status: "failed",
+      reason: "send_failed",
+    });
+  });
+
+  it("maps reorged and reverted receipts to failed results", async () => {
+    const build = (receipt: { status: "reorged" } | { status: "reverted"; reason?: string }) =>
+      new SafeTransactionExecutor({
+        registry: registry(),
+        router: { selectBestRoute: async () => routeSelected() },
+        nonceManager: new LocalNonceManager(),
+        client: {
+          estimateGas: async () => 900_000n,
+          getGasPrice: async () => 1_000_000_000n,
+          getPendingNonce: async () => 12,
+          simulateContract: async () => ({ success: true }),
+          send: async () => "0xabc",
+          waitForReceipt: async () => receipt,
+        },
+        logger: createLogger("silent"),
+        metrics: createBotMetrics(),
+      });
+
+    await expect(build({ status: "reorged" }).execute(request())).resolves.toEqual({
+      status: "failed",
+      reason: "receipt_reorged",
+    });
+    await expect(build({ status: "reverted", reason: "bad debt" }).execute(request())).resolves.toEqual({
+      status: "failed",
+      reason: "receipt_reverted",
+    });
+  });
+
+  it("falls back to receipt_reverted for unexpected non-terminal replacement receipt", async () => {
+    let receipts = 0;
+    const executor = new SafeTransactionExecutor({
+      registry: registry(),
+      router: { selectBestRoute: async () => routeSelected() },
+      nonceManager: new LocalNonceManager(),
+      client: {
+        estimateGas: async () => 900_000n,
+        getGasPrice: async () => 1_000_000_000n,
+        getPendingNonce: async () => 12,
+        simulateContract: async () => ({ success: true }),
+        send: async (_transaction, overrides) =>
+          overrides.gasPrice === 1_000_000_000n ? "0xfirst" : "0xreplacement",
+        waitForReceipt: async () => {
+          receipts += 1;
+          if (receipts === 1) {
+            return { status: "underpriced" as const };
+          }
+          return { status: "underpriced" as const };
+        },
+      },
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+    });
+
+    await expect(executor.execute(request())).resolves.toEqual({
+      status: "failed",
+      reason: "receipt_reverted",
+    });
   });
 });

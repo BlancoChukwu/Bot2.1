@@ -22,6 +22,8 @@ export interface LiquidationCandidate {
   readonly debtToCover: bigint;
   readonly repayValueUsd: number;
   readonly liquidationBonusBps: number;
+  readonly effectiveLiquidationBonusBps?: number;
+  readonly closeFactorBps?: number;
   readonly collateralReceivedWei?: bigint;
   readonly bonusPercentage?: number;
   readonly gasEstimate?: bigint;
@@ -116,6 +118,13 @@ export const aavePoolAbi = [
   },
   {
     type: "function",
+    name: "FLASHLOAN_PREMIUM_TOTAL",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "uint128" }],
+  },
+  {
+    type: "function",
     name: "liquidationCall",
     stateMutability: "nonpayable",
     inputs: [
@@ -150,6 +159,51 @@ export const aavePoolAbi = [
       { name: "variableBorrowRate", type: "uint256", indexed: false },
       { name: "liquidityIndex", type: "uint256", indexed: false },
       { name: "variableBorrowIndex", type: "uint256", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "Supply",
+    inputs: [
+      { name: "reserve", type: "address", indexed: true },
+      { name: "user", type: "address", indexed: true },
+      { name: "onBehalfOf", type: "address", indexed: true },
+      { name: "amount", type: "uint256", indexed: false },
+      { name: "referralCode", type: "uint16", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "Borrow",
+    inputs: [
+      { name: "reserve", type: "address", indexed: true },
+      { name: "user", type: "address", indexed: true },
+      { name: "onBehalfOf", type: "address", indexed: true },
+      { name: "amount", type: "uint256", indexed: false },
+      { name: "interestRateMode", type: "uint8", indexed: false },
+      { name: "borrowRate", type: "uint256", indexed: false },
+      { name: "referralCode", type: "uint16", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "Repay",
+    inputs: [
+      { name: "reserve", type: "address", indexed: true },
+      { name: "user", type: "address", indexed: true },
+      { name: "repayer", type: "address", indexed: true },
+      { name: "amount", type: "uint256", indexed: false },
+      { name: "useATokens", type: "bool", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "Withdraw",
+    inputs: [
+      { name: "reserve", type: "address", indexed: true },
+      { name: "user", type: "address", indexed: true },
+      { name: "to", type: "address", indexed: true },
+      { name: "amount", type: "uint256", indexed: false },
     ],
   },
 ] as const;

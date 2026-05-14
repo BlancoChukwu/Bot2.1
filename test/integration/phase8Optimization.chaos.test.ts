@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Address } from "viem";
 import { createAsset, createAssetAmount } from "../../src/utils/typedAssetMath";
 import { createBotMetrics, createLogger } from "../../src/bot";
@@ -73,6 +73,10 @@ function requestFor(account: Address): SafeExecutionRequest {
 }
 
 describe("Phase 8 optimization chaos paths", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("falls back to baseline order when prediction ranking fails", async () => {
     const first = "0x0000000000000000000000000000000000000001";
     const second = "0x0000000000000000000000000000000000000002";
@@ -123,9 +127,9 @@ describe("Phase 8 optimization chaos paths", () => {
     const risky = "0x0000000000000000000000000000000000000001";
     const safe = "0x0000000000000000000000000000000000000002";
     const model = new BayesianHazardModel();
-    model.recordOutcome({ chain: "optimism", opportunityId: `op:${risky}`, features: ["hot-reserve"], expectedProfitBps: 180, outcome: "lost_to_competitor" });
-    model.recordOutcome({ chain: "optimism", opportunityId: `op:${risky}`, features: ["hot-reserve"], expectedProfitBps: 180, outcome: "lost_to_competitor" });
-    model.recordOutcome({ chain: "optimism", opportunityId: `op:${safe}`, features: ["deep-liquidity"], expectedProfitBps: 90, outcome: "won" });
+    model.recordOutcome({ chain: "optimism", opportunityId: `op:${risky}`, features: ["hot-reserve", "providerScore:-2"], expectedProfitBps: 180, outcome: "lost_to_competitor" });
+    model.recordOutcome({ chain: "optimism", opportunityId: `op:${risky}`, features: ["hot-reserve", "providerScore:-2"], expectedProfitBps: 180, outcome: "lost_to_competitor" });
+    model.recordOutcome({ chain: "optimism", opportunityId: `op:${safe}`, features: ["deep-liquidity", "providerScore:3"], expectedProfitBps: 90, outcome: "won" });
     const ranker = new NoRegretOpportunityRanker({ model });
     const cache = new ReserveAwareBorrowerCache();
     cache.upsert(snapshot(risky));
@@ -155,7 +159,7 @@ describe("Phase 8 optimization chaos paths", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 30,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => "0xpublic",
         waitForReceipt: async () => ({ status: "included" }),
       },
@@ -201,7 +205,9 @@ describe("Phase 8 optimization chaos paths", () => {
           const ranked = ranker.rank(plans.map((plan) => ({
             chain,
             opportunityId: plan.request.opportunityId,
-            features: plan.request.account === risky ? ["hot-reserve"] : ["deep-liquidity"],
+            features: plan.request.account === risky
+              ? ["hot-reserve", "providerScore:-2"]
+              : ["deep-liquidity", "providerScore:3"],
             expectedProfitBps: plan.request.account === risky ? 180 : 90,
             plan,
           })));

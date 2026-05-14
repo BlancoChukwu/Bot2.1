@@ -64,7 +64,7 @@ describe("SafeTransactionExecutor chaos paths", () => {
           pendingNonceReads += 1;
           return 40;
         },
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async (_transaction, overrides) => {
           nonces.push(overrides.nonce);
           return `0x${overrides.nonce.toString(16)}`;
@@ -111,7 +111,7 @@ describe("SafeTransactionExecutor chaos paths", () => {
         estimateGas: async () => 900_000n,
         getGasPrice: async () => 1_000_000_000n,
         getPendingNonce: async () => 44,
-        simulate: async () => ({ success: true }),
+        simulateContract: async () => ({ success: true }),
         send: async () => {
           sends += 1;
           return "0xreorg";

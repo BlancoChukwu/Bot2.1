@@ -61,8 +61,13 @@ export interface PipelineOrchestratorConfig {
   readonly opportunityRanker?: PipelineOpportunityRanker;
   readonly outcomeObserver?: PipelineOutcomeObserver;
   readonly cycleObserver?: (summary: PipelineRunSummary) => void | Promise<void>;
-  buildExecutionRequest(candidate: LiquidationCandidate): SafeExecutionRequest | undefined;
-  buildExecutionRequestForOpportunity?(opportunity: Opportunity): SafeExecutionRequest | undefined;
+  readonly sequencerGuard?: {
+    isUp(chain: SupportedChain): Promise<boolean>;
+  };
+  buildExecutionRequest(candidate: LiquidationCandidate): SafeExecutionRequest | undefined | Promise<SafeExecutionRequest | undefined>;
+  buildExecutionRequestForOpportunity?(
+    opportunity: Opportunity,
+  ): SafeExecutionRequest | undefined | Promise<SafeExecutionRequest | undefined>;
 }
 
 export interface PipelineRunSummary {
@@ -165,6 +170,13 @@ export class PipelineOrchestrator {
   }
 
   private async runChain(chain: SupportedChain, summary: MutablePipelineRunSummary): Promise<void> {
+    if (this.config.sequencerGuard !== undefined) {
+      const sequencerUp = await this.config.sequencerGuard.isUp(chain);
+      if (!sequencerUp) {
+        this.config.logger.warn("pipeline_execution_paused_sequencer_down", { chain });
+        return;
+      }
+    }
     if (this.config.registry.get(chain).circuitBreakers.execution.status === "open") {
       this.config.logger.warn("pipeline_execution_circuit_open", { chain });
       return;
@@ -213,7 +225,7 @@ export class PipelineOrchestrator {
     const plans: PipelineExecutionPlan[] = [];
     for (const opportunity of opportunities) {
       try {
-        const request = this.buildExecutionRequest(opportunity);
+        const request = await this.buildExecutionRequest(opportunity);
         if (request !== undefined) {
           plans.push({
             chain,
@@ -422,7 +434,7 @@ export class PipelineOrchestrator {
     }
   }
 
-  private buildExecutionRequest(opportunity: Opportunity): SafeExecutionRequest | undefined {
+  private async buildExecutionRequest(opportunity: Opportunity): Promise<SafeExecutionRequest | undefined> {
     if (this.config.buildExecutionRequestForOpportunity !== undefined) {
       return this.config.buildExecutionRequestForOpportunity(opportunity);
     }
