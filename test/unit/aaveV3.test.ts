@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createChainRegistry } from "../../src/config/chainRegistry";
 import { getChainConfig } from "../../src/config/chains";
 import {
   buildFlashLoanSimpleParams,
@@ -8,6 +9,15 @@ import {
   ViemAaveV3Protocol,
 } from "../../src/protocols/aaveV3";
 
+const protocolRegistry = createChainRegistry({
+  chains: [{
+    chain: "optimism",
+    rpcUrl: "https://optimism.example",
+    fallbackRpcUrls: [],
+    aaveSubgraphUrl: "https://subgraph.example",
+  }],
+});
+
 describe("ViemAaveV3Protocol", () => {
   it("maps Aave pool account data into a typed user account", async () => {
     const account = "0x0000000000000000000000000000000000000001";
@@ -16,6 +26,10 @@ describe("ViemAaveV3Protocol", () => {
         readContract: async () => [1n, 2n, 3n, 4n, 5n, 6n] as const,
       },
       getChainConfig("optimism"),
+      undefined,
+      undefined,
+      50,
+      protocolRegistry,
     );
 
     const userAccount = await protocol.getUserAccount(account);
@@ -37,6 +51,10 @@ describe("ViemAaveV3Protocol", () => {
         readContract: async () => [1n, 2n, 3n, 4n, 5n, 6n] as const,
       },
       getChainConfig("optimism"),
+      undefined,
+      undefined,
+      50,
+      protocolRegistry,
     );
 
     const pair = await protocol.getBestLiquidationPair({
@@ -133,6 +151,7 @@ describe("ViemAaveV3Protocol", () => {
           ] as const;
         },
       },
+      registry: protocolRegistry,
     });
 
     expect(readAccounts).toHaveLength(2);
@@ -181,6 +200,7 @@ describe("ViemAaveV3Protocol", () => {
           ] as const;
         },
       },
+      registry: protocolRegistry,
     });
 
     expect(callCount).toBeGreaterThanOrEqual(2);
@@ -223,6 +243,7 @@ describe("ViemAaveV3Protocol", () => {
           ] as const;
         },
       },
+      registry: protocolRegistry,
     });
 
     expect(readAccounts).toEqual([
@@ -262,6 +283,7 @@ describe("ViemAaveV3Protocol", () => {
       },
       undefined,
       2,
+      protocolRegistry,
     );
 
     await protocol.getLiquidatablePositions();

@@ -1,4 +1,5 @@
 import type { Address, Hex } from "viem";
+import type { ChainRegistry } from "../config/chainRegistry";
 import type { AaveReservePair, ChainConfig } from "../config/chains";
 
 const wad = 1_000_000_000_000_000_000n;
@@ -91,6 +92,7 @@ export interface AavePositionScannerClient {
   readonly publicClient: AaveReadClient;
   readonly graphClient: AaveGraphClient;
   readonly pageSize?: number;
+  readonly registry: Pick<ChainRegistry, "getResolvedAave">;
 }
 
 interface BorrowerPage {
@@ -282,9 +284,10 @@ export async function getLiquidatablePositions(
 ): Promise<LiquidationCandidate[]> {
   const borrowers = await fetchAllBorrowers(optimismClient.graphClient, optimismClient.pageSize ?? 1_000);
   const positions: LiquidationCandidate[] = [];
+  const resolvedPool = optimismClient.registry.getResolvedAave(optimismClient.chain.name).pool;
 
   for (const account of borrowers) {
-    const userAccount = await readUserAccount(optimismClient.publicClient, optimismClient.chain, account);
+    const userAccount = await readUserAccount(optimismClient.publicClient, account, resolvedPool);
     if (calculateHealthFactor(userAccount) < wad) {
       positions.push(toLiquidationCandidate(userAccount, firstReservePair(optimismClient.chain)));
     }
@@ -303,10 +306,11 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
     private readonly graphClient?: AaveGraphClient,
     private readonly eventClient: AaveEventClient = publicClient,
     private readonly borrowerPageSize = 50,
+    private readonly registry?: Pick<ChainRegistry, "getResolvedAave">,
   ) {}
 
   public async getUserAccount(account: Address): Promise<AaveUserAccount> {
-    return readUserAccount(this.publicClient, this.chain, account);
+    return readUserAccount(this.publicClient, account, this.resolveAavePool());
   }
 
   public async getBestLiquidationPair(
@@ -353,7 +357,7 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
     }
 
     return this.eventClient.watchContractEvent({
-      address: this.chain.aave.pool,
+      address: this.resolveAavePool(),
       abi: aavePoolAbi,
       eventName: "ReserveDataUpdated",
       onLogs: (logs) => {
@@ -368,15 +372,22 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
   private advanceBorrowerCursor(rowsRead: number): void {
     this.nextBorrowerSkip = rowsRead < this.borrowerPageSize ? 0 : this.nextBorrowerSkip + this.borrowerPageSize;
   }
+
+  private resolveAavePool(): Address {
+    if (this.registry === undefined) {
+      throw new Error("ViemAaveV3Protocol requires chain registry for resolved Aave addresses");
+    }
+    return this.registry.getResolvedAave(this.chain.name).pool;
+  }
 }
 
 async function readUserAccount(
   publicClient: AaveReadClient,
-  chain: ChainConfig,
   account: Address,
+  pool: Address,
 ): Promise<AaveUserAccount> {
   const result = await publicClient.readContract({
-    address: chain.aave.pool,
+    address: pool,
     abi: aavePoolAbi,
     functionName: "getUserAccountData",
     args: [account],

@@ -9,6 +9,11 @@ import type { LiquidationCandidate } from "./protocols/aaveV3";
 import { calculateLiquidationEV } from "./utils/evCalculator";
 
 export type BotLatencyStage = "scan" | "execution" | "poll_cycle";
+export type PipelineLatencyStage =
+  | "event_to_detection_ms"
+  | "detection_to_submit_ms"
+  | "submit_to_inclusion_ms"
+  | "flashblocks_lead_ms";
 export interface LogContext {
   readonly chain?: string;
   readonly opportunityId?: string;
@@ -78,6 +83,15 @@ export interface BotMetrics {
   recordBundleSubmission(route: "public_rpc" | "private_bundle"): void;
   recordError(): void;
   recordLatency(stage: BotLatencyStage, durationSeconds: number, labels?: { readonly chain?: string }): void;
+  recordPipelineLatency(
+    stage: PipelineLatencyStage,
+    durationMs: number,
+    labels: {
+      readonly chain: string;
+      readonly provider: string;
+      readonly flashblocks: "enabled" | "disabled";
+    },
+  ): void;
   snapshot(): BotMetricsSnapshot;
 }
 
@@ -285,6 +299,13 @@ export function createBotMetrics(): BotMetrics {
     labelNames: ["route"],
     registers: [registry],
   });
+  const pipelineLatencyMilliseconds = new client.Histogram({
+    name: "pipeline_latency_ms",
+    help: "Pipeline latency by provider and Flashblocks mode",
+    labelNames: ["stage", "chain", "provider", "flashblocks"],
+    buckets: [5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 1_000, 2_000, 5_000],
+    registers: [registry],
+  });
 
   return {
     registry,
@@ -335,6 +356,14 @@ export function createBotMetrics(): BotMetrics {
     },
     recordLatency(stage, durationSeconds, labels = {}) {
       latencySeconds.observe({ stage, chain: labels.chain ?? "unknown" }, durationSeconds);
+    },
+    recordPipelineLatency(stage, durationMs, labels) {
+      pipelineLatencyMilliseconds.observe({
+        stage,
+        chain: labels.chain,
+        provider: labels.provider,
+        flashblocks: labels.flashblocks,
+      }, Math.max(0, durationMs));
     },
     snapshot() {
       return { ...snapshot };

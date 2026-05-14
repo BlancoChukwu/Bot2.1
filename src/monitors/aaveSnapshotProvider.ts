@@ -1,4 +1,5 @@
 import type { Address } from "viem";
+import type { ChainRegistry } from "../config/chainRegistry";
 import type { SupportedChain } from "../config/chains";
 import type { AaveUserAccount, AaveV3Protocol, LiquidationCandidate } from "../protocols/aaveV3";
 import { createAsset, createAssetAmount } from "../utils/typedAssetMath";
@@ -13,6 +14,7 @@ export class AaveSnapshotProvider {
   public constructor(
     private readonly chain: SupportedChain,
     private readonly protocol: AaveV3Protocol,
+    private readonly registry: Pick<ChainRegistry, "getResolvedAave">,
   ) {}
 
   public async getBorrowersForReserve(_chain: SupportedChain, _reserve: Address): Promise<Address[]> {
@@ -21,6 +23,7 @@ export class AaveSnapshotProvider {
   }
 
   public async refreshBorrowers(_chain: SupportedChain, accounts: readonly Address[]): Promise<readonly BorrowerSnapshot[]> {
+    this.registry.getResolvedAave(this.chain);
     const snapshots: BorrowerSnapshot[] = [];
     for (const account of accounts) {
       const snapshot = await this.refreshBorrower(account);
@@ -32,6 +35,7 @@ export class AaveSnapshotProvider {
   }
 
   public async pollBorrowers(_chain: SupportedChain): Promise<readonly BorrowerSnapshot[]> {
+    this.registry.getResolvedAave(this.chain);
     const candidates = await this.protocol.getLiquidatablePositions();
     return candidates.map((candidate) => toSnapshot(this.chain, candidate));
   }

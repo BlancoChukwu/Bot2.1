@@ -147,6 +147,7 @@ describe("createChainRegistry", () => {
     expect(base.chainConfig.aave.pool).toBe("0x1111111111111111111111111111111111111111");
     expect(base.chainConfig.aave.poolAddressesProvider).toBe("0x2222222222222222222222222222222222222222");
     expect(base.chainConfig.aave.uiPoolDataProvider).toBe("0x3333333333333333333333333333333333333333");
+    expect(base.chainConfig.aave).toEqual(registry.getResolvedAave("base"));
     expect(base.detection.wsPrimary).toBe("wss://base-primary.example");
     expect(base.detection.wsSecondary).toBe("wss://base-secondary.example");
     expect(base.detection.wsTertiary).toBe("wss://base-tertiary.example");

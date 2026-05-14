@@ -248,11 +248,23 @@ export function buildBot(config: RuntimeConfig, metrics: BotMetrics = createBotM
   const eventClient = config.wsRpcUrl === undefined
     ? publicClient
     : createChainWebSocketPublicClient({ chain: config.chain, wsRpcUrl: config.wsRpcUrl });
+  const singleChainRegistry = createChainRegistry({
+    chains: [{
+      chain: config.chain,
+      rpcUrl: config.executionRpcUrlPrimary,
+      fallbackRpcUrls: config.executionRpcFallbackUrls.length > 0 ? config.executionRpcFallbackUrls : config.fallbackRpcUrls,
+      ...(config.wsRpcUrl === undefined ? {} : { wsRpcUrl: config.wsRpcUrl }),
+      aaveSubgraphUrl: config.aaveSubgraphUrl,
+      flashLoanProviders: config.flashLoanProviders,
+    }],
+  });
   const protocol = new ViemAaveV3Protocol(
     publicClient,
     chainConfig,
     createGraphClient(config.aaveSubgraphUrl),
     eventClient,
+    50,
+    singleChainRegistry,
   );
   const monitor = new HealthFactorMonitor({
     protocol,
@@ -308,6 +320,31 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   const logger = createLogger(config.logLevel);
   const account = privateKeyToAccount(config.privateKey);
   const resolvedAaveCache = loadResolvedAaveAddressCache();
+  const registry = createChainRegistry({
+    chains: config.chains.map((chainName) => ({
+      chain: chainName,
+      rpcUrl: config.rpcUrl,
+      fallbackRpcUrls: config.fallbackRpcUrls,
+      ...(config.wsRpcUrl === undefined ? {} : { wsRpcUrl: config.wsRpcUrl }),
+      detection: {
+        ...(config.wsRpcUrlPrimary === undefined ? {} : { wsPrimary: config.wsRpcUrlPrimary }),
+        ...(config.wsRpcUrlSecondary === undefined ? {} : { wsSecondary: config.wsRpcUrlSecondary }),
+        ...(config.wsRpcUrlTertiary === undefined ? {} : { wsTertiary: config.wsRpcUrlTertiary }),
+        flashblocksEnabled: config.flashblocksEnabled,
+      },
+      execution: {
+        httpPrimary: config.executionRpcUrlPrimary,
+        fallbacks: config.executionRpcFallbackUrls,
+      },
+      sequencer: {
+        ...(config.sequencerUptimeFeed === undefined ? {} : { uptimeFeed: config.sequencerUptimeFeed }),
+        ...(config.sequencerDirectRpc === undefined ? {} : { directRpc: config.sequencerDirectRpc }),
+      },
+      ...(resolvedAaveCache[chainName] === undefined ? {} : { resolvedAave: resolvedAaveCache[chainName] }),
+      aaveSubgraphUrl: config.aaveSubgraphByChain.get(chainName)!,
+      flashLoanProviders: config.flashLoanProviders,
+    })),
+  });
   const cachedResolvedForActive = resolvedAaveCache[config.chain];
   let activeChainConfig = withResolvedAave(getChainConfig(config.chain), cachedResolvedForActive);
   let activePoolAddress = activeChainConfig.aave.pool;
@@ -330,6 +367,8 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     activeChainConfig,
     createGraphClient(config.aaveSubgraphUrl),
     eventClient,
+    50,
+    registry,
   );
   const chainConfig = activeChainConfig;
   const priceOracleCache = config.priceFeedRegistry === undefined
@@ -397,32 +436,6 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     slippageBps: config.slippageBps,
     resolveDynamicSlippageBps,
     logger,
-  });
-
-  const registry = createChainRegistry({
-    chains: config.chains.map((chainName) => ({
-      chain: chainName,
-      rpcUrl: config.rpcUrl,
-      fallbackRpcUrls: config.fallbackRpcUrls,
-      ...(config.wsRpcUrl === undefined ? {} : { wsRpcUrl: config.wsRpcUrl }),
-      detection: {
-        ...(config.wsRpcUrlPrimary === undefined ? {} : { wsPrimary: config.wsRpcUrlPrimary }),
-        ...(config.wsRpcUrlSecondary === undefined ? {} : { wsSecondary: config.wsRpcUrlSecondary }),
-        ...(config.wsRpcUrlTertiary === undefined ? {} : { wsTertiary: config.wsRpcUrlTertiary }),
-        flashblocksEnabled: config.flashblocksEnabled,
-      },
-      execution: {
-        httpPrimary: config.executionRpcUrlPrimary,
-        fallbacks: config.executionRpcFallbackUrls,
-      },
-      sequencer: {
-        ...(config.sequencerUptimeFeed === undefined ? {} : { uptimeFeed: config.sequencerUptimeFeed }),
-        ...(config.sequencerDirectRpc === undefined ? {} : { directRpc: config.sequencerDirectRpc }),
-      },
-      ...(resolvedAaveCache[chainName] === undefined ? {} : { resolvedAave: resolvedAaveCache[chainName] }),
-      aaveSubgraphUrl: config.aaveSubgraphByChain.get(chainName)!,
-      flashLoanProviders: config.flashLoanProviders,
-    })),
   });
 
   const usd = createAsset({ symbol: "USD", decimals: 8 });
@@ -500,7 +513,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   const hybridDetection = new HybridDetectionPipeline({
     registry,
     eventSource: detectionSource,
-    provider: new AaveSnapshotProvider(config.chain, protocol),
+    provider: new AaveSnapshotProvider(config.chain, protocol, registry),
     logger,
     metrics,
   });
@@ -734,11 +747,23 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
   const eventClient = config.wsRpcUrl === undefined
     ? publicClient
     : createChainWebSocketPublicClient({ chain: config.chain, wsRpcUrl: config.wsRpcUrl });
+  const replayRegistry = createChainRegistry({
+    chains: [{
+      chain: config.chain,
+      rpcUrl: config.rpcUrl,
+      fallbackRpcUrls: config.fallbackRpcUrls,
+      ...(config.wsRpcUrl === undefined ? {} : { wsRpcUrl: config.wsRpcUrl }),
+      aaveSubgraphUrl: config.aaveSubgraphUrl,
+      flashLoanProviders: ["aaveV3"],
+    }],
+  });
   const protocol = new ViemAaveV3Protocol(
     publicClient,
     chainConfig,
     createGraphClient(config.aaveSubgraphUrl),
     eventClient,
+    50,
+    replayRegistry,
   );
   const mockSequencerDown = parseBoolean(process.env.DRY_RUN_MOCK_SEQUENCER_DOWN, false);
   const sequencerUp = mockSequencerDown
@@ -779,19 +804,9 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
       };
     })
     .filter((event): event is { atMs: number; chain: SupportedChain; reserve: Address } => event !== undefined);
-  const replayRegistry = createChainRegistry({
-    chains: [{
-      chain: config.chain,
-      rpcUrl: config.rpcUrl,
-      fallbackRpcUrls: config.fallbackRpcUrls,
-      ...(config.wsRpcUrl === undefined ? {} : { wsRpcUrl: config.wsRpcUrl }),
-      aaveSubgraphUrl: config.aaveSubgraphUrl,
-      flashLoanProviders: ["aaveV3"],
-    }],
-  });
   const snapshots = await new ReplayHarness({
     registry: replayRegistry,
-    provider: new AaveSnapshotProvider(config.chain, protocol),
+    provider: new AaveSnapshotProvider(config.chain, protocol, replayRegistry),
     logger,
     metrics,
     events: replayEvents,

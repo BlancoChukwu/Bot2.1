@@ -5,6 +5,7 @@ import {
   calculateMarginBps,
   calculateNetProfit,
   meetsMinimumProfitMargin,
+  createAssetAmount,
   type AssetAmount,
 } from "../utils/typedAssetMath";
 
@@ -106,15 +107,23 @@ export class ProfitabilityEngine {
   }
 
   private calculateDeterministicProfit(input: ProfitSimulationInput): AssetAmount {
-    return calculateNetProfit({
-      revenue: input.revenue,
-      debt: input.debt,
-      gas: input.gas,
-      flashLoanFee: input.flashLoanFee,
-      swapCost: input.swapCost,
-      slippageBuffer: input.slippageBuffer,
-      safetyBuffer: input.safetyBuffer,
-    });
+    try {
+      return calculateNetProfit({
+        revenue: input.revenue,
+        debt: input.debt,
+        gas: input.gas,
+        flashLoanFee: input.flashLoanFee,
+        swapCost: input.swapCost,
+        slippageBuffer: input.slippageBuffer,
+        safetyBuffer: input.safetyBuffer,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("Asset subtraction would be negative")) {
+        return createAssetAmount(input.revenue.asset, 0n);
+      }
+      throw error;
+    }
   }
 
   private meetsMargin(netProfit: AssetAmount, input: ProfitSimulationInput): boolean {

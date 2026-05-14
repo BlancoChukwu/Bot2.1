@@ -76,10 +76,16 @@ export class HybridDetectionPipeline {
 
   public async pollFallback(chain: SupportedChain): Promise<void> {
     const startedAt = Date.now();
+    const resolvedAave = this.config.registry.getResolvedAave(chain);
     try {
       const snapshots = await this.config.provider.pollBorrowers(chain);
       this.upsertSnapshots(snapshots);
-      this.config.logger.info("fallback_poll_complete", { chain, borrowers: snapshots.length });
+      this.config.logger.info("fallback_poll_complete", {
+        chain,
+        borrowers: snapshots.length,
+        pool: resolvedAave.pool,
+        poolAddressesProvider: resolvedAave.poolAddressesProvider,
+      });
     } catch (error) {
       this.recordFailure(chain, "subgraph", error);
     } finally {
@@ -103,6 +109,7 @@ export class HybridDetectionPipeline {
 
   private async handleReserveUpdated(event: DetectionReserveEvent): Promise<void> {
     const startedAt = Date.now();
+    const resolvedAave = this.config.registry.getResolvedAave(event.chain);
     try {
       const borrowers = this.getCachedBorrowersForReserve(event.chain, event.reserve);
       const targetBorrowers = borrowers.length > 0
@@ -121,6 +128,8 @@ export class HybridDetectionPipeline {
         chain: event.chain,
         reserve: event.reserve,
         borrowers: targetBorrowers.length,
+        pool: resolvedAave.pool,
+        poolAddressesProvider: resolvedAave.poolAddressesProvider,
       });
     } catch (error) {
       this.recordFailure(event.chain, "rpc", error);

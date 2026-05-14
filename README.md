@@ -153,6 +153,60 @@ If live startup is **blocked**, logs show `deployment_safety_gate_blocked` with 
 
 ---
 
+## Base production runbook
+
+### Production Base env example
+
+```bash
+CHAIN=base
+CHAINS=base
+USE_PIPELINE_ORCHESTRATOR=true
+SIMULATION_MODE=true
+
+# Detection WS tiers (MultiWsEventSource primary/secondary/tertiary)
+WS_RPC_URL_PRIMARY=wss://<quicknode-base-ws>
+WS_RPC_URL_SECONDARY=wss://<alchemy-base-ws>
+WS_RPC_URL_TERTIARY=wss://<backup-base-ws>
+FLASHBLOCKS_ENABLED=true
+
+# Execution RPC path
+RPC_URL=https://<base-http-primary>
+FALLBACK_RPC_URLS=https://<base-http-fallback-1>,https://<base-http-fallback-2>
+EXECUTION_RPC_URL_PRIMARY=https://<base-exec-http-primary>
+EXECUTION_RPC_URL_FALLBACKS=https://<base-exec-http-fallback-1>,https://<base-exec-http-fallback-2>
+
+# Private tx routing and flash-loan providers
+PRIVATE_TX_MODE=auto
+FLASH_LOAN_PROVIDERS=aaveV3,balancer
+LIQUIDATION_RECEIVER_ADDRESS=0x...
+MIN_PROFIT_MARGIN_BPS=50
+```
+
+### Detection/scoring internals (what the bot does)
+
+- `MultiWsEventSource` tracks provider quality with a Bayesian + FTRL ranking model and promotes endpoints with faster, cleaner event streams.
+- When `FLASHBLOCKS_ENABLED=true`, block-driven `eth_getLogs` checks are sampled and reported as `flashblocks_lead_ms`.
+- The pipeline applies a sequencer guard before execution (`pipeline_execution_paused_sequencer_down`) when uptime feed says the sequencer is down.
+- Resolved Aave addresses are cached at `.cache/aave-addresses.json` and injected into chain registry entries (`getResolvedAave`).
+
+### Dry-run and benchmark commands
+
+```bash
+# Flash-wrapped dry-run replay (must produce profitable simulations)
+npm run start:sim -- --dry-run
+
+# Base latency + EV benchmark replay harness
+npm run benchmark:base
+```
+
+### Production notes (must read)
+
+- Public RPCs are not for production.
+- No Flashbots on Base — direct sequencer + provider private-tx.
+- Flash-loan wrapper mandatory.
+
+---
+
 ## Observability
 
 - **Logging** — Structured **JSON logs** via **Pino** (`createLogger` in `src/bot.ts`). Set `LOG_LEVEL` to control verbosity.

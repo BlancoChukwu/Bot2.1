@@ -7,8 +7,8 @@ const blockCallbacks = new Map<string, (blockNumber: bigint) => void | Promise<v
 const errorCallbacks = new Map<string, (error: Error) => void>();
 const blockErrorCallbacks = new Map<string, (error: Error) => void>();
 const stopFns: Array<() => void> = [];
-const closeFns: Array<() => void> = [];
-const destroyFns: Array<() => void> = [];
+const closeFns: Array<ReturnType<typeof vi.fn>> = [];
+const destroyFns: Array<ReturnType<typeof vi.fn>> = [];
 let blockLogs: readonly unknown[] = [];
 let getLogsImpl: () => Promise<readonly unknown[]> = async () => blockLogs;
 let returnUndefinedContractStop = false;

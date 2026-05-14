@@ -86,6 +86,7 @@ export interface RegisteredChain {
 export interface ChainRegistry {
   listChains(): SupportedChain[];
   get(chain: SupportedChain): RegisteredChain;
+  getResolvedAave(chain: SupportedChain): RegisteredChain["chainConfig"]["aave"];
   setCircuitBreakerState(chain: SupportedChain, name: CircuitBreakerName, state: CircuitBreakerState): void;
 }
 
@@ -149,6 +150,9 @@ export function createChainRegistry(input: ChainRegistryInput): ChainRegistry {
         throw new Error(`Chain is not registered: ${chain}`);
       }
       return entry;
+    },
+    getResolvedAave(chain) {
+      return this.get(chain).chainConfig.aave;
     },
     setCircuitBreakerState(chain, name, state) {
       const entry = this.get(chain);

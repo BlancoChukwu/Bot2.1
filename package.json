@@ -13,6 +13,7 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage --pool=forks --no-file-parallelism",
     "test:watch": "vitest",
+    "benchmark:base": "ts-node test/integration/benchmark.replay.ts",
     "compile:contracts": "node scripts/compile-liquidation-receiver.mjs",
     "deploy:liquidation-receiver:base": "ts-node scripts/deploy-liquidation-receiver-base.ts"
   },

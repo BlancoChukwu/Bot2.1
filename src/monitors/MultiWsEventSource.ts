@@ -77,7 +77,9 @@ export class MultiWsEventSource implements DetectionEventSource {
   }
 
   private subscribeProvider(providerName: string, wsUrl: string, handlers: DetectionEventHandlers): void {
-    const poolAddress = this.config.registry.get(this.config.chain).chainConfig.aave.pool;
+    const chainEntry = this.config.registry.get(this.config.chain);
+    const poolAddress = this.config.registry.getResolvedAave(this.config.chain).pool;
+    const flashblocks = chainEntry.detection.flashblocksEnabled ? "enabled" : "disabled";
     const wsClient = createChainWebSocketPublicClient({ chain: this.config.chain, wsRpcUrl: wsUrl });
     this.wsClients.push(wsClient);
     for (const eventName of trackedEvents) {
@@ -122,6 +124,11 @@ export class MultiWsEventSource implements DetectionEventSource {
           if (state !== undefined) {
             state.lastFlashblockLeadMs = Math.max(1, Date.now() - started);
             state.score += state.lastFlashblockLeadMs <= 120 ? 1 : -0.5;
+            this.config.metrics.recordPipelineLatency("flashblocks_lead_ms", state.lastFlashblockLeadMs, {
+              chain: this.config.chain,
+              provider: providerName,
+              flashblocks,
+            });
           }
           await this.handleLogs(providerName, "ReserveDataUpdated", logs, handlers);
         },
@@ -149,6 +156,9 @@ export class MultiWsEventSource implements DetectionEventSource {
   ): Promise<void> {
     const provider = this.providerStates.get(providerName);
     const receivedAt = Date.now();
+    const flashblocks = this.config.registry.get(this.config.chain).detection.flashblocksEnabled
+      ? "enabled"
+      : "disabled";
     if (provider === undefined) {
       return;
     }
@@ -186,7 +196,7 @@ export class MultiWsEventSource implements DetectionEventSource {
         const started = Date.now();
         try {
           await this.readClient.getLogs({
-            address: this.config.registry.get(this.config.chain).chainConfig.aave.pool,
+            address: this.config.registry.getResolvedAave(this.config.chain).pool,
             fromBlock: blockNumber,
             toBlock: blockNumber,
           });
@@ -197,6 +207,11 @@ export class MultiWsEventSource implements DetectionEventSource {
         }
       }
       this.config.metrics.recordLatency("scan", provider.lastEventToDetectionMs / 1_000, { chain: `${this.config.chain}:${providerName}` });
+      this.config.metrics.recordPipelineLatency("event_to_detection_ms", provider.lastEventToDetectionMs, {
+        chain: this.config.chain,
+        provider: providerName,
+        flashblocks,
+      });
       this.config.logger.info("multi_ws_event_detected", {
         chain: this.config.chain,
         provider: providerName,

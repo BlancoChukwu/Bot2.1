@@ -181,6 +181,12 @@ export class SafeTransactionExecutor {
         return { status: "simulated" };
       }
 
+      this.recordPipelineLatency(
+        "detection_to_submit_ms",
+        request,
+        transaction.provider,
+        Date.now() - startedAt,
+      );
       return await this.submitWithReplacement(request, transaction, overrides);
     } catch (error) {
       this.config.metrics.recordError();
@@ -230,12 +236,19 @@ export class SafeTransactionExecutor {
     transaction: TransactionEnvelope,
     overrides: TransactionOverrides,
   ): Promise<SafeExecutionResult> {
+    const submissionStartedAt = Date.now();
     const firstHash = await this.sendOrReplaceUnderpriced(request, transaction, overrides);
     if (firstHash === undefined) {
       return { status: "failed", reason: "send_failed" };
     }
     const firstReceipt = await this.config.client.waitForReceipt(firstHash);
     if (firstReceipt.status === "included") {
+      this.recordPipelineLatency(
+        "submit_to_inclusion_ms",
+        request,
+        transaction.provider,
+        Date.now() - submissionStartedAt,
+      );
       return { status: "sent", txHash: firstHash };
     }
     if (firstReceipt.status === "underpriced") {
@@ -249,6 +262,12 @@ export class SafeTransactionExecutor {
       }
       const replacementReceipt = await this.config.client.waitForReceipt(replacementHash);
       if (replacementReceipt.status === "included") {
+        this.recordPipelineLatency(
+          "submit_to_inclusion_ms",
+          request,
+          transaction.provider,
+          Date.now() - submissionStartedAt,
+        );
         return { status: "sent", txHash: replacementHash };
       }
       return toFailedReceipt(replacementReceipt);
@@ -418,6 +437,19 @@ export class SafeTransactionExecutor {
   private async resyncNonce(request: SafeExecutionRequest): Promise<void> {
     const nextNonce = await this.config.client.getPendingNonce(request.chain, request.account);
     this.config.nonceManager.resync(request.chain, request.account, nextNonce);
+  }
+
+  private recordPipelineLatency(
+    stage: "detection_to_submit_ms" | "submit_to_inclusion_ms",
+    request: SafeExecutionRequest,
+    provider: FlashLoanProviderId,
+    durationMs: number,
+  ): void {
+    this.config.metrics.recordPipelineLatency(stage, durationMs, {
+      chain: request.chain,
+      provider,
+      flashblocks: this.config.registry.get(request.chain).detection.flashblocksEnabled ? "enabled" : "disabled",
+    });
   }
 }
 

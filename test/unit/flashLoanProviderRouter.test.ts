@@ -79,6 +79,7 @@ describe("FlashLoanProviderRouter", () => {
       registry: {
         listChains: () => ["optimism"],
         get: () => openChain,
+        getResolvedAave: () => openChain.chainConfig.aave,
         setCircuitBreakerState: () => undefined,
       },
       logger: createLogger("silent"),

@@ -357,6 +357,7 @@ describe("PipelineOrchestrator", () => {
       registry: {
         listChains: () => ["optimism"],
         get: () => openChain,
+        getResolvedAave: () => openChain.chainConfig.aave,
         setCircuitBreakerState: () => undefined,
       },
       detection: detection(cache),
