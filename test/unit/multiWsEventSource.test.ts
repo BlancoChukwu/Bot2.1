@@ -602,4 +602,119 @@ describe("MultiWsEventSource", () => {
     expect(closeFns.some((close) => close.mock.calls.length > 0)).toBe(true);
     expect(destroyFns.some((destroy) => destroy.mock.calls.length > 0)).toBe(true);
   });
+
+  it("uses FTRL ranking mode when enabled and rollout is 100", async () => {
+    const info = vi.fn();
+    const source = new MultiWsEventSource({
+      registry: createChainRegistry({
+        chains: [{
+          chain: "optimism",
+          rpcUrl: "https://optimism.example",
+          fallbackRpcUrls: [],
+          detection: { wsPrimary: "wss://primary.example", wsSecondary: "wss://secondary.example" },
+          aaveSubgraphUrl: "https://subgraph.example",
+        }],
+      }),
+      chain: "optimism",
+      logger: {
+        info,
+        warn: () => undefined,
+        error: () => undefined,
+      },
+      metrics: createBotMetrics(),
+      ftrlScoring: {
+        enabled: true,
+        rolloutPct: 100,
+        randomSeed: 10,
+      },
+    });
+    const stop = await source.start({
+      onReserveUpdated: () => undefined,
+      onError: () => undefined,
+    });
+    activeStops.push(stop);
+    await callbacks.get("wss://primary.example:ReserveDataUpdated")?.([{
+      blockHash: "0xrank",
+      transactionHash: "0xtxrank",
+      logIndex: 7,
+      blockNumber: 120n,
+      args: { reserve: "0x0000000000000000000000000000000000000002" },
+    }]);
+    const rankingCall = info.mock.calls.find((call) => call[0] === "multi_ws_provider_ranking");
+    expect(rankingCall?.[1]).toMatchObject({ mode: "ftrl" });
+  });
+
+  it("handles ranking/logging when scorer is undefined and MIN_PROFIT_USD is invalid", async () => {
+    const previousMinProfit = process.env.MIN_PROFIT_USD;
+    process.env.MIN_PROFIT_USD = "not-a-number";
+    const info = vi.fn();
+    const source = new MultiWsEventSource({
+      registry: createChainRegistry({
+        chains: [{
+          chain: "optimism",
+          rpcUrl: "https://optimism.example",
+          fallbackRpcUrls: [],
+          detection: { wsPrimary: "wss://primary.example" },
+          aaveSubgraphUrl: "https://subgraph.example",
+        }],
+      }),
+      chain: "optimism",
+      logger: { info, warn: () => undefined, error: () => undefined },
+      metrics: createBotMetrics(),
+    });
+    (source as unknown as {
+      providerStates: Map<string, {
+        name: string;
+        wsUrl: string;
+        legacyScore: number;
+        eventCount: number;
+        missedOpportunities: number;
+        lastEventToDetectionMs: number;
+        lastGetLogsMs: number;
+        lastFlashblockLeadMs: number;
+      }>;
+      scorer: undefined;
+      handleLogs: (
+        providerName: string,
+        eventName: "ReserveDataUpdated",
+        logs: readonly unknown[],
+        handlers: { onReserveUpdated: () => void; onError: () => void },
+      ) => Promise<void>;
+    }).providerStates.set("primary", {
+      name: "primary",
+      wsUrl: "wss://primary.example",
+      legacyScore: 1,
+      eventCount: 0,
+      missedOpportunities: 0,
+      lastEventToDetectionMs: 0,
+      lastGetLogsMs: 0,
+      lastFlashblockLeadMs: 0,
+    });
+    await (source as unknown as {
+      handleLogs: (
+        providerName: string,
+        eventName: "ReserveDataUpdated",
+        logs: readonly unknown[],
+        handlers: { onReserveUpdated: () => void; onError: () => void },
+      ) => Promise<void>;
+    }).handleLogs(
+      "primary",
+      "ReserveDataUpdated",
+      [{
+        blockHash: "0xlegacy",
+        transactionHash: "0xtxlegacy",
+        logIndex: 1,
+        blockNumber: 11n,
+        args: { reserve: "0x0000000000000000000000000000000000000002" },
+      }],
+      { onReserveUpdated: () => undefined, onError: () => undefined },
+    );
+    const rankingCall = info.mock.calls.find((call) => call[0] === "multi_ws_provider_ranking");
+    expect(rankingCall?.[1]).toMatchObject({ mode: "legacy" });
+    if (previousMinProfit === undefined) {
+      delete process.env.MIN_PROFIT_USD;
+    } else {
+      process.env.MIN_PROFIT_USD = previousMinProfit;
+    }
+  });
 });

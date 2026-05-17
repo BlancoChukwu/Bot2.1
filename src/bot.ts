@@ -14,6 +14,11 @@ export type PipelineLatencyStage =
   | "detection_to_submit_ms"
   | "submit_to_inclusion_ms"
   | "flashblocks_lead_ms";
+export type ProviderRegretBaseline = "best_fixed" | "best_hindsight_signal";
+export type ProviderRegretKind = "instantaneous" | "cumulative";
+export type ProviderLossComponent = "latency" | "missed_ev" | "get_logs" | "flashblocks" | "error" | "hazard";
+export type ProviderSelectionMode = "legacy" | "ftrl";
+export type OpportunityRegretBaseline = "best_fixed";
 export interface LogContext {
   readonly chain?: string;
   readonly opportunityId?: string;
@@ -91,6 +96,29 @@ export interface BotMetrics {
       readonly provider: string;
       readonly flashblocks: "enabled" | "disabled";
     },
+  ): void;
+  recordProviderRegret(
+    baseline: ProviderRegretBaseline,
+    kind: ProviderRegretKind,
+    value: number,
+    labels: { readonly chain: string },
+  ): void;
+  recordProviderWeight(
+    weight: number,
+    labels: { readonly chain: string; readonly provider: string },
+  ): void;
+  recordProviderLossComponent(
+    component: ProviderLossComponent,
+    value: number,
+    labels: { readonly chain: string; readonly provider: string },
+  ): void;
+  recordProviderSelection(
+    labels: { readonly chain: string; readonly provider: string; readonly mode: ProviderSelectionMode },
+  ): void;
+  recordOpportunityRegret(
+    baseline: OpportunityRegretBaseline,
+    value: number,
+    labels: { readonly chain: string },
   ): void;
   snapshot(): BotMetricsSnapshot;
 }
@@ -306,6 +334,37 @@ export function createBotMetrics(): BotMetrics {
     buckets: [5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 1_000, 2_000, 5_000],
     registers: [registry],
   });
+  const providerRegret = new client.Gauge({
+    name: "provider_scoring_regret",
+    help: "Provider scoring regret by baseline and accumulation kind",
+    labelNames: ["chain", "baseline", "kind"],
+    registers: [registry],
+  });
+  const providerWeight = new client.Gauge({
+    name: "provider_scoring_weight",
+    help: "Provider scoring probability/weight by provider",
+    labelNames: ["chain", "provider"],
+    registers: [registry],
+  });
+  const providerLossComponent = new client.Histogram({
+    name: "provider_scoring_loss_component",
+    help: "Normalized provider scoring loss components",
+    labelNames: ["chain", "provider", "component"],
+    buckets: [0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1],
+    registers: [registry],
+  });
+  const providerSelection = new client.Counter({
+    name: "provider_scoring_selection_total",
+    help: "Provider selected by scoring mode",
+    labelNames: ["chain", "provider", "mode"],
+    registers: [registry],
+  });
+  const opportunityRegret = new client.Gauge({
+    name: "opportunity_scoring_regret",
+    help: "Opportunity ranking cumulative regret by chain",
+    labelNames: ["chain", "baseline"],
+    registers: [registry],
+  });
 
   return {
     registry,
@@ -364,6 +423,39 @@ export function createBotMetrics(): BotMetrics {
         provider: labels.provider,
         flashblocks: labels.flashblocks,
       }, Math.max(0, durationMs));
+    },
+    recordProviderRegret(baseline, kind, value, labels) {
+      providerRegret.set({
+        chain: labels.chain,
+        baseline,
+        kind,
+      }, Math.max(0, value));
+    },
+    recordProviderWeight(weight, labels) {
+      providerWeight.set({
+        chain: labels.chain,
+        provider: labels.provider,
+      }, Math.max(0, Math.min(1, weight)));
+    },
+    recordProviderLossComponent(component, value, labels) {
+      providerLossComponent.observe({
+        chain: labels.chain,
+        provider: labels.provider,
+        component,
+      }, Math.max(0, Math.min(1, value)));
+    },
+    recordProviderSelection(labels) {
+      providerSelection.inc({
+        chain: labels.chain,
+        provider: labels.provider,
+        mode: labels.mode,
+      });
+    },
+    recordOpportunityRegret(baseline, value, labels) {
+      opportunityRegret.set({
+        chain: labels.chain,
+        baseline,
+      }, Math.max(0, value));
     },
     snapshot() {
       return { ...snapshot };

@@ -59,4 +59,17 @@ describe("observability foundations", () => {
     expect(output).toContain('provider="primary"');
     expect(output).toContain('flashblocks="enabled"');
   });
+
+  it("records provider scoring diagnostics metrics", async () => {
+    const metrics = createBotMetrics();
+    metrics.recordProviderRegret("best_fixed", "instantaneous", 0.12, { chain: "base" });
+    metrics.recordProviderWeight(0.63, { chain: "base", provider: "primary" });
+    metrics.recordProviderLossComponent("latency", 0.33, { chain: "base", provider: "primary" });
+    metrics.recordProviderSelection({ chain: "base", provider: "primary", mode: "ftrl" });
+    const output = await metrics.registry.metrics();
+    expect(output).toContain("provider_scoring_regret");
+    expect(output).toContain("provider_scoring_weight");
+    expect(output).toContain("provider_scoring_loss_component_bucket");
+    expect(output).toContain("provider_scoring_selection_total");
+  });
 });

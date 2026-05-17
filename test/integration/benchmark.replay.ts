@@ -18,6 +18,8 @@ import type { LiquidationCandidate } from "../../src/protocols/aaveV3";
 import { FlashLoanProviderRouter } from "../../src/profitability/flashLoanProviderRouter";
 import { createAsset, createAssetAmount } from "../../src/utils/typedAssetMath";
 import { parseRuntimeConfig } from "../../src/index";
+import { FTRLProviderScorer } from "../../src/monitors/FTRLProviderScorer";
+import { BayesianHazardModel, NoRegretOpportunityRanker } from "../../src/optimization/hazardPrediction";
 
 const reserveDataUpdated = parseAbiItem(
   "event ReserveDataUpdated(address indexed reserve,uint256 liquidityRate,uint256 stableBorrowRate,uint256 variableBorrowRate,uint256 liquidityIndex,uint256 variableBorrowIndex)",
@@ -31,6 +33,26 @@ interface BenchmarkArmSummary {
   readonly rejected: number;
   readonly failed: number;
 }
+
+interface ProviderScenarioSummary {
+  readonly scenario: string;
+  readonly staticRegret: number;
+  readonly heuristicRegret: number;
+  readonly ftrlRegret: number;
+  readonly staticLatencyMs: number;
+  readonly heuristicLatencyMs: number;
+  readonly ftrlLatencyMs: number;
+  readonly winner: "static" | "heuristic" | "ftrl";
+}
+interface OpportunityScenarioSummary {
+  readonly scenario: string;
+  readonly staticRegret: number;
+  readonly ftrlRegret: number;
+  readonly staticCapturedEvUsd: number;
+  readonly ftrlCapturedEvUsd: number;
+}
+type ProviderArm = "primary" | "secondary" | "tertiary";
+const providerArms: ProviderArm[] = ["primary", "secondary", "tertiary"];
 
 async function run(): Promise<void> {
   const runtime = parseRuntimeConfig(process.env);
@@ -235,6 +257,22 @@ async function run(): Promise<void> {
   if (p95 >= 200) {
     throw new Error(`event->detection p95 hard gate failed (${p95.toFixed(2)}ms >= 200ms)`);
   }
+  const providerScenarioSummary = runProviderScoringScenarios();
+  const ftrlScenarioRegressions = providerScenarioSummary.filter((scenario) =>
+    scenario.ftrlRegret > Math.min(scenario.staticRegret, scenario.heuristicRegret)
+      || scenario.ftrlLatencyMs > Math.min(scenario.staticLatencyMs, scenario.heuristicLatencyMs) * 1.05
+  );
+  if (ftrlScenarioRegressions.length > 0) {
+    throw new Error(`Provider scoring FTRL benchmark gate failed for scenarios: ${ftrlScenarioRegressions.map((item) => item.scenario).join(", ")}`);
+  }
+  const opportunityScenarioSummary = runOpportunityRankingScenarios();
+  const opportunityRegressions = opportunityScenarioSummary.filter((scenario) =>
+    scenario.ftrlRegret > scenario.staticRegret
+      || scenario.ftrlCapturedEvUsd < scenario.staticCapturedEvUsd
+  );
+  if (opportunityRegressions.length > 0) {
+    throw new Error(`Opportunity ranking FTRL benchmark gate failed for scenarios: ${opportunityRegressions.map((item) => item.scenario).join(", ")}`);
+  }
 
   logger.info("base_benchmark_replay_complete", {
     chain,
@@ -247,6 +285,81 @@ async function run(): Promise<void> {
     target_event_to_detection_ms: 100,
     privateArm,
     publicArm,
+    providerScoringScenarios: providerScenarioSummary,
+    opportunityScoringScenarios: opportunityScenarioSummary,
+    providerScoringWinners: providerScenarioSummary.reduce<Record<string, number>>((acc, scenario) => {
+      acc[scenario.winner] = (acc[scenario.winner] ?? 0) + 1;
+      return acc;
+    }, {}),
+  });
+}
+
+function runOpportunityRankingScenarios(): OpportunityScenarioSummary[] {
+  const scenarios = [
+    { name: "ev_stable", rounds: 250, driftAt: -1 },
+    { name: "gas_spike_drift", rounds: 250, driftAt: 110 },
+  ] as const;
+  return scenarios.map((scenario) => {
+    const model = new BayesianHazardModel();
+    const ranker = new NoRegretOpportunityRanker({ model });
+    let staticRegret = 0;
+    let ftrlRegret = 0;
+    let staticCapturedEvUsd = 0;
+    let ftrlCapturedEvUsd = 0;
+    for (let round = 0; round < scenario.rounds; round += 1) {
+      const gasDrift = scenario.driftAt >= 0 && round >= scenario.driftAt;
+      const options = [
+        {
+          chain: "base" as const,
+          opportunityId: `safe:${round}`,
+          features: ["type:liquidation", "safe"],
+          expectedProfitBps: 120,
+          signals: {
+            estimatedEvMissUsd: 12,
+            gasSpikePenalty: gasDrift ? 0.15 : 0.05,
+            closeFactorRisk: 0.1,
+            oracleLatencyMs: 20,
+          },
+        },
+        {
+          chain: "base" as const,
+          opportunityId: `risky:${round}`,
+          features: ["type:liquidation", "risky"],
+          expectedProfitBps: 220,
+          signals: {
+            estimatedEvMissUsd: gasDrift ? 8 : 22,
+            gasSpikePenalty: gasDrift ? 0.9 : 0.2,
+            closeFactorRisk: gasDrift ? 0.85 : 0.55,
+            oracleLatencyMs: gasDrift ? 300 : 80,
+          },
+        },
+      ] as const;
+      const staticSelected = options[1]!;
+      const ranked = ranker.rank(options);
+      const ftrlSelected = ranked[0] ?? options[0]!;
+      const staticEv = staticSelected.signals?.estimatedEvMissUsd ?? 0;
+      const ftrlEv = ftrlSelected.signals?.estimatedEvMissUsd ?? 0;
+      const bestEv = Math.max(...options.map((option) => option.signals?.estimatedEvMissUsd ?? 0));
+      staticCapturedEvUsd += staticEv;
+      ftrlCapturedEvUsd += ftrlEv;
+      staticRegret += bestEv - staticEv;
+      ftrlRegret += bestEv - ftrlEv;
+      ranker.recordOutcome({
+        chain: ftrlSelected.chain,
+        opportunityId: ftrlSelected.opportunityId,
+        features: ftrlSelected.features,
+        expectedProfitBps: ftrlSelected.expectedProfitBps,
+        signals: ftrlSelected.signals,
+        outcome: ftrlEv >= staticEv ? "won" : "lost_to_competitor",
+      });
+    }
+    return {
+      scenario: scenario.name,
+      staticRegret: Number(staticRegret.toFixed(4)),
+      ftrlRegret: Number(ftrlRegret.toFixed(4)),
+      staticCapturedEvUsd: Number(staticCapturedEvUsd.toFixed(4)),
+      ftrlCapturedEvUsd: Number(ftrlCapturedEvUsd.toFixed(4)),
+    };
   });
 }
 
@@ -376,6 +489,115 @@ function percentile(values: readonly number[], p: number): number {
   const sorted = [...values].sort((left, right) => left - right);
   const rank = Math.ceil((p / 100) * sorted.length) - 1;
   return sorted[Math.max(0, Math.min(sorted.length - 1, rank))] ?? 0;
+}
+
+function runProviderScoringScenarios(): ProviderScenarioSummary[] {
+  const scenarios = [
+    { name: "stable", rounds: 600, mode: "stable" as const },
+    { name: "latency_drift_x2", rounds: 600, mode: "drift" as const },
+    { name: "outage_spikes", rounds: 600, mode: "outage" as const },
+  ];
+  return scenarios.map((scenario) => {
+    const staticProvider: ProviderArm = "primary";
+    const ftrl = new FTRLProviderScorer({
+      providerIds: providerArms,
+      enabled: true,
+      rolloutPct: 100,
+      randomSeed: 1337,
+    });
+    const heuristicLossEma = new Map<string, number>([
+      ["primary", 0.5],
+      ["secondary", 0.5],
+      ["tertiary", 0.5],
+    ]);
+    const cumulativeLoss = {
+      static: 0,
+      heuristic: 0,
+      ftrl: 0,
+    };
+    for (let round = 0; round < scenario.rounds; round += 1) {
+      const losses = scenarioLosses(round, scenario.mode);
+      const bestFixedLoss = Math.min(...Object.values(losses));
+      cumulativeLoss.static += losses[staticProvider] - bestFixedLoss;
+      const heuristicProvider = ([...heuristicLossEma.entries()].sort((left, right) => left[1] - right[1])[0]?.[0] ?? "primary") as ProviderArm;
+      cumulativeLoss.heuristic += losses[heuristicProvider] - bestFixedLoss;
+      for (const [provider, loss] of Object.entries(losses)) {
+        const prev = heuristicLossEma.get(provider) ?? 0.5;
+        heuristicLossEma.set(provider, prev * 0.9 + loss * 0.1);
+      }
+
+      const selected = (ftrl.samplePrimary() as ProviderArm);
+      cumulativeLoss.ftrl += (losses[selected] ?? losses.primary) - bestFixedLoss;
+      ftrl.updateFromEvent(selected, {
+        eventToDetectionMs: (losses[selected] ?? losses.primary) * 400,
+        getLogsLatencyMs: (losses[selected] ?? losses.primary) * 120,
+        flashblocksLeadMs: Math.max(0, 150 - (losses[selected] ?? losses.primary) * 100),
+        missedOpportunities: (losses[selected] ?? losses.primary) > 0.8 ? 1 : 0,
+        estimatedMissedEvUsd: 10,
+        errorRate: (losses[selected] ?? losses.primary) > 0.9 ? 1 : 0,
+        errorSeverity: (losses[selected] ?? losses.primary) > 0.9 ? "outage" : "transient",
+      });
+    }
+    const staticLatencyMs = averageLatencyMs(staticProvider, scenario.mode);
+    const heuristicProvider = ([...heuristicLossEma.entries()].sort((left, right) => left[1] - right[1])[0]?.[0] ?? "primary") as ProviderArm;
+    const heuristicLatencyMs = averageLatencyMs(heuristicProvider, scenario.mode);
+    const ftrlProvider = (ftrl.rankProviders()[0] ?? "primary") as ProviderArm;
+    const ftrlLatencyMs = averageLatencyMs(ftrlProvider, scenario.mode);
+    const winner = cumulativeLoss.ftrl <= cumulativeLoss.heuristic && cumulativeLoss.ftrl <= cumulativeLoss.static
+      ? "ftrl"
+      : cumulativeLoss.heuristic <= cumulativeLoss.static
+        ? "heuristic"
+        : "static";
+    return {
+      scenario: scenario.name,
+      staticRegret: Number(cumulativeLoss.static.toFixed(4)),
+      heuristicRegret: Number(cumulativeLoss.heuristic.toFixed(4)),
+      ftrlRegret: Number(cumulativeLoss.ftrl.toFixed(4)),
+      staticLatencyMs: Number(staticLatencyMs.toFixed(2)),
+      heuristicLatencyMs: Number(heuristicLatencyMs.toFixed(2)),
+      ftrlLatencyMs: Number(ftrlLatencyMs.toFixed(2)),
+      winner,
+    };
+  });
+}
+
+function scenarioLosses(round: number, mode: "stable" | "drift" | "outage"): Record<ProviderArm, number> {
+  if (mode === "stable") {
+    return {
+      primary: 0.25 + ((round % 11) / 250),
+      secondary: 0.35 + ((round % 17) / 220),
+      tertiary: 0.40 + ((round % 13) / 210),
+    };
+  }
+  if (mode === "drift") {
+    const primaryDegraded = round > 180 && round < 420;
+    return {
+      primary: primaryDegraded ? 0.85 + ((round % 7) / 60) : 0.30 + ((round % 13) / 240),
+      secondary: 0.38 + ((round % 19) / 240),
+      tertiary: 0.42 + ((round % 11) / 210),
+    };
+  }
+  const outagePrimary = round % 90 < 18;
+  const outageSecondary = round % 130 < 15;
+  return {
+    primary: outagePrimary ? 1 : 0.32 + ((round % 9) / 220),
+    secondary: outageSecondary ? 0.95 : 0.36 + ((round % 15) / 240),
+    tertiary: 0.44 + ((round % 21) / 220),
+  };
+}
+
+function averageLatencyMs(provider: ProviderArm, mode: "stable" | "drift" | "outage"): number {
+  const baseline = provider === "primary" ? 45 : provider === "secondary" ? 60 : 72;
+  if (mode === "stable") {
+    return baseline;
+  }
+  if (mode === "drift") {
+    return provider === "primary" ? baseline * 2 : baseline;
+  }
+  if (provider === "primary" || provider === "secondary") {
+    return baseline * 1.6;
+  }
+  return baseline;
 }
 
 function createGraphClient(url: string) {

@@ -1,12 +1,21 @@
 import type { SupportedChain } from "../config/chains";
+import { FTRLNoRegretScorer, type FTRLNoRegretScorerConfig } from "./FTRLNoRegretScorer";
 
 export type HazardOutcome = "won" | "missed" | "reverted" | "lost_to_competitor";
+
+export interface OpportunitySignalVector {
+  readonly estimatedEvMissUsd?: number;
+  readonly gasSpikePenalty?: number;
+  readonly closeFactorRisk?: number;
+  readonly oracleLatencyMs?: number;
+}
 
 export interface HazardPredictionInput {
   readonly chain: SupportedChain;
   readonly opportunityId: string;
   readonly features: readonly string[];
   readonly expectedProfitBps: number;
+  readonly signals?: OpportunitySignalVector;
 }
 
 export interface HazardOutcomeInput extends HazardPredictionInput {
@@ -32,6 +41,16 @@ interface FeatureState {
   weightBps: number;
 }
 
+export interface NoRegretOpportunityRankerConfig {
+  readonly model: BayesianHazardModel;
+  readonly scorerConfig?: FTRLNoRegretScorerConfig;
+}
+
+export interface OpportunityRankDiagnostics {
+  readonly cumulativeRegret: number;
+  readonly eta: number;
+}
+
 const bpsDenominator = 10_000;
 
 export class BayesianHazardModel {
@@ -48,19 +67,14 @@ export class BayesianHazardModel {
 
   public predict(input: HazardPredictionInput): HazardPrediction {
     const states = this.statesFor(input.chain, input.features);
-    const successProbabilityBps = Math.round(
-      states.reduce((sum, state) => sum + this.featureSuccessBps(state), 0) / states.length,
-    );
-    const weightBps = Math.round(
-      states.reduce((sum, state) => sum + state.weightBps, 0) / states.length,
-    );
-    const adjustedSuccessBps = Math.max(0, Math.min(bpsDenominator, (successProbabilityBps * weightBps) / bpsDenominator));
+    const successProbabilityBps = Math.round(states.reduce((sum, state) => sum + this.featureSuccessBps(state), 0) / states.length);
+    const weightBps = Math.round(states.reduce((sum, state) => sum + state.weightBps, 0) / states.length);
+    const adjustedSuccessBps = clamp((successProbabilityBps * weightBps) / bpsDenominator, 0, bpsDenominator);
     const utilityScore = Math.round((input.expectedProfitBps * adjustedSuccessBps) / bpsDenominator);
-
     return {
       opportunityId: input.opportunityId,
-      successProbabilityBps: Math.round(adjustedSuccessBps),
-      hazardBps: Math.round(bpsDenominator - adjustedSuccessBps),
+      successProbabilityBps: adjustedSuccessBps,
+      hazardBps: bpsDenominator - adjustedSuccessBps,
       utilityScore,
     };
   }
@@ -92,7 +106,6 @@ export class BayesianHazardModel {
     if (existing !== undefined) {
       return existing;
     }
-
     const created = {
       successes: this.priorSuccesses,
       failures: this.priorFailures,
@@ -103,120 +116,114 @@ export class BayesianHazardModel {
   }
 
   private featureSuccessBps(state: FeatureState): number {
-    return (state.successes * bpsDenominator) / (state.successes + state.failures);
+    return Math.round((state.successes * bpsDenominator) / (state.successes + state.failures));
   }
 }
 
-export interface NoRegretOpportunityRankerConfig {
-  readonly model: BayesianHazardModel;
-  readonly alpha?: number;
-  readonly beta?: number;
-  readonly l2Regularization?: number;
-}
+class OpportunityFTRLScorer extends FTRLNoRegretScorer {
+  private readonly lastLossByAction = new Map<string, number>();
 
-interface FtrlState {
-  n: number;
-  z: number;
-}
-
-export class FtrlOpportunityRanker {
-  private readonly states = new Map<string, FtrlState>();
-  private cumulativeRegret = 0;
-  private readonly alpha: number;
-  private readonly beta: number;
-  private readonly l2Regularization: number;
-
-  public constructor(private readonly config: NoRegretOpportunityRankerConfig) {
-    this.alpha = config.alpha ?? 0.5;
-    this.beta = config.beta ?? 1;
-    this.l2Regularization = config.l2Regularization ?? 1;
+  public constructor(config: FTRLNoRegretScorerConfig = {}) {
+    super(config);
   }
 
-  public rank<T extends HazardPredictionInput>(inputs: readonly T[]): T[] {
-    return [...inputs].sort((left, right) => {
-      const leftScore = this.score(left);
-      const rightScore = this.score(right);
-      if (leftScore === rightScore) {
-        return 0;
-      }
-      return leftScore > rightScore ? -1 : 1;
+  public rank<T extends HazardPredictionInput>(inputs: readonly T[], model: BayesianHazardModel): T[] {
+    const scored = inputs.map((input) => {
+      const actionId = actionIdFor(input);
+      this.ensureAction(actionId);
+      const prediction = model.predict(input);
+      const hazard = prediction.hazardBps / bpsDenominator;
+      const loss = expectedLoss(input, hazard);
+      const probability = this.probability(actionId);
+      const score = prediction.utilityScore - (loss * input.expectedProfitBps) - prediction.hazardBps / 100 + probability * 25;
+      return { input, score };
     });
+    return scored
+      .sort((left, right) => (right.score === left.score ? 0 : right.score > left.score ? 1 : -1))
+      .map((entry) => entry.input);
   }
 
-  public observe(input: HazardOutcomeInput): void {
-    const reward = outcomeReward(input.outcome);
-    const prediction = this.probability(input);
-    this.cumulativeRegret += Math.abs(reward - prediction);
-    for (const feature of this.featureKeys(input.chain, input.features)) {
-      const state = this.stateFor(feature);
-      const gradient = prediction - reward;
-      const sigma = (Math.sqrt(state.n + gradient * gradient) - Math.sqrt(state.n)) / this.alpha;
-      const weight = this.weightFor(state);
-      state.z += gradient - sigma * weight;
-      state.n += gradient * gradient;
+  public observe(input: HazardOutcomeInput, model: BayesianHazardModel): void {
+    const actionId = actionIdFor(input);
+    this.ensureAction(actionId);
+    const lossesByAction: Record<string, number> = {};
+    for (const knownActionId of this.actionIdsSnapshot()) {
+      if (knownActionId === actionId) {
+        const hazard = model.predict(input).hazardBps / bpsDenominator;
+        lossesByAction[knownActionId] = observedLoss(input, hazard);
+      } else {
+        const previous = this.lastLossByAction.get(knownActionId);
+        lossesByAction[knownActionId] = previous === undefined ? 0.5 : clamp(previous * 0.99 + 0.005, 0, 1);
+      }
     }
-  }
-
-  public getCumulativeRegret(): number {
-    return this.cumulativeRegret;
-  }
-
-  private score(input: HazardPredictionInput): number {
-    const utility = this.config.model.predict(input).utilityScore;
-    const ftrlWeight = this.featureKeys(input.chain, input.features)
-      .reduce((sum, feature) => sum + this.weightFor(this.stateFor(feature)), 0);
-    return utility + ftrlWeight * input.expectedProfitBps;
-  }
-
-  private probability(input: HazardPredictionInput): number {
-    const score = this.config.model.predict(input).successProbabilityBps / bpsDenominator;
-    return Math.max(0, Math.min(1, score));
-  }
-
-  private featureKeys(chain: SupportedChain, features: readonly string[]): string[] {
-    const scoped = features.length === 0 ? ["global"] : [...features];
-    return scoped.map((feature) => `${chain}:${feature}`);
-  }
-
-  private stateFor(feature: string): FtrlState {
-    const existing = this.states.get(feature);
-    if (existing !== undefined) {
-      return existing;
+    this.applyRoundLosses(lossesByAction);
+    this.lastLossByAction.clear();
+    for (const [knownActionId, loss] of Object.entries(lossesByAction)) {
+      this.lastLossByAction.set(knownActionId, loss);
     }
-    const created = { n: 0, z: 0 };
-    this.states.set(feature, created);
-    return created;
-  }
-
-  private weightFor(state: FtrlState): number {
-    if (Math.abs(state.z) <= this.l2Regularization) {
-      return 0;
-    }
-    const signed = state.z < 0 ? -1 : 1;
-    return -((state.z - signed * this.l2Regularization)
-      / ((this.beta + Math.sqrt(state.n)) / this.alpha + this.l2Regularization));
   }
 }
 
 export class NoRegretOpportunityRanker {
-  private readonly ftrl: FtrlOpportunityRanker;
+  private readonly scorer: OpportunityFTRLScorer;
 
   public constructor(private readonly config: NoRegretOpportunityRankerConfig) {
-    this.ftrl = new FtrlOpportunityRanker(config);
+    this.scorer = new OpportunityFTRLScorer({
+      enabled: true,
+      rolloutPct: 100,
+      epsilonStart: 0.05,
+      epsilonEnd: 0.01,
+      ...(config.scorerConfig ?? {}),
+    });
   }
 
   public rank<T extends HazardPredictionInput>(inputs: readonly T[]): T[] {
-    return this.ftrl.rank(inputs);
+    return this.scorer.rank(inputs, this.config.model);
   }
 
   public recordOutcome(input: HazardOutcomeInput): void {
     this.config.model.recordOutcome(input);
-    this.ftrl.observe(input);
+    this.scorer.observe(input, this.config.model);
   }
 
   public cumulativeRegret(): number {
-    return this.ftrl.getCumulativeRegret();
+    return this.scorer.diagnostics().cumulativeRegretBestFixed;
   }
+
+  public diagnostics(): OpportunityRankDiagnostics {
+    const diagnostics = this.scorer.diagnostics();
+    return {
+      cumulativeRegret: diagnostics.cumulativeRegretBestFixed,
+      eta: diagnostics.eta,
+    };
+  }
+}
+
+function actionIdFor(input: HazardPredictionInput): string {
+  const features = [...input.features].sort().join("|");
+  return `${input.chain}:${features.length === 0 ? "global" : features}`;
+}
+
+function expectedLoss(input: HazardPredictionInput, hazard: number): number {
+  const evMiss = normalizeEvMiss(input.signals?.estimatedEvMissUsd, input.expectedProfitBps);
+  const gasPenalty = clamp(input.signals?.gasSpikePenalty ?? 0, 0, 1);
+  const closeFactorRisk = clamp(input.signals?.closeFactorRisk ?? 0, 0, 1);
+  const oracleLatency = normalizeLatency(input.signals?.oracleLatencyMs ?? 0);
+  return clamp(
+    0.40 * evMiss
+    + 0.20 * gasPenalty
+    + 0.20 * closeFactorRisk
+    + 0.10 * oracleLatency
+    + 0.10 * hazard,
+    0,
+    1,
+  );
+}
+
+function observedLoss(input: HazardOutcomeInput, hazard: number): number {
+  const base = expectedLoss(input, hazard);
+  const rewardLoss = 1 - outcomeReward(input.outcome);
+  return clamp(0.6 * base + 0.4 * rewardLoss, 0, 1);
 }
 
 function outcomeReward(outcome: HazardOutcome): number {
@@ -226,5 +233,25 @@ function outcomeReward(outcome: HazardOutcome): number {
   if (outcome === "missed") {
     return 0.4;
   }
+  if (outcome === "lost_to_competitor") {
+    return 0.1;
+  }
   return 0;
+}
+
+function normalizeEvMiss(estimatedEvMissUsd: number | undefined, expectedProfitBps: number): number {
+  const fallback = Math.max(0, expectedProfitBps) / (bpsDenominator * 4);
+  if (estimatedEvMissUsd === undefined || !Number.isFinite(estimatedEvMissUsd)) {
+    return clamp(fallback, 0, 1);
+  }
+  return clamp(1 - Math.exp(-Math.max(0, estimatedEvMissUsd) / 25), 0, 1);
+}
+
+function normalizeLatency(latencyMs: number): number {
+  const safe = Number.isFinite(latencyMs) ? latencyMs : 0;
+  return clamp(1 - Math.exp(-Math.max(0, safe) / 250), 0, 1);
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }

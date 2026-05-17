@@ -4,7 +4,8 @@ import type { ChainRegistry } from "../config/chainRegistry";
 import { aavePoolAbi } from "../protocols/aaveV3";
 import type { BotMetrics, LoggerLike } from "../bot";
 import type { DetectionEventHandlers, DetectionEventSource } from "./hybridDetectionPipeline";
-import { BayesianHazardModel, FtrlOpportunityRanker } from "../optimization/hazardPrediction";
+import { BayesianHazardModel } from "../optimization/hazardPrediction";
+import { FTRLProviderScorer } from "./FTRLProviderScorer";
 
 const trackedEvents = ["ReserveDataUpdated", "Borrow", "Supply", "Repay", "Withdraw"] as const;
 type TrackedEventName = (typeof trackedEvents)[number];
@@ -12,7 +13,7 @@ type TrackedEventName = (typeof trackedEvents)[number];
 interface ProviderState {
   readonly name: string;
   readonly wsUrl: string;
-  score: number;
+  legacyScore: number;
   eventCount: number;
   missedOpportunities: number;
   lastEventToDetectionMs: number;
@@ -20,11 +21,19 @@ interface ProviderState {
   lastFlashblockLeadMs: number;
 }
 
+export interface MultiWsFtrlScoringConfig {
+  readonly enabled?: boolean;
+  readonly rolloutPct?: number;
+  readonly randomSeed?: number;
+  readonly persistencePath?: string;
+}
+
 export interface MultiWsEventSourceConfig {
   readonly registry: ChainRegistry;
   readonly chain: SupportedChain;
   readonly logger: LoggerLike;
   readonly metrics: BotMetrics;
+  readonly ftrlScoring?: MultiWsFtrlScoringConfig;
 }
 
 export class MultiWsEventSource implements DetectionEventSource {
@@ -34,8 +43,8 @@ export class MultiWsEventSource implements DetectionEventSource {
   private readonly reconnectTimers: NodeJS.Timeout[] = [];
   private readonly wsClients: unknown[] = [];
   private readonly readClient;
-  private readonly model = new BayesianHazardModel();
-  private readonly ftrl = new FtrlOpportunityRanker({ model: this.model });
+  private readonly hazardModel = new BayesianHazardModel();
+  private scorer?: FTRLProviderScorer;
 
   public constructor(private readonly config: MultiWsEventSourceConfig) {
     const entry = config.registry.get(config.chain);
@@ -54,13 +63,22 @@ export class MultiWsEventSource implements DetectionEventSource {
     for (const endpoint of endpoints) {
       this.providerStates.set(endpoint.name, {
         ...endpoint,
-        score: 0,
+        legacyScore: 0,
         eventCount: 0,
         missedOpportunities: 0,
         lastEventToDetectionMs: 0,
         lastGetLogsMs: 0,
         lastFlashblockLeadMs: 0,
       });
+    }
+    this.scorer = new FTRLProviderScorer({
+      providerIds: endpoints.map((endpoint) => endpoint.name),
+      enabled: this.config.ftrlScoring?.enabled ?? false,
+      rolloutPct: this.config.ftrlScoring?.rolloutPct ?? 10,
+      randomSeed: this.config.ftrlScoring?.randomSeed ?? 1_337,
+      ...(this.config.ftrlScoring?.persistencePath === undefined ? {} : { persistencePath: this.config.ftrlScoring.persistencePath }),
+    });
+    for (const endpoint of endpoints) {
       this.seedProvider(endpoint.name);
       this.subscribeProvider(endpoint.name, endpoint.wsUrl, handlers);
     }
@@ -94,13 +112,14 @@ export class MultiWsEventSource implements DetectionEventSource {
           const state = this.providerStates.get(providerName);
           if (state !== undefined) {
             state.missedOpportunities += 1;
-            state.score -= 2;
-            this.ftrl.observe({
-              chain: this.config.chain,
-              opportunityId: `${providerName}:ws_error:${Date.now()}`,
-              features: [`provider:${providerName}`, "signal:ws_error"],
-              expectedProfitBps: 100,
-              outcome: "missed",
+            state.legacyScore -= 2;
+            const hazard = this.hazardForProvider(providerName);
+            this.scorer?.updateFromError(providerName, {
+              missedOpportunities: state.missedOpportunities,
+              estimatedMissedEvUsd: this.estimatedMissedEvUsd(),
+              errorRate: 1,
+              errorSeverity: "outage",
+              hazardBps: hazard,
             });
           }
           handlers.onError(this.config.chain, error);
@@ -123,7 +142,11 @@ export class MultiWsEventSource implements DetectionEventSource {
           const state = this.providerStates.get(providerName);
           if (state !== undefined) {
             state.lastFlashblockLeadMs = Math.max(1, Date.now() - started);
-            state.score += state.lastFlashblockLeadMs <= 120 ? 1 : -0.5;
+            state.legacyScore += state.lastFlashblockLeadMs <= 120 ? 1 : -0.5;
+            this.scorer?.updateFromLatency(providerName, {
+              flashblocksLeadMs: state.lastFlashblockLeadMs,
+              hazardBps: this.hazardForProvider(providerName),
+            });
             this.config.metrics.recordPipelineLatency("flashblocks_lead_ms", state.lastFlashblockLeadMs, {
               chain: this.config.chain,
               provider: providerName,
@@ -188,7 +211,7 @@ export class MultiWsEventSource implements DetectionEventSource {
       }
       provider.eventCount += 1;
       provider.lastEventToDetectionMs = Math.max(1, Date.now() - receivedAt);
-      provider.score += 1 + this.ftrlBoost(providerName);
+      provider.legacyScore += 1;
       handlers.onReserveUpdated({ chain: this.config.chain, reserve });
 
       const blockNumber = shaped.blockNumber;
@@ -201,11 +224,29 @@ export class MultiWsEventSource implements DetectionEventSource {
             toBlock: blockNumber,
           });
           provider.lastGetLogsMs = Date.now() - started;
-          provider.score += provider.lastGetLogsMs <= 100 ? 0.5 : -0.5;
+          provider.legacyScore += provider.lastGetLogsMs <= 100 ? 0.5 : -0.5;
         } catch {
-          provider.score -= 1;
+          provider.legacyScore -= 1;
+          this.scorer?.updateFromError(providerName, {
+            errorRate: 0.5,
+            errorSeverity: "transient",
+            hazardBps: this.hazardForProvider(providerName),
+          });
         }
       }
+      const hazardBps = this.hazardForProvider(providerName);
+      const loss = this.scorer?.updateFromEvent(providerName, {
+        eventToDetectionMs: provider.lastEventToDetectionMs,
+        getLogsLatencyMs: provider.lastGetLogsMs,
+        flashblocksLeadMs: provider.lastFlashblockLeadMs,
+        missedOpportunities: provider.missedOpportunities,
+        estimatedMissedEvUsd: this.estimatedMissedEvUsd(),
+        errorRate: provider.missedOpportunities > 0
+          ? provider.missedOpportunities / Math.max(1, provider.eventCount + provider.missedOpportunities)
+          : 0,
+        errorSeverity: provider.missedOpportunities > 2 ? "repeated" : "transient",
+        hazardBps,
+      });
       this.config.metrics.recordLatency("scan", provider.lastEventToDetectionMs / 1_000, { chain: `${this.config.chain}:${providerName}` });
       this.config.metrics.recordPipelineLatency("event_to_detection_ms", provider.lastEventToDetectionMs, {
         chain: this.config.chain,
@@ -219,29 +260,93 @@ export class MultiWsEventSource implements DetectionEventSource {
         event_to_detection_ms: provider.lastEventToDetectionMs,
         eth_getLogs_ms: provider.lastGetLogsMs,
         flashblocks_lead_ms: provider.lastFlashblockLeadMs,
-        score: provider.score,
+        legacy_score: provider.legacyScore,
       });
-      this.ftrl.observe({
-        chain: this.config.chain,
-        opportunityId: `${providerName}:${dedupeKey}`,
-        features: [`provider:${providerName}`, `event:${eventName}`],
-        expectedProfitBps: 100,
-        outcome: "won",
-      });
+      if (loss !== undefined) {
+        this.config.metrics.recordProviderLossComponent("latency", loss.latency, {
+          chain: this.config.chain,
+          provider: providerName,
+        });
+        this.config.metrics.recordProviderLossComponent("missed_ev", loss.missedEv, {
+          chain: this.config.chain,
+          provider: providerName,
+        });
+        this.config.metrics.recordProviderLossComponent("get_logs", loss.getLogs, {
+          chain: this.config.chain,
+          provider: providerName,
+        });
+        this.config.metrics.recordProviderLossComponent("flashblocks", loss.flashblocks, {
+          chain: this.config.chain,
+          provider: providerName,
+        });
+        this.config.metrics.recordProviderLossComponent("error", loss.error, {
+          chain: this.config.chain,
+          provider: providerName,
+        });
+        this.config.metrics.recordProviderLossComponent("hazard", loss.hazard, {
+          chain: this.config.chain,
+          provider: providerName,
+        });
+      }
     }
 
+    const diagnostics = this.scorer?.getDiagnostics();
+    const selectedProvider = this.scorer?.samplePrimary();
+    const useFtrl = this.scorer?.shouldUseFtrl() ?? false;
     const ranked = [...this.providerStates.values()]
-      .sort((left, right) => right.score - left.score)
-      .map((state) => ({
-        provider: state.name,
-        score: Number(state.score.toFixed(2)),
-        event_to_detection_ms: state.lastEventToDetectionMs,
-        eth_getLogs_ms: state.lastGetLogsMs,
-        flashblocks_lead_ms: state.lastFlashblockLeadMs,
-        missed_opps: state.missedOpportunities,
-      }));
+      .sort((left, right) => {
+        if (!useFtrl || diagnostics === undefined) {
+          return right.legacyScore - left.legacyScore;
+        }
+        return (diagnostics.probabilities[right.name] ?? 0) - (diagnostics.probabilities[left.name] ?? 0);
+      })
+      .map((state) => {
+        const probability = diagnostics?.probabilities[state.name] ?? 0;
+        this.config.metrics.recordProviderWeight(probability, {
+          chain: this.config.chain,
+          provider: state.name,
+        });
+        return {
+          provider: state.name,
+          legacy_score: Number(state.legacyScore.toFixed(3)),
+          probability: Number(probability.toFixed(6)),
+          cumulative_loss: Number((diagnostics?.cumulativeLosses[state.name] ?? 0).toFixed(6)),
+          event_to_detection_ms: state.lastEventToDetectionMs,
+          eth_getLogs_ms: state.lastGetLogsMs,
+          flashblocks_lead_ms: state.lastFlashblockLeadMs,
+          missed_opps: state.missedOpportunities,
+        };
+      });
+    if (diagnostics !== undefined) {
+      this.config.metrics.recordProviderRegret("best_fixed", "instantaneous", diagnostics.instantaneousRegretBestFixed, {
+        chain: this.config.chain,
+      });
+      this.config.metrics.recordProviderRegret("best_fixed", "cumulative", diagnostics.cumulativeRegretBestFixed, {
+        chain: this.config.chain,
+      });
+      this.config.metrics.recordProviderRegret(
+        "best_hindsight_signal",
+        "cumulative",
+        diagnostics.cumulativeRegretBestHindsightSignal,
+        { chain: this.config.chain },
+      );
+    }
+    if (selectedProvider !== undefined) {
+      this.config.metrics.recordProviderSelection({
+        chain: this.config.chain,
+        provider: selectedProvider,
+        mode: useFtrl ? "ftrl" : "legacy",
+      });
+    }
     this.config.logger.info("multi_ws_provider_ranking", {
       chain: this.config.chain,
+      mode: useFtrl ? "ftrl" : "legacy",
+      selectedProvider,
+      eta: diagnostics?.eta,
+      epsilon: diagnostics?.epsilon,
+      fallbackActive: diagnostics?.fallbackActive,
+      cumulativeRegretBestFixed: diagnostics?.cumulativeRegretBestFixed,
+      cumulativeRegretBestHindsightSignal: diagnostics?.cumulativeRegretBestHindsightSignal,
       rankedProviders: ranked,
     });
   }
@@ -270,37 +375,27 @@ export class MultiWsEventSource implements DetectionEventSource {
   }
 
   private seedProvider(providerName: string): void {
-    this.ftrl.observe({
-      chain: this.config.chain,
-      opportunityId: `${providerName}:seed`,
-      features: [`provider:${providerName}`, "signal:seed"],
-      expectedProfitBps: 100,
-      outcome: providerName === "primary" ? "won" : "missed",
+    this.scorer?.updateFromEvent(providerName, {
+      eventToDetectionMs: providerName === "primary" ? 15 : 50,
+      getLogsLatencyMs: 20,
+      flashblocksLeadMs: 80,
+      hazardBps: this.hazardForProvider(providerName),
+      estimatedMissedEvUsd: this.estimatedMissedEvUsd(),
     });
   }
 
-  private ftrlBoost(providerName: string): number {
-    const ranked = this.ftrl.rank([
-      {
-        chain: this.config.chain,
-        opportunityId: "primary",
-        features: ["provider:primary"],
-        expectedProfitBps: 100,
-      },
-      {
-        chain: this.config.chain,
-        opportunityId: "secondary",
-        features: ["provider:secondary"],
-        expectedProfitBps: 100,
-      },
-      {
-        chain: this.config.chain,
-        opportunityId: "tertiary",
-        features: ["provider:tertiary"],
-        expectedProfitBps: 100,
-      },
-    ]);
-    const top = ranked[0]?.opportunityId;
-    return top === providerName ? 0.3 : 0;
+  private estimatedMissedEvUsd(): number {
+    const minProfitUsd = Number(process.env.MIN_PROFIT_USD ?? "10");
+    return Number.isFinite(minProfitUsd) && minProfitUsd > 0 ? minProfitUsd : 10;
+  }
+
+  private hazardForProvider(providerName: string): number {
+    const prediction = this.hazardModel.predict({
+      chain: this.config.chain,
+      opportunityId: `${providerName}:hazard`,
+      features: [`provider:${providerName}`],
+      expectedProfitBps: 100,
+    });
+    return prediction.hazardBps;
   }
 }

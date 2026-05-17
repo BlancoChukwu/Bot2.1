@@ -31,6 +31,10 @@ export interface PipelineOpportunityRanker {
   rank(chain: SupportedChain, plans: readonly PipelineExecutionPlan[]): Promise<readonly PipelineExecutionPlan[]>;
 }
 
+export interface PipelineOpportunitySubsetSelector {
+  select(chain: SupportedChain, plans: readonly PipelineExecutionPlan[]): Promise<readonly PipelineExecutionPlan[]>;
+}
+
 export interface PipelineExecutionPlan {
   readonly chain: SupportedChain;
   readonly opportunity: Opportunity;
@@ -59,6 +63,7 @@ export interface PipelineOrchestratorConfig {
   readonly metrics: BotMetrics;
   readonly maxCacheAgeMs?: number;
   readonly opportunityRanker?: PipelineOpportunityRanker;
+  readonly opportunitySubsetSelector?: PipelineOpportunitySubsetSelector;
   readonly outcomeObserver?: PipelineOutcomeObserver;
   readonly cycleObserver?: (summary: PipelineRunSummary) => void | Promise<void>;
   readonly sequencerGuard?: {
@@ -198,9 +203,10 @@ export class PipelineOrchestrator {
     const extraOpportunities = await this.config.detection.collectExtraOpportunities?.(chain) ?? [];
     const plans = await this.buildExecutionPlans(chain, [...baseOpportunities, ...extraOpportunities], summary);
     const rankedPlans = await this.rankPlans(chain, plans);
-    summary.scanned += rankedPlans.length;
-    this.config.metrics.recordPositionsScanned(rankedPlans.length);
-    for (const plan of rankedPlans) {
+    const selectedPlans = await this.selectPlanSubset(chain, rankedPlans);
+    summary.scanned += selectedPlans.length;
+    this.config.metrics.recordPositionsScanned(selectedPlans.length);
+    for (const plan of selectedPlans) {
       await this.executePlan(plan, summary);
     }
   }
@@ -405,6 +411,22 @@ export class PipelineOrchestrator {
       this.config.metrics.recordError();
       this.config.logger.error("pipeline_opportunity_ranker_failed", { chain, error });
       return plans;
+    }
+  }
+
+  private async selectPlanSubset(
+    chain: SupportedChain,
+    rankedPlans: readonly PipelineExecutionPlan[],
+  ): Promise<readonly PipelineExecutionPlan[]> {
+    if (this.config.opportunitySubsetSelector === undefined) {
+      return rankedPlans;
+    }
+    try {
+      return await this.config.opportunitySubsetSelector.select(chain, rankedPlans);
+    } catch (error) {
+      this.config.metrics.recordError();
+      this.config.logger.error("pipeline_opportunity_subset_selector_failed", { chain, error });
+      return rankedPlans;
     }
   }
 

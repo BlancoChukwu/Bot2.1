@@ -16,6 +16,7 @@ export default defineConfig({
       reporter: ["text", "html"],
       include: [
         "src/monitors/MultiWsEventSource.ts",
+        "src/monitors/FTRLProviderScorer.ts",
         "src/config/chainRegistry.ts",
         "src/utils/evCalculator.ts",
         "src/executors/liquidationExecutionAdapter.ts",

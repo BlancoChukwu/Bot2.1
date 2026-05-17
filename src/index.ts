@@ -106,6 +106,11 @@ export interface RuntimeConfig {
   readonly dailyPnlCsvPath: string | undefined;
   readonly arbitrageMinProfitUsd: number;
   readonly priceFeedRegistry: OracleFeedRegistry | undefined;
+  readonly ftrlProviderScoringEnabled: boolean;
+  readonly ftrlRolloutPct: number;
+  readonly ftrlRandomSeed: number;
+  readonly ftrlStateCachePath: string;
+  readonly opportunityFtrlStateCachePath: string;
 }
 
 export interface BotRunner {
@@ -206,6 +211,11 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     dailyPnlCsvPath: optionalEnv(parsedEnv, "DAILY_PNL_CSV_PATH"),
     arbitrageMinProfitUsd: parseMinNumber(parsedEnv.ARBITRAGE_MIN_PROFIT_USD, 0.15, 0, "ARBITRAGE_MIN_PROFIT_USD"),
     priceFeedRegistry,
+    ftrlProviderScoringEnabled: parseBoolean(parsedEnv.FTRL_PROVIDER_SCORING_ENABLED, false),
+    ftrlRolloutPct: parseMinNumber(parsedEnv.FTRL_ROLLOUT_PCT, 10, 0, "FTRL_ROLLOUT_PCT"),
+    ftrlRandomSeed: Math.floor(parseMinNumber(parsedEnv.FTRL_RANDOM_SEED, 1337, 0, "FTRL_RANDOM_SEED")),
+    ftrlStateCachePath: optionalEnv(parsedEnv, "FTRL_PROVIDER_STATE_CACHE_PATH") ?? "cache/ftrl-provider-scorer-state.json",
+    opportunityFtrlStateCachePath: optionalEnv(parsedEnv, "FTRL_OPPORTUNITY_STATE_CACHE_PATH") ?? "cache/ftrl-opportunity-scorer-state.json",
   };
   assertPipelineFlashLiquidationReadiness(config);
   assertArbitragePriceFeedCoverage(config);
@@ -509,6 +519,12 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       chain: config.chain,
       logger,
       metrics,
+      ftrlScoring: {
+        enabled: config.ftrlProviderScoringEnabled,
+        rolloutPct: config.ftrlRolloutPct,
+        randomSeed: config.ftrlRandomSeed,
+        persistencePath: config.ftrlStateCachePath,
+      },
     });
   const hybridDetection = new HybridDetectionPipeline({
     registry,
@@ -610,7 +626,17 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     }
   };
   const hazardModel = new BayesianHazardModel();
-  const noRegretRanker = new NoRegretOpportunityRanker({ model: hazardModel });
+  const noRegretRanker = new NoRegretOpportunityRanker({
+    model: hazardModel,
+    scorerConfig: {
+      enabled: true,
+      rolloutPct: 100,
+      randomSeed: config.ftrlRandomSeed,
+      persistencePath: config.opportunityFtrlStateCachePath,
+      epsilonStart: 0.05,
+      epsilonEnd: 0.01,
+    },
+  });
   const orchestrator = new PipelineOrchestrator({
     registry,
     detection,
@@ -655,17 +681,23 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
           opportunityId: plan.request.opportunityId,
           features: opportunityFeatures(plan.opportunity),
           expectedProfitBps: estimateOpportunityProfitBps(plan.opportunity),
+          signals: opportunitySignals(plan),
           plan,
         })),
       ).map((entry) => entry.plan),
     },
+    opportunitySubsetSelector: {
+      select: async (_chain, plans) => selectOpportunitySubset(plans),
+    },
     outcomeObserver: {
       recordOutcome: async (outcome) => {
         noRegretRanker.recordOutcome(outcome);
+        metrics.recordOpportunityRegret("best_fixed", noRegretRanker.cumulativeRegret(), { chain: outcome.chain });
         logger.info("no_regret_outcome_recorded", {
           opportunityId: outcome.opportunityId,
           outcome: outcome.outcome,
           cumulativeRegret: noRegretRanker.cumulativeRegret(),
+          eta: noRegretRanker.diagnostics().eta,
         });
       },
     },
@@ -1088,6 +1120,73 @@ function estimateOpportunityProfitBps(opportunity: Opportunity): number {
   }
   const raw = (opportunity.candidate.expectedAmountOut - base) * 10_000n / base;
   return Number(raw > 0n ? raw : 1n);
+}
+
+function opportunitySignals(plan: {
+  readonly opportunity: Opportunity;
+  readonly request: { readonly routeInput: {
+    readonly revenue: { readonly raw: bigint };
+    readonly gas: { readonly raw: bigint };
+    readonly capitalAtRisk: { readonly raw: bigint };
+  } };
+}): {
+  readonly estimatedEvMissUsd: number;
+  readonly gasSpikePenalty: number;
+  readonly closeFactorRisk: number;
+  readonly oracleLatencyMs: number;
+} {
+  const routeInput = plan.request.routeInput;
+  const estimatedEvMissUsd = Number(routeInput.revenue.raw) / 1e8;
+  const gasSpikePenalty = routeInput.revenue.raw === 0n
+    ? 1
+    : Math.min(1, Number((routeInput.gas.raw * 10_000n) / routeInput.revenue.raw) / 10_000);
+  const closeFactorRisk = plan.opportunity.kind === "liquidation"
+    ? liquidationCloseFactorRisk(plan.opportunity.candidate)
+    : 0.15;
+  return {
+    estimatedEvMissUsd,
+    gasSpikePenalty,
+    closeFactorRisk,
+    oracleLatencyMs: 0,
+  };
+}
+
+function liquidationCloseFactorRisk(candidate: {
+  readonly closeFactorBps?: number;
+  readonly healthFactor: bigint;
+}): number {
+  const closeFactor = candidate.closeFactorBps ?? (candidate.healthFactor < 950_000_000_000_000_000n ? 10_000 : 5_000);
+  return Math.max(0, Math.min(1, 1 - closeFactor / 10_000));
+}
+
+function selectOpportunitySubset<T extends {
+  readonly request: {
+    readonly routeInput: {
+      readonly gas: { readonly raw: bigint };
+      readonly capitalAtRisk: { readonly raw: bigint };
+    };
+  };
+}>(plans: readonly T[]): readonly T[] {
+  const maxPlans = 20;
+  const gasBudgetRaw = 30_000_000_000n;
+  const liquidityBudgetRaw = 500_000_000_000n;
+  const selected: T[] = [];
+  let gasUsed = 0n;
+  let liquidityUsed = 0n;
+  for (const plan of plans) {
+    if (selected.length >= maxPlans) {
+      break;
+    }
+    const nextGas = gasUsed + plan.request.routeInput.gas.raw;
+    const nextLiquidity = liquidityUsed + plan.request.routeInput.capitalAtRisk.raw;
+    if (nextGas > gasBudgetRaw || nextLiquidity > liquidityBudgetRaw) {
+      continue;
+    }
+    selected.push(plan);
+    gasUsed = nextGas;
+    liquidityUsed = nextLiquidity;
+  }
+  return selected.length > 0 ? selected : plans.slice(0, Math.min(maxPlans, plans.length));
 }
 
 function parsePriceFeedRegistry(value: string | undefined): OracleFeedRegistry | undefined {
