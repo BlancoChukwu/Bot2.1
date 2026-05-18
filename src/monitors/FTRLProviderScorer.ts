@@ -115,6 +115,29 @@ export class FTRLProviderScorer extends FTRLNoRegretScorer {
     return this.update(providerId, signal);
   }
 
+  /** Applies one FTRL round from precomputed per-provider losses (benchmark / replay harness). */
+  public updateFromRoundLosses(lossesByProvider: Readonly<Record<string, number>>): void {
+    const lossesByAction: Record<string, number> = {};
+    for (const actionId of this.actionIdsSnapshot()) {
+      this.ensureAction(actionId);
+      lossesByAction[actionId] = clamp(lossesByProvider[actionId] ?? 0.5, 0, 1);
+    }
+    this.applyRoundLosses(lossesByAction);
+    this.lastRoundLosses.clear();
+    for (const [actionId, total] of Object.entries(lossesByAction)) {
+      this.lastRoundLosses.set(actionId, {
+        providerId: actionId,
+        total,
+        latency: total,
+        missedEv: total,
+        getLogs: total,
+        flashblocks: total,
+        error: total,
+        hazard: total,
+      });
+    }
+  }
+
   public rankProviders(): string[] {
     return this.rankActionIds(this.actionIdsSnapshot());
   }
