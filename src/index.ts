@@ -25,6 +25,7 @@ import {
   type SupportedChain,
 } from "./config/chains";
 import { parseTopBorrowerPollIntervalMs } from "./config/envTiming";
+import { safeGetLogs } from "./utils/safeGetLogs";
 import { parseFtrlRuntimeConfig, toOpportunityScorerConfig, type FtrlRuntimeConfig } from "./config/ftrlEnv";
 import { createChainRegistry } from "./config/chainRegistry";
 import type { FlashLoanProviderId } from "./config/chainRegistry";
@@ -801,17 +802,18 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
   const reserveDataUpdated = parseAbiItem(
     "event ReserveDataUpdated(address indexed reserve,uint256 liquidityRate,uint256 stableBorrowRate,uint256 variableBorrowRate,uint256 liquidityIndex,uint256 variableBorrowIndex)",
   );
-  const logs = await (publicClient as unknown as {
-    getLogs: (args: Record<string, unknown>) => Promise<Array<{ args?: { reserve?: Address }; blockNumber?: bigint }>>;
-  }).getLogs({
+  const logs = await safeGetLogs(publicClient, {
     address: chainConfig.aave.pool,
     event: reserveDataUpdated,
     fromBlock,
     toBlock: latestBlock,
+  }, {
+    logger,
+    tag: "dry_run_replay",
   });
   const replayEvents = logs
     .map((log) => {
-      const reserve = log.args?.reserve;
+      const reserve = (log as { args?: { reserve?: Address } }).args?.reserve;
       if (reserve === undefined) {
         return undefined;
       }

@@ -16,6 +16,7 @@ import { createReserveAwareCandidates } from "../../src/monitors/reserveAwareBor
 import { ViemAaveV3Protocol } from "../../src/protocols/aaveV3";
 import type { LiquidationCandidate } from "../../src/protocols/aaveV3";
 import { FlashLoanProviderRouter } from "../../src/profitability/flashLoanProviderRouter";
+import { safeGetLogs } from "../../src/utils/safeGetLogs";
 import { createAsset, createAssetAmount } from "../../src/utils/typedAssetMath";
 import { parseRuntimeConfig } from "../../src/index";
 import { FTRLProviderScorer } from "../../src/monitors/FTRLProviderScorer";
@@ -131,12 +132,12 @@ async function run(): Promise<void> {
   const resolvedAave = registry.getResolvedAave(chain);
   const latestBlock = await publicClient.getBlockNumber();
   const fromBlock = latestBlock > BigInt(benchmarkBlocks) ? latestBlock - BigInt(benchmarkBlocks) : 0n;
-  const logs = await publicClient.getLogs({
+  const logs = await safeGetLogs(publicClient, {
     address: resolvedAave.pool,
     event: reserveDataUpdated,
     fromBlock,
     toBlock: latestBlock,
-  });
+  }, { tag: "benchmark_replay" });
   const events = logs
     .map((log) => {
       const reserve = (log as { readonly args?: { readonly reserve?: Address } }).args?.reserve;

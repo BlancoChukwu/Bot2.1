@@ -1,5 +1,6 @@
 import type { Address } from "viem";
 import { createFailoverPublicClient, createChainWebSocketPublicClient, type SupportedChain } from "../config/chains";
+import { safeGetLogs } from "../utils/safeGetLogs";
 import type { ChainRegistry } from "../config/chainRegistry";
 import { aavePoolAbi } from "../protocols/aaveV3";
 import type { BotMetrics, LoggerLike } from "../bot";
@@ -143,10 +144,13 @@ export class MultiWsEventSource implements DetectionEventSource {
       const stopFlash = wsClient.watchBlockNumber?.({
         onBlockNumber: async (blockNumber) => {
           const started = Date.now();
-          const logs = await this.readClient.getLogs({
+          const logs = await safeGetLogs(this.readClient, {
             address: poolAddress,
             fromBlock: blockNumber,
             toBlock: blockNumber,
+          }, {
+            logger: this.config.logger,
+            tag: `flashblocks:${providerName}`,
           });
           const state = this.providerStates.get(providerName);
           if (state !== undefined) {
@@ -263,10 +267,13 @@ export class MultiWsEventSource implements DetectionEventSource {
       if (blockNumber !== undefined) {
         const started = Date.now();
         try {
-          await this.readClient.getLogs({
+          await safeGetLogs(this.readClient, {
             address: this.config.registry.getResolvedAave(this.config.chain).pool,
             fromBlock: blockNumber,
             toBlock: blockNumber,
+          }, {
+            logger: this.config.logger,
+            tag: `probe:${providerName}`,
           });
           provider.lastGetLogsMs = Date.now() - started;
           provider.legacyScore += provider.lastGetLogsMs <= 100 ? 0.5 : -0.5;
