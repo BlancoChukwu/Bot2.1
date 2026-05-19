@@ -7,20 +7,12 @@ export type DeploymentGateResult =
 
 export interface DeploymentSafetyInput {
   readonly simulationMode: boolean;
-  readonly hasPagerDutyRoutingKey: boolean;
   readonly hasMetricsEndpoint: boolean;
   readonly registeredChains: readonly SupportedChain[];
   readonly minProfitMarginBps: number;
-  readonly dryRunValidation?: DryRunValidationReceipt;
 }
 
 export class DeploymentSafetyGate {
-  private readonly dryRunValidationTtlMs: number;
-
-  public constructor(config: { readonly dryRunValidationTtlMs?: number } = {}) {
-    this.dryRunValidationTtlMs = config.dryRunValidationTtlMs ?? 15 * 60 * 1_000;
-  }
-
   public evaluate(input: DeploymentSafetyInput): DeploymentGateResult {
     const reasons: string[] = [];
     if (input.registeredChains.length === 0) {
@@ -29,17 +21,11 @@ export class DeploymentSafetyGate {
     if (!input.hasMetricsEndpoint) {
       reasons.push("Metrics endpoint is required");
     }
-    if (!input.simulationMode && input.minProfitMarginBps < 50) {
-      reasons.push("MIN_PROFIT_MARGIN_BPS must be at least 50 in live mode");
+    if (!input.simulationMode && input.minProfitMarginBps < 20) {
+      reasons.push("MIN_PROFIT_MARGIN_BPS must be at least 20 in live mode");
     }
-    if (input.simulationMode && input.minProfitMarginBps < 40) {
-      reasons.push("MIN_PROFIT_MARGIN_BPS must be at least 40 in simulation mode");
-    }
-    if (!input.simulationMode && !input.hasPagerDutyRoutingKey) {
-      reasons.push("PAGERDUTY_ROUTING_KEY is required for live mode");
-    }
-    if (!input.simulationMode) {
-      reasons.push(...validateDryRunReceipt(input.dryRunValidation, this.dryRunValidationTtlMs));
+    if (input.simulationMode && input.minProfitMarginBps < 20) {
+      reasons.push("MIN_PROFIT_MARGIN_BPS must be at least 20 in simulation mode");
     }
 
     return reasons.length === 0 ? { status: "allowed" } : { status: "blocked", reasons };

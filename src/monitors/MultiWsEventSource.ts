@@ -5,6 +5,7 @@ import { aavePoolAbi } from "../protocols/aaveV3";
 import type { BotMetrics, LoggerLike } from "../bot";
 import type { DetectionEventHandlers, DetectionEventSource } from "./hybridDetectionPipeline";
 import { BayesianHazardModel } from "../optimization/hazardPrediction";
+import { defaultFtrlRuntimeConfig, type FtrlRuntimeConfig, toProviderScorerConfig } from "../config/ftrlEnv";
 import { FTRLProviderScorer } from "./FTRLProviderScorer";
 
 const trackedEvents = ["ReserveDataUpdated", "Borrow", "Supply", "Repay", "Withdraw"] as const;
@@ -21,12 +22,8 @@ interface ProviderState {
   lastFlashblockLeadMs: number;
 }
 
-export interface MultiWsFtrlScoringConfig {
-  readonly enabled?: boolean;
-  readonly rolloutPct?: number;
-  readonly randomSeed?: number;
-  readonly persistencePath?: string;
-}
+/** Provider FTRL tuning from `FTRL_*` env vars (provider ids are added at subscribe time). */
+export type MultiWsFtrlScoringConfig = FtrlRuntimeConfig;
 
 export interface MultiWsEventSourceConfig {
   readonly registry: ChainRegistry;
@@ -36,11 +33,18 @@ export interface MultiWsEventSourceConfig {
   readonly ftrlScoring?: MultiWsFtrlScoringConfig;
 }
 
+const reconnectBaseMs = 500;
+const reconnectMaxMs = 30_000;
+const wsOutageFailureThreshold = 5;
+
 export class MultiWsEventSource implements DetectionEventSource {
   private readonly dedupe = new Set<string>();
   private readonly providerStates = new Map<string, ProviderState>();
-  private readonly stopFns: Array<() => void> = [];
+  private readonly providerStopFns = new Map<string, Array<() => void>>();
   private readonly reconnectTimers: NodeJS.Timeout[] = [];
+  private readonly reconnectPending = new Set<string>();
+  private readonly reconnectAttempts = new Map<string, number>();
+  private readonly consecutiveFailures = new Map<string, number>();
   private readonly wsClients: unknown[] = [];
   private readonly readClient;
   private readonly hazardModel = new BayesianHazardModel();
@@ -71,13 +75,12 @@ export class MultiWsEventSource implements DetectionEventSource {
         lastFlashblockLeadMs: 0,
       });
     }
-    this.scorer = new FTRLProviderScorer({
-      providerIds: endpoints.map((endpoint) => endpoint.name),
-      enabled: this.config.ftrlScoring?.enabled ?? false,
-      rolloutPct: this.config.ftrlScoring?.rolloutPct ?? 10,
-      randomSeed: this.config.ftrlScoring?.randomSeed ?? 1_337,
-      ...(this.config.ftrlScoring?.persistencePath === undefined ? {} : { persistencePath: this.config.ftrlScoring.persistencePath }),
-    });
+    this.scorer = new FTRLProviderScorer(
+      toProviderScorerConfig(
+        this.config.ftrlScoring ?? defaultFtrlRuntimeConfig(),
+        endpoints.map((endpoint) => endpoint.name),
+      ),
+    );
     for (const endpoint of endpoints) {
       this.seedProvider(endpoint.name);
       this.subscribeProvider(endpoint.name, endpoint.wsUrl, handlers);
@@ -95,11 +98,33 @@ export class MultiWsEventSource implements DetectionEventSource {
   }
 
   private subscribeProvider(providerName: string, wsUrl: string, handlers: DetectionEventHandlers): void {
+    this.teardownProvider(providerName);
     const chainEntry = this.config.registry.get(this.config.chain);
     const poolAddress = this.config.registry.getResolvedAave(this.config.chain).pool;
     const flashblocks = chainEntry.detection.flashblocksEnabled ? "enabled" : "disabled";
     const wsClient = createChainWebSocketPublicClient({ chain: this.config.chain, wsRpcUrl: wsUrl });
     this.wsClients.push(wsClient);
+    const stops: Array<() => void> = [];
+    const onProviderError = (error: unknown, source: "contract" | "flashblocks"): void => {
+      const alreadyReconnecting = this.reconnectPending.has(providerName);
+      const state = this.providerStates.get(providerName);
+      if (state !== undefined && !alreadyReconnecting) {
+        state.missedOpportunities += 1;
+        state.legacyScore -= 2;
+        const hazard = this.hazardForProvider(providerName);
+        this.scorer?.updateFromError(providerName, {
+          missedOpportunities: state.missedOpportunities,
+          estimatedMissedEvUsd: this.estimatedMissedEvUsd(),
+          errorRate: 1,
+          errorSeverity: "outage",
+          hazardBps: hazard,
+        });
+      }
+      if (!alreadyReconnecting) {
+        handlers.onError(this.config.chain, normalizeWsError(error));
+      }
+      this.scheduleReconnect(providerName, wsUrl, handlers, source);
+    };
     for (const eventName of trackedEvents) {
       const stop = wsClient.watchContractEvent?.({
         address: poolAddress,
@@ -108,26 +133,10 @@ export class MultiWsEventSource implements DetectionEventSource {
         onLogs: async (logs) => {
           await this.handleLogs(providerName, eventName, logs, handlers);
         },
-        onError: (error) => {
-          const state = this.providerStates.get(providerName);
-          if (state !== undefined) {
-            state.missedOpportunities += 1;
-            state.legacyScore -= 2;
-            const hazard = this.hazardForProvider(providerName);
-            this.scorer?.updateFromError(providerName, {
-              missedOpportunities: state.missedOpportunities,
-              estimatedMissedEvUsd: this.estimatedMissedEvUsd(),
-              errorRate: 1,
-              errorSeverity: "outage",
-              hazardBps: hazard,
-            });
-          }
-          handlers.onError(this.config.chain, error);
-          this.scheduleReconnect(providerName, wsUrl, handlers);
-        },
+        onError: (error) => onProviderError(error, "contract"),
       });
       if (stop !== undefined) {
-        this.stopFns.push(stop);
+        stops.push(stop);
       }
     }
     if (this.config.registry.get(this.config.chain).detection.flashblocksEnabled) {
@@ -155,19 +164,53 @@ export class MultiWsEventSource implements DetectionEventSource {
           }
           await this.handleLogs(providerName, "ReserveDataUpdated", logs, handlers);
         },
-        onError: (error) => handlers.onError(this.config.chain, error),
+        onError: (error) => onProviderError(error, "flashblocks"),
       });
       if (stopFlash !== undefined) {
-        this.stopFns.push(stopFlash);
+        stops.push(stopFlash);
       }
     }
+    this.providerStopFns.set(providerName, stops);
   }
 
-  private scheduleReconnect(providerName: string, wsUrl: string, handlers: DetectionEventHandlers): void {
-    const jitter = Math.floor(Math.random() * 150);
+  private teardownProvider(providerName: string): void {
+    const stops = this.providerStopFns.get(providerName);
+    if (stops === undefined) {
+      return;
+    }
+    for (const stop of stops) {
+      stop();
+    }
+    this.providerStopFns.delete(providerName);
+  }
+
+  private scheduleReconnect(
+    providerName: string,
+    wsUrl: string,
+    handlers: DetectionEventHandlers,
+    source: "contract" | "flashblocks",
+  ): void {
+    if (this.reconnectPending.has(providerName)) {
+      return;
+    }
+    this.reconnectPending.add(providerName);
+    this.teardownProvider(providerName);
+    const failures = (this.consecutiveFailures.get(providerName) ?? 0) + 1;
+    this.consecutiveFailures.set(providerName, failures);
+    const attempt = (this.reconnectAttempts.get(providerName) ?? 0) + 1;
+    this.reconnectAttempts.set(providerName, attempt);
+    const jitter = Math.floor(Math.random() * 250);
+    const delayMs = Math.min(reconnectMaxMs, reconnectBaseMs * 2 ** Math.min(attempt - 1, 6)) + jitter;
+    const logPayload = { chain: this.config.chain, provider: providerName, source, failures, attempt, delayMs };
+    if (failures >= wsOutageFailureThreshold) {
+      this.config.logger.warn("ws_provider_degraded", logPayload);
+    } else {
+      this.config.logger.info("ws_provider_reconnecting", logPayload);
+    }
     const timer = setTimeout(() => {
+      this.reconnectPending.delete(providerName);
       this.subscribeProvider(providerName, wsUrl, handlers);
-    }, 500 + jitter);
+    }, delayMs);
     this.reconnectTimers.push(timer);
   }
 
@@ -212,6 +255,8 @@ export class MultiWsEventSource implements DetectionEventSource {
       provider.eventCount += 1;
       provider.lastEventToDetectionMs = Math.max(1, Date.now() - receivedAt);
       provider.legacyScore += 1;
+      this.consecutiveFailures.set(providerName, 0);
+      this.reconnectAttempts.set(providerName, 0);
       handlers.onReserveUpdated({ chain: this.config.chain, reserve });
 
       const blockNumber = shaped.blockNumber;
@@ -352,8 +397,8 @@ export class MultiWsEventSource implements DetectionEventSource {
   }
 
   private stopAll(): void {
-    for (const stop of this.stopFns.splice(0)) {
-      stop();
+    for (const providerName of [...this.providerStopFns.keys()]) {
+      this.teardownProvider(providerName);
     }
     for (const timer of this.reconnectTimers.splice(0)) {
       clearTimeout(timer);
@@ -398,4 +443,14 @@ export class MultiWsEventSource implements DetectionEventSource {
     });
     return prediction.hazardBps;
   }
+}
+
+function normalizeWsError(error: unknown): Error {
+  if (error instanceof Error) {
+    return error;
+  }
+  if (typeof error === "object" && error !== null && "message" in error) {
+    return new Error(String((error as { message: unknown }).message));
+  }
+  return new Error(String(error));
 }

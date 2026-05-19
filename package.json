@@ -16,7 +16,12 @@
     "benchmark:base": "ts-node test/integration/benchmark.replay.ts",
     "benchmark:base:dry": "cross-env BENCHMARK_DRY=true BENCHMARK_VERBOSE=true ts-node test/integration/benchmark.replay.ts --dry-benchmark",
     "compile:contracts": "node scripts/compile-liquidation-receiver.mjs",
-    "deploy:liquidation-receiver:base": "ts-node scripts/deploy-liquidation-receiver-base.ts"
+    "deploy:liquidation-receiver:base": "ts-node scripts/deploy-liquidation-receiver-base.ts",
+    "create:burner-wallet": "ts-node scripts/create-burner-wallet.ts",
+    "secret-scan": "node scripts/secret-scan.mjs",
+    "hooks:install": "node scripts/install-git-hooks.mjs",
+    "print-dry-run-receipt": "ts-node scripts/print-dry-run-receipt.ts",
+    "apply-dry-run-receipt": "node scripts/apply-dry-run-receipt.mjs"
   },
   "keywords": [],
   "author": "",

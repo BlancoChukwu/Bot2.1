@@ -62,6 +62,8 @@ export interface PipelineOrchestratorConfig {
   readonly logger: LoggerLike;
   readonly metrics: BotMetrics;
   readonly maxCacheAgeMs?: number;
+  /** Subgraph borrower refresh via `HybridDetectionPipeline.pollFallback` (TOP_BORROWER_POLL_INTERVAL_MS). */
+  readonly borrowerPollIntervalMs?: number;
   readonly opportunityRanker?: PipelineOpportunityRanker;
   readonly opportunitySubsetSelector?: PipelineOpportunitySubsetSelector;
   readonly outcomeObserver?: PipelineOutcomeObserver;
@@ -123,6 +125,7 @@ export class PipelineDeadLetterQueue {
 
 export class PipelineOrchestrator {
   private readonly maxCacheAgeMs: number;
+  private readonly lastBorrowerPollMs = new Map<SupportedChain, number>();
 
   public constructor(private readonly config: PipelineOrchestratorConfig) {
     this.maxCacheAgeMs = config.maxCacheAgeMs ?? 30_000;
@@ -175,6 +178,7 @@ export class PipelineOrchestrator {
   }
 
   private async runChain(chain: SupportedChain, summary: MutablePipelineRunSummary): Promise<void> {
+    await this.maybePollBorrowers(chain);
     if (this.config.sequencerGuard !== undefined) {
       const sequencerUp = await this.config.sequencerGuard.isUp(chain);
       if (!sequencerUp) {
@@ -208,6 +212,25 @@ export class PipelineOrchestrator {
     this.config.metrics.recordPositionsScanned(selectedPlans.length);
     for (const plan of selectedPlans) {
       await this.executePlan(plan, summary);
+    }
+  }
+
+  private async maybePollBorrowers(chain: SupportedChain): Promise<void> {
+    const intervalMs = this.config.borrowerPollIntervalMs;
+    if (intervalMs === undefined) {
+      return;
+    }
+    const now = Date.now();
+    const lastPollMs = this.lastBorrowerPollMs.get(chain) ?? 0;
+    if (now - lastPollMs < intervalMs) {
+      return;
+    }
+    this.lastBorrowerPollMs.set(chain, now);
+    try {
+      await this.config.detection.pollFallback(chain);
+    } catch (error) {
+      this.config.metrics.recordError();
+      this.config.logger.error("scheduled_borrower_poll_failed", { chain, error });
     }
   }
 

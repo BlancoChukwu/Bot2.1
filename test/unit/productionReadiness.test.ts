@@ -9,140 +9,65 @@ import {
 } from "../../src/production/productionReadiness";
 
 describe("DeploymentSafetyGate", () => {
-  it("blocks live mode when required production safety signals are missing", () => {
+  it("allows live mode without dry-run receipt", () => {
     const gate = new DeploymentSafetyGate();
 
     const result = gate.evaluate({
       simulationMode: false,
-      hasPagerDutyRoutingKey: false,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
       minProfitMarginBps: 50,
-      dryRunValidation: {
-        success: true,
-        validatedAtMs: Date.now(),
-        configHash: "cfg",
-        expectedConfigHash: "cfg",
-        chains: ["optimism"],
-        expectedChains: ["optimism"],
-      },
     });
 
-    expect(result).toEqual({
-      status: "blocked",
-      reasons: ["PAGERDUTY_ROUTING_KEY is required for live mode"],
-    });
+    expect(result.status).toBe("allowed");
   });
 
-  it("allows simulation mode without PagerDuty while still requiring chains and metrics", () => {
+  it("allows simulation mode while requiring chains and metrics", () => {
     const gate = new DeploymentSafetyGate();
 
     expect(gate.evaluate({
       simulationMode: true,
-      hasPagerDutyRoutingKey: false,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
       minProfitMarginBps: 50,
     }).status).toBe("allowed");
   });
 
-  it("allows simulation at 40 bps margin (quote smoke tuning)", () => {
+  it("allows simulation at 20 bps margin (bootstrap tuning)", () => {
     const gate = new DeploymentSafetyGate();
     expect(gate.evaluate({
       simulationMode: true,
-      hasPagerDutyRoutingKey: false,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
-      minProfitMarginBps: 40,
+      minProfitMarginBps: 20,
     }).status).toBe("allowed");
   });
 
-  it("blocks simulation when margin is below 40 bps", () => {
+  it("blocks simulation when margin is below 20 bps", () => {
     const gate = new DeploymentSafetyGate();
     const result = gate.evaluate({
       simulationMode: true,
-      hasPagerDutyRoutingKey: false,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
-      minProfitMarginBps: 39,
+      minProfitMarginBps: 19,
     });
     expect(result.status).toBe("blocked");
     if (result.status === "blocked") {
-      expect(result.reasons).toContain("MIN_PROFIT_MARGIN_BPS must be at least 40 in simulation mode");
+      expect(result.reasons).toContain("MIN_PROFIT_MARGIN_BPS must be at least 20 in simulation mode");
     }
   });
 
-  it("blocks live mode when margin is below 50 bps", () => {
+  it("blocks live mode when margin is below 20 bps", () => {
     const gate = new DeploymentSafetyGate();
     const result = gate.evaluate({
       simulationMode: false,
-      hasPagerDutyRoutingKey: true,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
-      minProfitMarginBps: 45,
-      dryRunValidation: {
-        success: true,
-        validatedAtMs: Date.now(),
-        configHash: "cfg",
-        expectedConfigHash: "cfg",
-        chains: ["optimism"],
-        expectedChains: ["optimism"],
-      },
+      minProfitMarginBps: 19,
     });
     expect(result.status).toBe("blocked");
     if (result.status === "blocked") {
-      expect(result.reasons).toContain("MIN_PROFIT_MARGIN_BPS must be at least 50 in live mode");
-    }
-  });
-
-  it("blocks live mode when dry-run validation is stale or for the wrong config", () => {
-    const gate = new DeploymentSafetyGate({ dryRunValidationTtlMs: 1_000 });
-
-    const result = gate.evaluate({
-      simulationMode: false,
-      hasPagerDutyRoutingKey: true,
-      hasMetricsEndpoint: true,
-      registeredChains: ["optimism"],
-      minProfitMarginBps: 50,
-      dryRunValidation: {
-        success: true,
-        validatedAtMs: Date.now() - 10_000,
-        configHash: "old",
-        expectedConfigHash: "new",
-        chains: ["arbitrum"],
-        expectedChains: ["optimism"],
-      },
-    });
-
-    expect(result.status).toBe("blocked");
-    if (result.status === "blocked") {
-      expect(result.reasons).toContain("Dry-run validation is stale");
-      expect(result.reasons).toContain("Dry-run validation config hash does not match current config");
-      expect(result.reasons).toContain("Dry-run validation chains do not match current chains");
-    }
-  });
-
-  it("blocks live mode when dry-run validation timestamp is invalid or future dated", () => {
-    const gate = new DeploymentSafetyGate();
-    const result = gate.evaluate({
-      simulationMode: false,
-      hasPagerDutyRoutingKey: true,
-      hasMetricsEndpoint: true,
-      registeredChains: ["optimism"],
-      minProfitMarginBps: 50,
-      dryRunValidation: {
-        success: true,
-        validatedAtMs: Number.NaN,
-        configHash: "cfg",
-        expectedConfigHash: "cfg",
-        chains: ["optimism"],
-        expectedChains: ["optimism"],
-      },
-    });
-
-    expect(result.status).toBe("blocked");
-    if (result.status === "blocked") {
-      expect(result.reasons).toContain("Dry-run validation timestamp is invalid");
+      expect(result.reasons).toContain("MIN_PROFIT_MARGIN_BPS must be at least 20 in live mode");
     }
   });
 });

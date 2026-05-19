@@ -24,6 +24,8 @@ import {
   type ChainConfig,
   type SupportedChain,
 } from "./config/chains";
+import { parseTopBorrowerPollIntervalMs } from "./config/envTiming";
+import { parseFtrlRuntimeConfig, toOpportunityScorerConfig, type FtrlRuntimeConfig } from "./config/ftrlEnv";
 import { createChainRegistry } from "./config/chainRegistry";
 import type { FlashLoanProviderId } from "./config/chainRegistry";
 import { createLiquidationActions, LiquidationExecutor } from "./executors/liquidationExecutor";
@@ -85,6 +87,7 @@ export interface RuntimeConfig {
   readonly aaveSubgraphByChain: ReadonlyMap<SupportedChain, string>;
   readonly privateKey: Hex;
   readonly pollIntervalMs: number;
+  readonly topBorrowerPollIntervalMs: number;
   readonly candidateCooldownMs: number;
   readonly minProfitWei: bigint;
   readonly minProfitUsd: number;
@@ -94,6 +97,7 @@ export interface RuntimeConfig {
   readonly flashLoanFeeBps: number;
   readonly flashLoanSlippageFloorBps: number;
   readonly gasOracleCacheMs: number;
+  readonly priceOracleMaxStaleMs: number;
   readonly simulationMode: boolean;
   readonly telegramBotToken: string | undefined;
   readonly telegramChatId: string | undefined;
@@ -106,11 +110,7 @@ export interface RuntimeConfig {
   readonly dailyPnlCsvPath: string | undefined;
   readonly arbitrageMinProfitUsd: number;
   readonly priceFeedRegistry: OracleFeedRegistry | undefined;
-  readonly ftrlProviderScoringEnabled: boolean;
-  readonly ftrlRolloutPct: number;
-  readonly ftrlRandomSeed: number;
-  readonly ftrlStateCachePath: string;
-  readonly opportunityFtrlStateCachePath: string;
+  readonly ftrl: FtrlRuntimeConfig;
 }
 
 export interface BotRunner {
@@ -121,9 +121,9 @@ type Env = Record<string, string | undefined>;
 
 const runtimeEnvSchema = z.record(z.string(), z.string().optional());
 /** Live mode: Aave-style risk floor (0.5%). */
-const minimumProfitMarginBpsLive = 50;
-/** Simulation: lower floor so quotes / approvals are easier to observe (raise before live). */
-const minimumProfitMarginBpsSimulation = 40;
+const minimumProfitMarginBpsLive = 20;
+/** Simulation: same floor as live bootstrap (FTRL adapts upward). */
+const minimumProfitMarginBpsSimulation = 20;
 const defaultProfitMarginBps = 50;
 const defaultFlashLoanFeeBps = 9;
 const defaultFlashLoanSlippageFloorBps = 500;
@@ -175,6 +175,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     flashLoanProviders: parseFlashLoanProviders(parsedEnv.FLASH_LOAN_PROVIDERS),
     privateTxMode: parsePrivateTxMode(optionalEnv(parsedEnv, "PRIVATE_TX_MODE")),
     pollIntervalMs: parseMinNumber(parsedEnv.POLL_INTERVAL_MS, 400, 100, "POLL_INTERVAL_MS"),
+    topBorrowerPollIntervalMs: parseTopBorrowerPollIntervalMs(parsedEnv),
     candidateCooldownMs: parseMinNumber(parsedEnv.CANDIDATE_COOLDOWN_MS, 30_000, 0, "CANDIDATE_COOLDOWN_MS"),
     minProfitWei: parseEthThreshold(parsedEnv.MIN_PROFIT_THRESHOLD_ETH),
     minProfitUsd: parseMinNumber(parsedEnv.MIN_PROFIT_USD, 10, 0, "MIN_PROFIT_USD"),
@@ -199,6 +200,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
       "FLASH_LOAN_SLIPPAGE_FLOOR_BPS",
     ),
     gasOracleCacheMs: parseMinNumber(parsedEnv.GAS_ORACLE_CACHE_MS, 30_000, 1, "GAS_ORACLE_CACHE_MS"),
+    priceOracleMaxStaleMs: parseMinNumber(parsedEnv.PRICE_ORACLE_MAX_STALE_MS, 120_000, 1, "PRICE_ORACLE_MAX_STALE_MS"),
     simulationMode,
     telegramBotToken: optionalEnv(parsedEnv, "TELEGRAM_BOT_TOKEN"),
     telegramChatId: optionalEnv(parsedEnv, "TELEGRAM_CHAT_ID"),
@@ -211,11 +213,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     dailyPnlCsvPath: optionalEnv(parsedEnv, "DAILY_PNL_CSV_PATH"),
     arbitrageMinProfitUsd: parseMinNumber(parsedEnv.ARBITRAGE_MIN_PROFIT_USD, 0.15, 0, "ARBITRAGE_MIN_PROFIT_USD"),
     priceFeedRegistry,
-    ftrlProviderScoringEnabled: parseBoolean(parsedEnv.FTRL_PROVIDER_SCORING_ENABLED, false),
-    ftrlRolloutPct: parseMinNumber(parsedEnv.FTRL_ROLLOUT_PCT, 10, 0, "FTRL_ROLLOUT_PCT"),
-    ftrlRandomSeed: Math.floor(parseMinNumber(parsedEnv.FTRL_RANDOM_SEED, 1337, 0, "FTRL_RANDOM_SEED")),
-    ftrlStateCachePath: optionalEnv(parsedEnv, "FTRL_PROVIDER_STATE_CACHE_PATH") ?? "cache/ftrl-provider-scorer-state.json",
-    opportunityFtrlStateCachePath: optionalEnv(parsedEnv, "FTRL_OPPORTUNITY_STATE_CACHE_PATH") ?? "cache/ftrl-opportunity-scorer-state.json",
+    ftrl: parseFtrlRuntimeConfig(parsedEnv),
   };
   assertPipelineFlashLiquidationReadiness(config);
   assertArbitragePriceFeedCoverage(config);
@@ -225,11 +223,9 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
 export function evaluateRuntimeDeploymentSafety(config: RuntimeConfig): DeploymentGateResult {
   return new DeploymentSafetyGate().evaluate({
     simulationMode: config.simulationMode,
-    hasPagerDutyRoutingKey: config.pagerDutyRoutingKey !== undefined,
     hasMetricsEndpoint: true,
     registeredChains: config.chains,
     minProfitMarginBps: config.minProfitMarginBps,
-    ...(config.dryRunValidation === undefined ? {} : { dryRunValidation: config.dryRunValidation }),
   });
 }
 
@@ -387,6 +383,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       publicClient,
       chain: config.chain,
       feedRegistry: config.priceFeedRegistry,
+      maxStaleMs: config.priceOracleMaxStaleMs,
       logger,
     });
   let resolvedFlashLoanFeeBpsPromise: Promise<number> | undefined;
@@ -519,12 +516,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       chain: config.chain,
       logger,
       metrics,
-      ftrlScoring: {
-        enabled: config.ftrlProviderScoringEnabled,
-        rolloutPct: config.ftrlRolloutPct,
-        randomSeed: config.ftrlRandomSeed,
-        persistencePath: config.ftrlStateCachePath,
-      },
+      ftrlScoring: config.ftrl,
     });
   const hybridDetection = new HybridDetectionPipeline({
     registry,
@@ -571,7 +563,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   });
   const liquidationReceiver = config.liquidationReceiverAddress;
   const liquidationReceiverExpectedSwapRouter = parseAddress(
-    process.env.LIQUIDATION_RECEIVER_EXPECTED_SWAP_ROUTER?.trim(),
+    optionalEnv(process.env, "LIQUIDATION_RECEIVER_EXPECTED_SWAP_ROUTER"),
   );
   const validateLiquidationReceiverRpc =
     liquidationReceiver !== undefined
@@ -628,14 +620,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   const hazardModel = new BayesianHazardModel();
   const noRegretRanker = new NoRegretOpportunityRanker({
     model: hazardModel,
-    scorerConfig: {
-      enabled: true,
-      rolloutPct: 100,
-      randomSeed: config.ftrlRandomSeed,
-      persistencePath: config.opportunityFtrlStateCachePath,
-      epsilonStart: 0.05,
-      epsilonEnd: 0.01,
-    },
+    scorerConfig: toOpportunityScorerConfig(config.ftrl),
   });
   const orchestrator = new PipelineOrchestrator({
     registry,
@@ -644,6 +629,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     deadLetters: new PipelineDeadLetterQueue(),
     logger,
     metrics,
+    borrowerPollIntervalMs: config.topBorrowerPollIntervalMs,
     sequencerGuard: {
       isUp: async (chain) => isSequencerUp({
         publicClient,
@@ -908,6 +894,7 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
       publicClient,
       chain: config.chain,
       feedRegistry: config.priceFeedRegistry,
+      maxStaleMs: config.priceOracleMaxStaleMs,
       logger,
     });
   const gasPrice = await publicClient.getGasPrice();
@@ -1294,6 +1281,9 @@ export async function assertArbitrageOracleReadiness(
   priceOracleCache: Pick<PriceOracleCache, "batchGetUsdPrices">,
 ): Promise<void> {
   if (config.simulationMode || !config.usePipelineOrchestrator) {
+    return;
+  }
+  if (config.arbitrageReceiverAddress === undefined) {
     return;
   }
 

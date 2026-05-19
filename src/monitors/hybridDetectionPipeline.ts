@@ -77,16 +77,27 @@ export class HybridDetectionPipeline {
   public async pollFallback(chain: SupportedChain): Promise<void> {
     const startedAt = Date.now();
     const resolvedAave = this.config.registry.getResolvedAave(chain);
+    this.config.logger.info("subgraph_poll_start", {
+      chain,
+      pool: resolvedAave.pool,
+      poolAddressesProvider: resolvedAave.poolAddressesProvider,
+    });
     try {
       const snapshots = await this.config.provider.pollBorrowers(chain);
       this.upsertSnapshots(snapshots);
       this.config.logger.info("fallback_poll_complete", {
         chain,
         borrowers: snapshots.length,
+        durationMs: Date.now() - startedAt,
         pool: resolvedAave.pool,
         poolAddressesProvider: resolvedAave.poolAddressesProvider,
       });
     } catch (error) {
+      this.config.logger.error("subgraph_poll_failed", {
+        chain,
+        durationMs: Date.now() - startedAt,
+        error,
+      });
       this.recordFailure(chain, "subgraph", error);
     } finally {
       this.config.metrics.recordLatency("scan", (Date.now() - startedAt) / 1_000, { chain });

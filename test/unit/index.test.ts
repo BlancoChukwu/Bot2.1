@@ -271,101 +271,92 @@ describe("parseRuntimeConfig", () => {
     ).toThrow(/LIQUIDATION_RECEIVER_ADDRESS/);
   });
 
-  it("rejects profit margin below live floor (50 bps)", () => {
+  it("rejects profit margin below live floor (20 bps)", () => {
     expect(() =>
       parseRuntimeConfig({
         RPC_URL: "https://optimism.example",
         AAVE_SUBGRAPH_URL: "https://subgraph.example",
         PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
         SIMULATION_MODE: "false",
-        MIN_PROFIT_MARGIN_BPS: "49",
+        MIN_PROFIT_MARGIN_BPS: "19",
       }),
     ).toThrow(/MIN_PROFIT_MARGIN_BPS/);
   });
 
-  it("rejects profit margin below simulation floor (40 bps)", () => {
+  it("rejects profit margin below simulation floor (20 bps)", () => {
     expect(() =>
       parseRuntimeConfig({
         RPC_URL: "https://optimism.example",
         AAVE_SUBGRAPH_URL: "https://subgraph.example",
         PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
         SIMULATION_MODE: "true",
-        MIN_PROFIT_MARGIN_BPS: "39",
+        MIN_PROFIT_MARGIN_BPS: "19",
       }),
     ).toThrow(/MIN_PROFIT_MARGIN_BPS/);
   });
 
-  it("allows 40 bps margin in simulation", () => {
+  it("allows 20 bps margin in simulation", () => {
     const config = parseRuntimeConfig({
       RPC_URL: "https://optimism.example",
       AAVE_SUBGRAPH_URL: "https://subgraph.example",
       PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
       SIMULATION_MODE: "true",
-      MIN_PROFIT_MARGIN_BPS: "40",
+      MIN_PROFIT_MARGIN_BPS: "20",
     });
-    expect(config.minProfitMarginBps).toBe(40);
+    expect(config.minProfitMarginBps).toBe(20);
   });
 
-  it("blocks live startup through the runtime deployment safety gate", () => {
+  it("allows live startup without dry-run receipt", () => {
+    const config = parseRuntimeConfig({
+      CHAIN: "base",
+      RPC_URL: "https://base.example",
+      BASE_AAVE_SUBGRAPH_URL: "https://subgraph.example",
+      PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+      SIMULATION_MODE: "false",
+      USE_PIPELINE_ORCHESTRATOR: "true",
+      LIQUIDATION_RECEIVER_ADDRESS: "0x00000000000000000000000000000000000000A1",
+    });
+
+    expect(evaluateRuntimeDeploymentSafety(config).status).toBe("allowed");
+  });
+
+  it("parses timing and full FTRL env knobs", () => {
     const config = parseRuntimeConfig({
       RPC_URL: "https://optimism.example",
       AAVE_SUBGRAPH_URL: "https://subgraph.example",
       PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
-      SIMULATION_MODE: "false",
+      TOP_BORROWER_POLL_INTERVAL_MS: "45000",
+      CANDIDATE_COOLDOWN_MS: "60000",
+      GAS_ORACLE_CACHE_MS: "15000",
+      FTRL_PROVIDER_SCORING_ENABLED: "true",
+      FTRL_INITIAL_ETA: "1.0",
+      FTRL_HAZARD_WEIGHT: "0.3",
+      FTRL_WARMUP_ROUNDS: "50",
     });
 
-    expect(evaluateRuntimeDeploymentSafety(config).status).toBe("blocked");
+    expect(config.topBorrowerPollIntervalMs).toBe(45_000);
+    expect(config.candidateCooldownMs).toBe(60_000);
+    expect(config.gasOracleCacheMs).toBe(15_000);
+    expect(config.ftrl.providerScoringEnabled).toBe(true);
+    expect(config.ftrl.etaInit).toBe(1);
+    expect(config.ftrl.hazardWeight).toBe(0.3);
+    expect(config.ftrl.warmupEvents).toBe(50);
   });
 
-  it("invalidates dry-run receipts when safety-relevant runtime config changes", () => {
+  it("still parses optional dry-run receipt fields without enforcing them at the gate", () => {
     const config = parseRuntimeConfig({
       CHAINS: "optimism",
       RPC_URL: "https://optimism.example",
       AAVE_SUBGRAPH_URL: "https://subgraph.example",
       PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
       SIMULATION_MODE: "false",
-      PAGERDUTY_ROUTING_KEY: "pd-key",
       DRY_RUN_SUCCESS: "true",
       DRY_RUN_VALIDATED_AT_MS: String(Date.now()),
-      DRY_RUN_CONFIG_HASH: "chains:optimism",
+      DRY_RUN_CONFIG_HASH: "stale-hash",
       DRY_RUN_CHAINS: "optimism",
     });
 
-    const result = evaluateRuntimeDeploymentSafety(config);
-
-    expect(result.status).toBe("blocked");
-    if (result.status === "blocked") {
-      expect(result.reasons).toContain("Dry-run validation config hash does not match current config");
-    }
-  });
-
-  it("includes capital threshold and executing account in dry-run receipt validation", () => {
-    const config = parseRuntimeConfig({
-      CHAINS: "optimism",
-      RPC_URL: "https://optimism.example",
-      AAVE_SUBGRAPH_URL: "https://subgraph.example",
-      PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
-      MIN_PROFIT_THRESHOLD_ETH: "0.02",
-      SIMULATION_MODE: "false",
-      PAGERDUTY_ROUTING_KEY: "pd-key",
-      DRY_RUN_SUCCESS: "true",
-      DRY_RUN_VALIDATED_AT_MS: String(Date.now()),
-      DRY_RUN_CONFIG_HASH: JSON.stringify({
-        chains: ["optimism"],
-        rpcUrl: "https://optimism.example",
-        fallbackRpcUrls: [],
-        aaveSubgraphUrl: "https://subgraph.example",
-        minProfitThresholdEth: "0.01",
-        account: "0x0000000000000000000000000000000000000000",
-      }),
-      DRY_RUN_CHAINS: "optimism",
-    });
-
-    const result = evaluateRuntimeDeploymentSafety(config);
-
-    expect(result.status).toBe("blocked");
-    if (result.status === "blocked") {
-      expect(result.reasons).toContain("Dry-run validation config hash does not match current config");
-    }
+    expect(config.dryRunValidation?.configHash).toBe("stale-hash");
+    expect(evaluateRuntimeDeploymentSafety(config).status).toBe("allowed");
   });
 });

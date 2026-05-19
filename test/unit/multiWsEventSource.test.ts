@@ -623,9 +623,20 @@ describe("MultiWsEventSource", () => {
       },
       metrics: createBotMetrics(),
       ftrlScoring: {
-        enabled: true,
+        providerScoringEnabled: true,
         rolloutPct: 100,
         randomSeed: 10,
+        providerStateCachePath: "cache/ftrl-provider-scorer-state.json",
+        opportunityStateCachePath: "cache/ftrl-opportunity-scorer-state.json",
+        etaInit: 0.08,
+        etaMin: 0.005,
+        etaMax: 0.35,
+        epsilonStart: 0.12,
+        epsilonEnd: 0.02,
+        epsilonDecayEvents: 3000,
+        hazardWeight: 0.15,
+        circuitBreakerWindow: 250,
+        warmupEvents: 200,
       },
     });
     const stop = await source.start({
