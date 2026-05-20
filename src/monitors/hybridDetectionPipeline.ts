@@ -6,6 +6,7 @@ import {
   ReserveAwareBorrowerCache,
   type BorrowerSnapshot,
 } from "./reserveAwareBorrowerCache";
+import type { LiquidationCandidateGate } from "../orchestrator/liquidationCandidateGate";
 
 export interface DetectionReserveEvent {
   readonly chain: SupportedChain;
@@ -34,6 +35,7 @@ export interface HybridDetectionPipelineConfig {
   readonly logger: LoggerLike;
   readonly metrics: BotMetrics;
   readonly failureThreshold?: number;
+  readonly liquidationGate?: LiquidationCandidateGate;
 }
 
 export class HybridDetectionPipeline {
@@ -124,6 +126,9 @@ export class HybridDetectionPipeline {
       }
       const snapshots = await this.config.provider.refreshBorrowers(event.chain, targetBorrowers);
       this.upsertSnapshots(snapshots);
+      if (this.config.liquidationGate !== undefined && snapshots.length > 0) {
+        await this.config.liquidationGate.auditBorrowerSnapshots(event.chain, snapshots);
+      }
       this.config.logger.info("reserve_event_refresh_complete", {
         chain: event.chain,
         reserve: event.reserve,

@@ -30,6 +30,8 @@ describe("parseRuntimeConfig", () => {
       process.env.RPC_URL = "https://optimism.example";
       process.env.AAVE_SUBGRAPH_URL = "https://subgraph.example";
       process.env.PRIVATE_KEY = "0x0000000000000000000000000000000000000000000000000000000000000001";
+      process.env.SIMULATION_MODE = "true";
+      process.env.USE_PIPELINE_ORCHESTRATOR = "false";
 
       const config = parseRuntimeConfig(process.env);
 
@@ -69,7 +71,7 @@ describe("parseRuntimeConfig", () => {
       PRICE_FEED_REGISTRY_JSON: JSON.stringify({
         base: {
           "0x4200000000000000000000000000000000000006": {
-            feed: "0x0000000000000000000000000000000000000011",
+            feed: "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70",
             priceDecimals: 8,
           },
         },
@@ -78,7 +80,7 @@ describe("parseRuntimeConfig", () => {
 
     expect(config.arbitrageMinProfitUsd).toBe(0.25);
     expect(config.priceFeedRegistry?.base["0x4200000000000000000000000000000000000006"]?.feed)
-      .toBe("0x0000000000000000000000000000000000000011");
+      .toBe("0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70");
   });
 
   it("uses canonical Base Chainlink feeds when no override is provided", () => {

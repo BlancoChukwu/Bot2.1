@@ -1,5 +1,6 @@
 import type { ExecutionPreflightClient, FinalSimulationResult, TransactionEnvelope, TransactionOverrides } from "./safeTransactionExecutor";
 import type { SupportedChain } from "../config/chains";
+import { decodeExecutionRevert } from "../utils/revertDecoder";
 
 export interface ViemExecutionClientConfig {
   readonly publicClient: {
@@ -64,7 +65,7 @@ export class ViemExecutionClient implements ExecutionPreflightClient {
       });
       return { success: true };
     } catch (error) {
-      return { success: false, reason: error instanceof Error ? error.message : String(error) };
+      return { success: false, reason: decodeExecutionRevert(error) };
     }
   }
 

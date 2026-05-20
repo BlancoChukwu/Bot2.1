@@ -1,5 +1,10 @@
 import type { Address } from "viem";
 import type { AaveV3Protocol, LiquidationCandidate } from "../protocols/aaveV3";
+import {
+  evaluateDustFilter,
+  logLiquidationDustDecision,
+  type DustFilterInput,
+} from "../protocols/liquidationCandidateFilter";
 import { calculateLiquidationEv } from "../utils/evCalculator";
 
 export interface MonitorLogger {
@@ -18,6 +23,8 @@ export interface HealthFactorMonitorConfig {
   readonly slippageBps: number;
   readonly resolveDynamicSlippageBps?: () => Promise<number>;
   readonly onReserveDataUpdated?: (reserve?: Address) => void;
+  readonly minLiquidationDebtUsd?: number;
+  readonly resolveDebtUsd?: (candidate: LiquidationCandidate) => Promise<number>;
   readonly logger: MonitorLogger;
 }
 
@@ -34,7 +41,12 @@ export class HealthFactorMonitor {
     const gasCostUsd = await this.resolveGasCostUsd();
     const slippageBps = await this.resolveSlippageBps();
     const positions = await this.config.protocol.getLiquidatablePositions();
-    const candidates = positions.filter((position) => this.isExecutableCandidate(position, now, gasCostUsd, slippageBps));
+    const candidates: LiquidationCandidate[] = [];
+    for (const position of positions) {
+      if (await this.isExecutableCandidate(position, now, gasCostUsd, slippageBps)) {
+        candidates.push(position);
+      }
+    }
     const stats = this.config.protocol.getLastScanStats?.() ?? {
       scanned: positions.length,
       liquidatable: positions.length,
@@ -73,14 +85,37 @@ export class HealthFactorMonitor {
     this.reserveSubscriptionStop = undefined;
   }
 
-  private isExecutableCandidate(
+  private async isExecutableCandidate(
     candidate: LiquidationCandidate,
     now: number,
     gasCostUsd: number,
     slippageBps: number,
-  ): boolean {
+  ): Promise<boolean> {
     if (candidate.healthFactor >= liquidationHealthFactor || this.isCoolingDown(candidate, now)) {
       return false;
+    }
+
+    if (this.config.minLiquidationDebtUsd !== undefined) {
+      const debtUsd = this.config.resolveDebtUsd === undefined
+        ? candidate.repayValueUsd
+        : await this.config.resolveDebtUsd(candidate);
+      const dust = evaluateDustFilter({
+        debtUsd,
+        minDebtUsd: this.config.minLiquidationDebtUsd,
+        gasCostUsd,
+      } satisfies DustFilterInput);
+      logLiquidationDustDecision(this.config.logger, {
+        chain: "monitor",
+        account: candidate.account,
+        debtAsset: candidate.debtAsset,
+        collateralAsset: candidate.collateralAsset,
+        stage: "health_factor_scan",
+        decision: dust,
+        minDebtUsd: this.config.minLiquidationDebtUsd,
+      });
+      if (dust.isDust) {
+        return false;
+      }
     }
 
     const ev = calculateLiquidationEv({

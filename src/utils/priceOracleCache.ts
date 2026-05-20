@@ -2,8 +2,9 @@ import type { Address } from "viem";
 import type { SupportedChain } from "../config/chains";
 
 const DEFAULT_CACHE_TTL_MS = 5_000;
-const DEFAULT_MAX_STALE_MS = 120_000;
+const DEFAULT_MAX_STALE_MS = 900_000;
 const DEFAULT_USD_DECIMALS = 8;
+const DEFAULT_POLL_INTERVAL_MS = 60_000;
 
 const chainlinkAggregatorAbi = [
   {
@@ -28,6 +29,16 @@ const chainlinkAggregatorAbi = [
   },
 ] as const;
 
+const aaveOracleAbi = [
+  {
+    name: "getAssetPrice",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "asset", type: "address" }],
+    outputs: [{ type: "uint256" }],
+  },
+] as const;
+
 export interface OracleFeedConfig {
   readonly feed: Address;
   readonly priceDecimals?: number;
@@ -35,13 +46,26 @@ export interface OracleFeedConfig {
 
 export type OracleFeedRegistry = Readonly<Record<SupportedChain, Readonly<Partial<Record<Address, OracleFeedConfig>>>>>;
 
+export type OraclePriceSource = "chainlink" | "aave";
+
 interface PriceCacheEntry {
   readonly priceInUsdRaw: bigint;
   readonly updatedAtMs: number;
+  readonly oracleUpdatedAtSec: number;
+  readonly source: OraclePriceSource;
+  readonly freshnessMs: number;
 }
 
 interface PriceOracleLogger {
   warn(message: string, meta?: unknown): void;
+  error(message: string, meta?: unknown): void;
+}
+
+export interface OracleFreshnessObservation {
+  readonly chain: SupportedChain;
+  readonly token: Address;
+  readonly freshnessMs: number;
+  readonly source: OraclePriceSource;
 }
 
 export interface PriceOracleCacheConfig {
@@ -53,8 +77,11 @@ export interface PriceOracleCacheConfig {
   readonly feedRegistry?: OracleFeedRegistry;
   readonly cacheTtlMs?: number;
   readonly maxStaleMs?: number;
+  readonly aaveOracleAddress?: Address;
   readonly logger?: PriceOracleLogger;
   readonly nowMs?: () => number;
+  readonly onFreshnessObserved?: (observation: OracleFreshnessObservation) => void;
+  readonly heartbeatWarnMs?: number;
 }
 
 /**
@@ -69,15 +96,20 @@ export class PriceOracleCache {
   private readonly feedDecimalsCache = new Map<Address, number>();
   private readonly cacheTtlMs: number;
   private readonly maxStaleMs: number;
+  private readonly heartbeatWarnMs: number;
   private readonly nowMs: () => number;
   private readonly logger: PriceOracleLogger | undefined;
   private readonly feedsByToken: Readonly<Partial<Record<Address, OracleFeedConfig>>>;
+  private readonly onFreshnessObserved: ((observation: OracleFreshnessObservation) => void) | undefined;
+  private pollTimer: ReturnType<typeof setInterval> | undefined;
 
   public constructor(private readonly config: PriceOracleCacheConfig) {
     this.cacheTtlMs = config.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
     this.maxStaleMs = config.maxStaleMs ?? DEFAULT_MAX_STALE_MS;
+    this.heartbeatWarnMs = config.heartbeatWarnMs ?? this.maxStaleMs;
     this.nowMs = config.nowMs ?? (() => Date.now());
     this.logger = config.logger;
+    this.onFreshnessObserved = config.onFreshnessObserved;
     this.feedsByToken = config.feedRegistry?.[config.chain] ?? {};
   }
 
@@ -142,9 +174,48 @@ export class PriceOracleCache {
     return result;
   }
 
+  public async forceRefreshUsdPrices(tokens: readonly Address[]): Promise<Partial<Record<Address, bigint>>> {
+    for (const token of dedupeAddresses(tokens)) {
+      this.cache.delete(token);
+      this.inFlight.delete(token);
+    }
+    return this.batchGetUsdPrices(tokens);
+  }
+
+  public getOracleFreshnessMs(token: Address): number | undefined {
+    return this.cache.get(token)?.freshnessMs;
+  }
+
+  public startBackgroundPoll(tokens: readonly Address[], intervalMs = DEFAULT_POLL_INTERVAL_MS): () => void {
+    this.stopBackgroundPoll();
+    const unique = dedupeAddresses(tokens);
+    if (unique.length === 0) {
+      return () => undefined;
+    }
+    const poll = () => {
+      void this.forceRefreshUsdPrices(unique).catch((error) => {
+        this.logger?.warn("price_oracle_background_poll_failed", {
+          chain: this.config.chain,
+          error: toErrorMessage(error),
+        });
+      });
+    };
+    poll();
+    this.pollTimer = setInterval(poll, intervalMs);
+    return () => this.stopBackgroundPoll();
+  }
+
+  public stopBackgroundPoll(): void {
+    if (this.pollTimer !== undefined) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    }
+  }
+
   public clear(): void {
     this.cache.clear();
     this.inFlight.clear();
+    this.stopBackgroundPoll();
   }
 
   private getFreshCached(token: Address): bigint | undefined {
@@ -162,7 +233,7 @@ export class PriceOracleCache {
     const feed = this.feedsByToken[token];
     if (feed === undefined) {
       this.logger?.warn("price_oracle_missing_feed", { chain: this.config.chain, token });
-      return 0n;
+      return this.readAaveFallback(token);
     }
 
     try {
@@ -174,12 +245,14 @@ export class PriceOracleCache {
       const rawPrice = sanitizeOraclePrice(roundData[1]);
       const updatedAtSec = Number(roundData[3]);
       const scaled = await this.scaleToUsd8(feed, rawPrice);
-      const fresh = this.guardFreshness(scaled, updatedAtSec, token);
-      this.cache.set(token, { priceInUsdRaw: fresh, updatedAtMs: this.nowMs() });
-      return fresh;
+      const fresh = this.guardFreshness(scaled, updatedAtSec, token, "chainlink", false);
+      if (fresh > 0n) {
+        return fresh;
+      }
+      return this.readAaveFallback(token);
     } catch (error) {
       this.logger?.warn("price_oracle_read_failed", { chain: this.config.chain, token, error: toErrorMessage(error) });
-      return 0n;
+      return this.readAaveFallback(token);
     }
   }
 
@@ -190,7 +263,7 @@ export class PriceOracleCache {
     if (feedEntries.length === 0) {
       for (const token of tokens) {
         this.logger?.warn("price_oracle_missing_feed", { chain: this.config.chain, token });
-        sink[token] = 0n;
+        sink[token] = await this.readAaveFallback(token);
       }
       return;
     }
@@ -198,7 +271,7 @@ export class PriceOracleCache {
     for (const token of tokens) {
       if (this.feedsByToken[token] === undefined) {
         this.logger?.warn("price_oracle_missing_feed", { chain: this.config.chain, token });
-        sink[token] = 0n;
+        sink[token] = await this.readAaveFallback(token);
       }
     }
 
@@ -218,27 +291,22 @@ export class PriceOracleCache {
           continue;
         }
         const response = responses[index];
-        if (response === undefined || response.status !== "success") {
+        if (response === undefined || response.status !== "success" || response.result === undefined) {
           this.logger?.warn("price_oracle_multicall_entry_failed", {
             chain: this.config.chain,
             token: entry.token,
             feed: entry.config.feed,
           });
-          sink[entry.token] = 0n;
+          sink[entry.token] = await this.readAaveFallback(entry.token);
           continue;
         }
 
-        if (response.result === undefined) {
-          sink[entry.token] = 0n;
-          continue;
-        }
         const raw = response.result;
         const rawPrice = sanitizeOraclePrice(raw[1]);
         const updatedAtSec = Number(raw[3]);
         const scaled = await this.scaleToUsd8(entry.config, rawPrice);
-        const fresh = this.guardFreshness(scaled, updatedAtSec, entry.token);
-        sink[entry.token] = fresh;
-        this.cache.set(entry.token, { priceInUsdRaw: fresh, updatedAtMs: this.nowMs() });
+        const fresh = this.guardFreshness(scaled, updatedAtSec, entry.token, "chainlink", false);
+        sink[entry.token] = fresh > 0n ? fresh : await this.readAaveFallback(entry.token);
       }
     } catch (error) {
       this.logger?.warn("price_oracle_multicall_failed", {
@@ -250,6 +318,45 @@ export class PriceOracleCache {
         sink[entry.token] = await this.fetchOne(entry.token);
       }
     }
+  }
+
+  private async readAaveFallback(token: Address): Promise<bigint> {
+    if (this.config.aaveOracleAddress === undefined) {
+      this.logOracleUntrustedCritical(token, "aave_oracle_not_configured");
+      return 0n;
+    }
+    try {
+      const raw = await this.config.publicClient.readContract({
+        address: this.config.aaveOracleAddress,
+        abi: aaveOracleAbi,
+        functionName: "getAssetPrice",
+        args: [token],
+      }) as bigint;
+      const sanitized = sanitizeOraclePrice(raw);
+      if (sanitized <= 0n) {
+        this.logOracleUntrustedCritical(token, "aave_oracle_zero_price");
+        return 0n;
+      }
+      return this.storePrice(token, sanitized, Math.floor(this.nowMs() / 1_000), "aave");
+    } catch (error) {
+      this.logger?.warn("price_oracle_aave_fallback_failed", {
+        chain: this.config.chain,
+        token,
+        error: toErrorMessage(error),
+      });
+      this.logOracleUntrustedCritical(token, "aave_oracle_read_failed");
+      return 0n;
+    }
+  }
+
+  private logOracleUntrustedCritical(token: Address, cause: string): void {
+    this.logger?.error("price_oracle_untrusted_critical", {
+      chain: this.config.chain,
+      token,
+      cause,
+      sources: ["chainlink", "aave"],
+      message: "Both Chainlink and Aave oracle paths failed or returned stale/zero — debt USD must not use cache fallback",
+    });
   }
 
   private async scaleToUsd8(feed: OracleFeedConfig, rawPrice: bigint): Promise<bigint> {
@@ -285,7 +392,13 @@ export class PriceOracleCache {
     }
   }
 
-  private guardFreshness(priceInUsdRaw: bigint, updatedAtSec: number, token: Address): bigint {
+  private guardFreshness(
+    priceInUsdRaw: bigint,
+    updatedAtSec: number,
+    token: Address,
+    source: OraclePriceSource,
+    logStaleWarning = true,
+  ): bigint {
     if (priceInUsdRaw <= 0n) {
       return 0n;
     }
@@ -293,10 +406,52 @@ export class PriceOracleCache {
       this.logger?.warn("price_oracle_invalid_updated_at", { chain: this.config.chain, token, updatedAtSec });
       return 0n;
     }
-    const ageMs = this.nowMs() - updatedAtSec * 1_000;
-    if (ageMs > this.maxStaleMs) {
-      this.logger?.warn("price_oracle_stale_price", { chain: this.config.chain, token, ageMs, maxStaleMs: this.maxStaleMs });
+    const freshnessMs = this.nowMs() - updatedAtSec * 1_000;
+    if (freshnessMs > this.maxStaleMs) {
+      if (logStaleWarning) {
+        this.logger?.warn("price_oracle_stale_price", {
+          chain: this.config.chain,
+          token,
+          ageMs: freshnessMs,
+          maxStaleMs: this.maxStaleMs,
+        });
+      }
       return 0n;
+    }
+    return this.storePrice(token, priceInUsdRaw, updatedAtSec, source, freshnessMs);
+  }
+
+  private storePrice(
+    token: Address,
+    priceInUsdRaw: bigint,
+    updatedAtSec: number,
+    source: OraclePriceSource,
+    freshnessMs = this.nowMs() - updatedAtSec * 1_000,
+  ): bigint {
+    if (priceInUsdRaw <= 0n) {
+      return 0n;
+    }
+    this.cache.set(token, {
+      priceInUsdRaw,
+      updatedAtMs: this.nowMs(),
+      oracleUpdatedAtSec: updatedAtSec,
+      source,
+      freshnessMs,
+    });
+    this.onFreshnessObserved?.({
+      chain: this.config.chain,
+      token,
+      freshnessMs,
+      source,
+    });
+    if (freshnessMs > this.heartbeatWarnMs) {
+      this.logger?.warn("price_oracle_heartbeat_stale", {
+        chain: this.config.chain,
+        token,
+        freshnessMs,
+        heartbeatWarnMs: this.heartbeatWarnMs,
+        source,
+      });
     }
     return priceInUsdRaw;
   }
@@ -315,4 +470,25 @@ function toErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+/** Base mainnet Chainlink ETH/USD — must not use mainnet L1 feed addresses on Base. */
+export const canonicalBaseEthUsdFeed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70" as Address;
+
+/** Aave V3 Base AaveOracle — verified on-chain 2026-05-20. */
+export const canonicalBaseAaveOracleAddress = "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156" as Address;
+
+export function assertBaseFeedRegistry(feedRegistry: OracleFeedRegistry | undefined): void {
+  const baseFeeds = feedRegistry?.base;
+  if (baseFeeds === undefined) {
+    throw new Error("Base price feed registry is required");
+  }
+  const weth = "0x4200000000000000000000000000000000000006" as Address;
+  const configured = baseFeeds[weth]?.feed;
+  if (configured === undefined) {
+    throw new Error("Base WETH feed is missing from price feed registry");
+  }
+  if (configured.toLowerCase() !== canonicalBaseEthUsdFeed.toLowerCase()) {
+    throw new Error(`Base WETH feed must be ${canonicalBaseEthUsdFeed}, got ${configured}`);
+  }
 }

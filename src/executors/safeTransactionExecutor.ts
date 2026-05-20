@@ -79,7 +79,7 @@ export interface SafeExecutionRequest {
 export type SafeExecutionResult =
   | { readonly status: "sent"; readonly txHash: Hash }
   | { readonly status: "simulated" }
-  | { readonly status: "rejected"; readonly reason: "route_rejected" | "route_transaction_mismatch" | "final_simulation_failed" | "execution_circuit_open" }
+  | { readonly status: "rejected"; readonly reason: "route_rejected" | "route_transaction_mismatch" | "final_simulation_failed" | "execution_circuit_open" | "dust_filtered" | "borrower_cooldown" }
   | { readonly status: "failed"; readonly reason: "receipt_reorged" | "receipt_reverted" | "send_failed" };
 
 export interface FlashLoanRouteSelector {
@@ -100,6 +100,7 @@ export interface SafeTransactionExecutorConfig {
   readonly allowPublicFallbackAfterBundleFailure?: boolean;
   readonly privateFirstChains?: readonly SupportedChain[];
   readonly dryRunMode?: boolean;
+  readonly rejectBeforePreview?: (request: SafeExecutionRequest) => Promise<string | undefined>;
 }
 
 interface PreflightResult {
@@ -149,6 +150,20 @@ export class SafeTransactionExecutor {
         nonce: preflight.nonce,
       };
       if (request.buildFlashLoanPreviewTransaction !== undefined) {
+        const previewRejectReason = await this.config.rejectBeforePreview?.(request);
+        if (previewRejectReason !== undefined) {
+          this.releaseNonce(request, preflight.nonce);
+          this.config.logger.warn("flash_loan_preview_rejected", {
+            chain: request.chain,
+            opportunityId: request.opportunityId,
+            reason: previewRejectReason,
+          });
+          if (previewRejectReason === "borrower_cooldown") {
+            return { status: "rejected", reason: "borrower_cooldown" };
+          }
+          const isDustReject = previewRejectReason.startsWith("dust:");
+          return { status: "rejected", reason: isDustReject ? "dust_filtered" : "final_simulation_failed" };
+        }
         const previewTx = request.buildFlashLoanPreviewTransaction(preflight.route);
         const preview = await this.config.client.simulateContract(previewTx, overrides);
         if (!preview.success) {

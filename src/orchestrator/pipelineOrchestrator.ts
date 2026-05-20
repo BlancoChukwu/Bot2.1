@@ -8,6 +8,7 @@ import type { LiquidationCandidate } from "../protocols/aaveV3";
 import type { RouteSelectionInput } from "../profitability/flashLoanProviderRouter";
 import type { Opportunity } from "../types/opportunity";
 import { fromLiquidationCandidate } from "../types/opportunity";
+import type { LiquidationCandidateGate } from "./liquidationCandidateGate";
 
 export interface PipelineLoopOptions {
   readonly pollIntervalMs: number;
@@ -68,6 +69,7 @@ export interface PipelineOrchestratorConfig {
   buildExecutionRequestForOpportunity?(
     opportunity: Opportunity,
   ): SafeExecutionRequest | undefined | Promise<SafeExecutionRequest | undefined>;
+  readonly liquidationGate?: LiquidationCandidateGate;
 }
 
 export interface PipelineRunSummary {
@@ -191,9 +193,12 @@ export class PipelineOrchestrator {
       }
     }
 
-    const baseCandidates = degraded
+    const rawCandidates = degraded
       ? this.createFreshCandidates(chain)
       : createReserveAwareCandidates(this.config.detection.cache, chain);
+    const baseCandidates = this.config.liquidationGate === undefined
+      ? rawCandidates
+      : await this.config.liquidationGate.filterCandidates(chain, rawCandidates, "pipeline_enqueue");
     const baseOpportunities = baseCandidates.map((candidate) => fromLiquidationCandidate(candidate));
     const extraOpportunities = await this.config.detection.collectExtraOpportunities?.(chain) ?? [];
     const plans = await this.buildExecutionPlans(chain, [...baseOpportunities, ...extraOpportunities], summary);
@@ -224,6 +229,13 @@ export class PipelineOrchestrator {
   ): Promise<PipelineExecutionPlan[]> {
     const plans: PipelineExecutionPlan[] = [];
     for (const opportunity of opportunities) {
+      if (
+        opportunity.kind === "liquidation"
+        && this.config.liquidationGate !== undefined
+        && this.config.liquidationGate.isBorrowerBlocked(chain, opportunity.candidate.account)
+      ) {
+        continue;
+      }
       try {
         const request = await this.buildExecutionRequest(opportunity);
         if (request !== undefined) {
@@ -256,6 +268,18 @@ export class PipelineOrchestrator {
     summary: MutablePipelineRunSummary,
   ): Promise<void> {
     const { request } = plan;
+    if (
+      plan.opportunity.kind === "liquidation"
+      && this.config.liquidationGate !== undefined
+      && this.config.liquidationGate.isBorrowerBlocked(plan.chain, plan.opportunity.candidate.account)
+    ) {
+      this.config.logger.info("pipeline_execution_skipped_borrower_cooldown", {
+        chain: plan.chain,
+        account: plan.opportunity.candidate.account,
+        opportunityId: request.opportunityId,
+      });
+      return;
+    }
     summary.attempted += 1;
     this.config.metrics.recordLiquidationAttempt();
     this.config.logger.info("pipeline_execution_started", {
@@ -312,6 +336,14 @@ export class PipelineOrchestrator {
 
     if (result.status === "rejected") {
       summary.rejected += 1;
+      if (result.reason === "dust_filtered" || result.reason === "borrower_cooldown") {
+        this.config.logger.info("pipeline_execution_skipped_guard", {
+          chain: request.chain,
+          opportunityId: request.opportunityId,
+          reason: result.reason,
+        });
+        return;
+      }
     } else {
       summary.failed += 1;
       this.config.metrics.recordError();
@@ -326,6 +358,10 @@ export class PipelineOrchestrator {
   }
 
   private deadLetter(request: SafeExecutionRequest, reason: string): void {
+    if (reason === "dust_filtered" || reason === "borrower_cooldown") {
+      return;
+    }
+    this.config.liquidationGate?.recordDeadLetter(request.chain, request.account, reason);
     this.config.deadLetters.enqueue({
       chain: request.chain,
       opportunityId: request.opportunityId,
@@ -339,6 +375,9 @@ export class PipelineOrchestrator {
     candidate: LiquidationCandidate,
     reason: string,
   ): void {
+    if (reason !== "dust_filtered") {
+      this.config.liquidationGate?.recordDeadLetter(chain, candidate.account, reason);
+    }
     this.config.deadLetters.enqueue({
       chain,
       opportunityId: `${chain}:${candidate.account}:${candidate.debtAsset}`,

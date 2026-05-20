@@ -81,6 +81,9 @@ export interface BotMetrics {
   recordArbitrageExecuted(count: number): void;
   recordNetProfitUsd(amountUsd: number): void;
   recordBundleSubmission(route: "public_rpc" | "private_bundle"): void;
+  recordOracleFreshnessMs(chain: string, token: string, freshnessMs: number, source: string): void;
+  recordDustFiltered(count?: number): void;
+  recordCooldownBlock(count?: number): void;
   recordError(): void;
   recordLatency(stage: BotLatencyStage, durationSeconds: number, labels?: { readonly chain?: string }): void;
   recordPipelineLatency(
@@ -306,6 +309,23 @@ export function createBotMetrics(): BotMetrics {
     buckets: [5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 1_000, 2_000, 5_000],
     registers: [registry],
   });
+  const oracleFreshnessMs = new client.Histogram({
+    name: "oracle_freshness_ms",
+    help: "Age of the underlying oracle price sample in milliseconds",
+    labelNames: ["chain", "token", "source"],
+    buckets: [1_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000],
+    registers: [registry],
+  });
+  const dustFilteredTotal = new client.Counter({
+    name: "dust_filtered_total",
+    help: "Liquidation candidates rejected as dust before enqueue or preview",
+    registers: [registry],
+  });
+  const cooldownBlocksTotal = new client.Counter({
+    name: "cooldown_blocks_total",
+    help: "Execution attempts blocked by post-dead-letter borrower cooldown",
+    registers: [registry],
+  });
 
   return {
     registry,
@@ -349,6 +369,15 @@ export function createBotMetrics(): BotMetrics {
         snapshot.publicRpcSubmissions += 1;
       }
       bundleRouteSubmissions.inc({ route });
+    },
+    recordOracleFreshnessMs(chain, token, freshnessMs, source) {
+      oracleFreshnessMs.observe({ chain, token, source }, Math.max(0, freshnessMs));
+    },
+    recordDustFiltered(count = 1) {
+      dustFilteredTotal.inc(count);
+    },
+    recordCooldownBlock(count = 1) {
+      cooldownBlocksTotal.inc(count);
     },
     recordError() {
       snapshot.errorsTotal += 1;

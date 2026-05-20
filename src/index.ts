@@ -48,10 +48,21 @@ import { buildLiquidationCallParams, ViemAaveV3Protocol } from "./protocols/aave
 import { FlashLoanProviderRouter } from "./profitability/flashLoanProviderRouter";
 import { ProfitabilityEngine } from "./profitability/profitabilityEngine";
 import { ReplayHarness } from "./backtesting/replayHarness";
+import { runPhase2TargetedDustDryRun } from "./backtesting/phase2TargetedDryRun";
+import { phase2DustBorrowerAccounts } from "./constants/phase2DustBorrowers";
 import { MIN_PROFIT_THRESHOLD_WEI } from "./utils/evCalculator";
 import { GasPriceOracle } from "./utils/gasPriceOracle";
 import { createAsset, createAssetAmount } from "./utils/typedAssetMath";
-import { PriceOracleCache, type OracleFeedRegistry } from "./utils/priceOracleCache";
+import {
+  PriceOracleCache,
+  assertBaseFeedRegistry,
+  canonicalBaseAaveOracleAddress,
+  type OracleFeedRegistry,
+} from "./utils/priceOracleCache";
+import { BorrowerCooldownRegistry } from "./utils/borrowerCooldown";
+import { acquireSingleInstanceLock } from "./utils/singleInstanceLock";
+import { LiquidationCandidateGate } from "./orchestrator/liquidationCandidateGate";
+import { evaluateDustFilter } from "./protocols/liquidationCandidateFilter";
 import { sendDailyPnlSummary, sendLiquidationAlert } from "./utils/telegramAlert";
 import { assertLiquidationReceiverReadiness } from "./production/liquidationReceiverReadiness";
 import { DeploymentSafetyGate, type DeploymentGateResult, type DryRunValidationReceipt } from "./production/productionReadiness";
@@ -106,6 +117,12 @@ export interface RuntimeConfig {
   readonly dailyPnlCsvPath: string | undefined;
   readonly arbitrageMinProfitUsd: number;
   readonly priceFeedRegistry: OracleFeedRegistry | undefined;
+  readonly minLiquidationDebtUsd: number;
+  readonly borrowerDeadLetterCooldownMs: number;
+  readonly oracleMaxStaleMs: number;
+  readonly oraclePollIntervalMs: number;
+  readonly singleInstanceLockPath: string;
+  readonly disableSingleInstanceLock: boolean;
 }
 
 export interface BotRunner {
@@ -129,6 +146,7 @@ const canonicalBaseCbBtc = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Addre
 const canonicalBaseUsdcUsdFeed = "0x7e860098F58bBFC8648a4311b374B1D669a2bc6B" as Address;
 const canonicalBaseEthUsdFeed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70" as Address;
 const canonicalBaseCbBtcUsdFeed = "0x07DA0E54543a844a80ABE69c8A12F22B3aA59f9D" as Address;
+const baseAaveOracleAddress = canonicalBaseAaveOracleAddress;
 
 export function parseRuntimeConfig(env: Env): RuntimeConfig {
   const parsedEnv = parseRuntimeEnv(env);
@@ -206,9 +224,28 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     dailyPnlCsvPath: optionalEnv(parsedEnv, "DAILY_PNL_CSV_PATH"),
     arbitrageMinProfitUsd: parseMinNumber(parsedEnv.ARBITRAGE_MIN_PROFIT_USD, 0.15, 0, "ARBITRAGE_MIN_PROFIT_USD"),
     priceFeedRegistry,
+    minLiquidationDebtUsd: parseMinNumber(
+      parsedEnv.MIN_LIQUIDATION_DEBT_USD,
+      Math.max(parseMinNumber(parsedEnv.MIN_PROFIT_USD, 10, 0, "MIN_PROFIT_USD"), 100),
+      0,
+      "MIN_LIQUIDATION_DEBT_USD",
+    ),
+    borrowerDeadLetterCooldownMs: parseMinNumber(
+      parsedEnv.BORROWER_DEAD_LETTER_COOLDOWN_MS,
+      600_000,
+      300_000,
+      "BORROWER_DEAD_LETTER_COOLDOWN_MS",
+    ),
+    oracleMaxStaleMs: parseMinNumber(parsedEnv.ORACLE_MAX_STALE_MS, 900_000, 1_000, "ORACLE_MAX_STALE_MS"),
+    oraclePollIntervalMs: parseMinNumber(parsedEnv.ORACLE_POLL_INTERVAL_MS, 60_000, 1_000, "ORACLE_POLL_INTERVAL_MS"),
+    singleInstanceLockPath: optionalEnv(parsedEnv, "SINGLE_INSTANCE_LOCK_PATH") ?? ".runtime/bot.lock",
+    disableSingleInstanceLock: parseBoolean(parsedEnv.DISABLE_SINGLE_INSTANCE_LOCK, false),
   };
   assertPipelineFlashLiquidationReadiness(config);
   assertArbitragePriceFeedCoverage(config);
+  if (config.chains.includes("base")) {
+    assertBaseFeedRegistry(config.priceFeedRegistry);
+  }
   return config;
 }
 
@@ -377,8 +414,25 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       publicClient,
       chain: config.chain,
       feedRegistry: config.priceFeedRegistry,
+      maxStaleMs: config.oracleMaxStaleMs,
+      heartbeatWarnMs: config.oracleMaxStaleMs,
+      ...(config.chain === "base" ? { aaveOracleAddress: baseAaveOracleAddress } : {}),
       logger,
+      onFreshnessObserved: (observation) => {
+        metrics.recordOracleFreshnessMs(
+          observation.chain,
+          observation.token,
+          observation.freshnessMs,
+          observation.source,
+        );
+      },
     });
+  if (priceOracleCache !== undefined && config.chain === "base") {
+    priceOracleCache.startBackgroundPoll(
+      [canonicalBaseWeth, canonicalBaseUsdc, canonicalBaseCbBtc],
+      config.oraclePollIntervalMs,
+    );
+  }
   let resolvedFlashLoanFeeBpsPromise: Promise<number> | undefined;
   const resolveFlashLoanFeeBps = async (): Promise<number> => {
     if (resolvedFlashLoanFeeBpsPromise === undefined) {
@@ -426,6 +480,17 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     }
     return config.slippageBps;
   };
+  const borrowerCooldown = new BorrowerCooldownRegistry({
+    cooldownMs: config.borrowerDeadLetterCooldownMs,
+  });
+  const liquidationGate = new LiquidationCandidateGate({
+    minDebtUsd: config.minLiquidationDebtUsd,
+    resolveGasCostUsd: resolveDynamicGasCostUsd,
+    ...(priceOracleCache === undefined ? {} : { priceOracle: priceOracleCache }),
+    borrowerCooldown,
+    logger,
+    metrics,
+  });
   const monitor = new HealthFactorMonitor({
     protocol,
     pollIntervalMs: config.pollIntervalMs,
@@ -435,6 +500,15 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     resolveDynamicGasCostUsd,
     slippageBps: config.slippageBps,
     resolveDynamicSlippageBps,
+    minLiquidationDebtUsd: config.minLiquidationDebtUsd,
+    resolveDebtUsd: async (candidate) => {
+      const filtered = await liquidationGate.filterCandidates(
+        config.chain,
+        [candidate],
+        "health_factor_scan",
+      );
+      return filtered[0]?.repayValueUsd ?? candidate.repayValueUsd;
+    },
     logger,
   });
 
@@ -490,6 +564,22 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     allowPublicFallbackAfterBundleFailure: true,
     bundleRouter: privateSubmissionClient,
     privateFirstChains: config.chain === "base" ? ["base"] : [],
+    rejectBeforePreview: async (request) => {
+      if (liquidationGate.isBorrowerBlocked(request.chain, request.account)) {
+        return "borrower_cooldown";
+      }
+      const debtUsd = Number(request.routeInput.debt.raw) / 1e8;
+      const gasCostUsd = await resolveDynamicGasCostUsd();
+      const dust = evaluateDustFilter({
+        debtUsd,
+        minDebtUsd: config.minLiquidationDebtUsd,
+        gasCostUsd,
+      });
+      if (dust.isDust) {
+        return `dust:${dust.reason ?? "filtered"}:debtUSD=${debtUsd}`;
+      }
+      return undefined;
+    },
   });
   const arbQueue = new ArbitrageOpportunityQueue();
   const detectionSource = config.wsRpcUrlPrimary === undefined
@@ -516,6 +606,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     provider: new AaveSnapshotProvider(config.chain, protocol, registry),
     logger,
     metrics,
+    liquidationGate,
   });
   const detection = new PipelineDetectionAdapter({
     chain: config.chain,
@@ -616,6 +707,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     detection,
     executor,
     deadLetters: new PipelineDeadLetterQueue(),
+    liquidationGate,
     logger,
     metrics,
     sequencerGuard: {
@@ -707,7 +799,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     },
   });
 
-  return new PipelineBotRunner(orchestrator, arbitrageScanner, startupGuard);
+  return new PipelineBotRunner(orchestrator, arbitrageScanner, startupGuard, () => {
+    priceOracleCache?.stopBackgroundPoll();
+  });
 }
 
 class PipelineBotRunner implements BotRunner {
@@ -715,6 +809,7 @@ class PipelineBotRunner implements BotRunner {
     private readonly orchestrator: PipelineOrchestrator,
     private readonly arbitrageScanner: ArbitrageScanner,
     private readonly startupGuard?: () => Promise<void>,
+    private readonly onShutdown?: () => void,
   ) {}
 
   public async runPollingLoop(options: PollingLoopOptions): Promise<void> {
@@ -726,8 +821,20 @@ class PipelineBotRunner implements BotRunner {
       await this.orchestrator.runLoop(options);
     } finally {
       this.arbitrageScanner.stop();
+      this.onShutdown?.();
     }
   }
+}
+
+function parseDryRunTargetBorrowers(env: Env): Address[] | undefined {
+  if (parseBoolean(env.DRY_RUN_PHASE2_VALIDATION, false)) {
+    return [...phase2DustBorrowerAccounts];
+  }
+  const raw = optionalEnv(env, "DRY_RUN_TARGET_BORROWERS");
+  if (raw === undefined) {
+    return undefined;
+  }
+  return raw.split(",").map((entry) => entry.trim()).filter((entry) => /^0x[a-fA-F0-9]{40}$/.test(entry)) as Address[];
 }
 
 async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logger: LoggerLike): Promise<void> {
@@ -765,6 +872,38 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
     50,
     replayRegistry,
   );
+  const targetBorrowers = parseDryRunTargetBorrowers(process.env);
+  if (targetBorrowers !== undefined && targetBorrowers.length > 0) {
+    const result = await runPhase2TargetedDustDryRun({
+      config: {
+        chain: config.chain,
+        rpcUrl: config.rpcUrl,
+        fallbackRpcUrls: config.fallbackRpcUrls,
+        aaveSubgraphUrl: config.aaveSubgraphUrl,
+        minLiquidationDebtUsd: config.minLiquidationDebtUsd,
+        borrowerDeadLetterCooldownMs: config.borrowerDeadLetterCooldownMs,
+        oracleMaxStaleMs: config.oracleMaxStaleMs,
+        minProfitUsd: config.minProfitUsd,
+        gasCostUsd: config.gasCostUsd,
+        slippageBps: config.slippageBps,
+        minProfitMarginBps: config.minProfitMarginBps,
+        flashLoanFeeBps: config.flashLoanFeeBps,
+        flashLoanSlippageFloorBps: config.flashLoanSlippageFloorBps,
+        ...(config.liquidationReceiverAddress === undefined
+          ? {}
+          : { liquidationReceiverAddress: config.liquidationReceiverAddress }),
+        ...(config.priceFeedRegistry === undefined ? {} : { priceFeedRegistry: config.priceFeedRegistry }),
+      },
+      logger,
+      metrics,
+      protocol,
+      publicClient,
+      walletClient,
+      accounts: targetBorrowers,
+    });
+    logger.info("dry_run_phase2_complete", result);
+    return;
+  }
   const mockSequencerDown = parseBoolean(process.env.DRY_RUN_MOCK_SEQUENCER_DOWN, false);
   const sequencerUp = mockSequencerDown
     ? false
@@ -816,7 +955,39 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
     cache.upsert(snapshot);
   }
   const replayCandidates = createReserveAwareCandidates(cache, config.chain);
-  const candidates = replayCandidates.length > 0 ? replayCandidates : await protocol.getLiquidatablePositions();
+  const rawCandidates = replayCandidates.length > 0 ? replayCandidates : await protocol.getLiquidatablePositions();
+  const priceOracleForReplay = config.priceFeedRegistry === undefined
+    ? undefined
+    : new PriceOracleCache({
+      publicClient,
+      chain: config.chain,
+      feedRegistry: config.priceFeedRegistry,
+      maxStaleMs: config.oracleMaxStaleMs,
+      ...(config.chain === "base" ? { aaveOracleAddress: baseAaveOracleAddress } : {}),
+      logger,
+    });
+  const replayGasCostUsd = priceOracleForReplay === undefined
+    ? config.gasCostUsd
+    : await (async () => {
+      const gasPrice = await publicClient.getGasPrice();
+      const nativeToken = nativeGasTokenForChain(config.chain);
+      const prices = await priceOracleForReplay.batchGetUsdPrices([nativeToken]);
+      const nativePriceRaw = prices[nativeToken] ?? 0n;
+      if (nativePriceRaw <= 0n) {
+        return config.gasCostUsd;
+      }
+      const gasCostWei = gasPrice * 500_000n;
+      return Number((gasCostWei * nativePriceRaw) / 1_000_000_000_000_000_000n) / 1e8;
+    })();
+  const replayGate = new LiquidationCandidateGate({
+    minDebtUsd: config.minLiquidationDebtUsd,
+    resolveGasCostUsd: async () => replayGasCostUsd,
+    ...(priceOracleForReplay === undefined ? {} : { priceOracle: priceOracleForReplay }),
+    borrowerCooldown: new BorrowerCooldownRegistry({ cooldownMs: config.borrowerDeadLetterCooldownMs }),
+    logger,
+    metrics,
+  });
+  const candidates = await replayGate.filterCandidates(config.chain, rawCandidates, "dry_run_replay");
   if (candidates.length === 0) {
     logger.warn("dry_run_replay_no_candidates", {
       chain: config.chain,
@@ -870,28 +1041,7 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
     metrics,
     dryRunMode: true,
   });
-  const priceOracleCache = config.priceFeedRegistry === undefined
-    ? undefined
-    : new PriceOracleCache({
-      publicClient,
-      chain: config.chain,
-      feedRegistry: config.priceFeedRegistry,
-      logger,
-    });
-  const gasPrice = await publicClient.getGasPrice();
-  const gasCostUsd = priceOracleCache === undefined
-    ? config.gasCostUsd
-    : await (async () => {
-      const nativeToken = nativeGasTokenForChain(config.chain);
-      const prices = await priceOracleCache.batchGetUsdPrices([nativeToken]);
-      const nativePriceRaw = prices[nativeToken] ?? 0n;
-      if (nativePriceRaw <= 0n) {
-        return config.gasCostUsd;
-      }
-      const gasCostWei = gasPrice * 500_000n;
-      const gasCostUsdRaw = (gasCostWei * nativePriceRaw) / 1_000_000_000_000_000_000n;
-      return Number(gasCostUsdRaw) / 1e8;
-    })();
+  const gasCostUsd = replayGasCostUsd;
   let simulated = 0;
   for (const candidate of candidates.slice(0, 25)) {
     const request = buildLiquidationExecutionRequest(config.chain, candidate, {
@@ -926,7 +1076,23 @@ async function main(): Promise<void> {
   const logger = createLogger(config.logLevel);
   const metrics = createBotMetrics();
   const metricsServer = startMetricsServer(metrics, logger);
-  if (process.argv.includes("--dry-run")) {
+  const dryRunMode = process.argv.includes("--dry-run");
+  if (!config.disableSingleInstanceLock && !dryRunMode) {
+    const lock = acquireSingleInstanceLock({ lockPath: resolve(config.singleInstanceLockPath) });
+    if (lock === null) {
+      logger.error("single_instance_lock_rejected", {
+        lockPath: config.singleInstanceLockPath,
+        message: "Another bot instance is already running; exiting to prevent duplicate execution",
+      });
+      metricsServer.close();
+      process.exitCode = 1;
+      return;
+    }
+    process.once("SIGINT", () => lock.release());
+    process.once("SIGTERM", () => lock.release());
+    logger.info("single_instance_lock_acquired", { lockPath: lock.lockPath, pid: process.pid });
+  }
+  if (dryRunMode) {
     try {
       await runDryRunReplay(config, metrics, logger);
     } finally {
