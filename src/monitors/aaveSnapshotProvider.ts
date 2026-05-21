@@ -9,6 +9,7 @@ const usd = createAsset({ symbol: "USD", decimals: 8 });
 const weth = createAsset({ symbol: "WETH", decimals: 18 });
 const usdc = createAsset({ symbol: "USDC", decimals: 6 });
 const liquidationHealthFactor = 1_000_000_000_000_000_000n;
+const preLiquidatableHealthFactor = 1_050_000_000_000_000_000n;
 
 export class AaveSnapshotProvider {
   public constructor(
@@ -23,10 +24,24 @@ export class AaveSnapshotProvider {
   }
 
   public async refreshBorrowers(_chain: SupportedChain, accounts: readonly Address[]): Promise<readonly BorrowerSnapshot[]> {
+    return this.refreshBorrowersWithThreshold(accounts, liquidationHealthFactor);
+  }
+
+  public async refreshWatchlistBorrowers(
+    _chain: SupportedChain,
+    accounts: readonly Address[],
+  ): Promise<readonly BorrowerSnapshot[]> {
+    return this.refreshBorrowersWithThreshold(accounts, preLiquidatableHealthFactor);
+  }
+
+  private async refreshBorrowersWithThreshold(
+    accounts: readonly Address[],
+    hfThreshold: bigint,
+  ): Promise<readonly BorrowerSnapshot[]> {
     this.registry.getResolvedAave(this.chain);
     const snapshots: BorrowerSnapshot[] = [];
     for (const account of accounts) {
-      const snapshot = await this.refreshBorrower(account);
+      const snapshot = await this.refreshBorrower(account, hfThreshold);
       if (snapshot !== undefined) {
         snapshots.push(snapshot);
       }
@@ -40,13 +55,16 @@ export class AaveSnapshotProvider {
     return candidates.map((candidate) => toSnapshot(this.chain, candidate));
   }
 
-  private async refreshBorrower(account: Address): Promise<BorrowerSnapshot | undefined> {
+  private async refreshBorrower(
+    account: Address,
+    hfThreshold: bigint = liquidationHealthFactor,
+  ): Promise<BorrowerSnapshot | undefined> {
     if (this.protocol.getUserAccount === undefined || this.protocol.getBestLiquidationPair === undefined) {
       return undefined;
     }
 
     const userAccount = await this.protocol.getUserAccount(account);
-    if (userAccount.healthFactor >= liquidationHealthFactor) {
+    if (userAccount.healthFactor >= hfThreshold || userAccount.totalDebtBase <= 0n) {
       return undefined;
     }
     const pair = await this.protocol.getBestLiquidationPair(userAccount);

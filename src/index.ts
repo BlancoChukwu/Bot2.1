@@ -62,6 +62,8 @@ import {
 import { BorrowerCooldownRegistry } from "./utils/borrowerCooldown";
 import { acquireSingleInstanceLock } from "./utils/singleInstanceLock";
 import { LiquidationCandidateGate } from "./orchestrator/liquidationCandidateGate";
+import { startBorrowerWatchlistRescanner } from "./monitors/borrowerWatchlistRescanner";
+import { startMemoryMonitor } from "./utils/memoryMonitor";
 import { evaluateDustFilter } from "./protocols/liquidationCandidateFilter";
 import { sendDailyPnlSummary, sendLiquidationAlert } from "./utils/telegramAlert";
 import { assertLiquidationReceiverReadiness } from "./production/liquidationReceiverReadiness";
@@ -226,7 +228,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     priceFeedRegistry,
     minLiquidationDebtUsd: parseMinNumber(
       parsedEnv.MIN_LIQUIDATION_DEBT_USD,
-      Math.max(parseMinNumber(parsedEnv.MIN_PROFIT_USD, 10, 0, "MIN_PROFIT_USD"), 100),
+      Math.max(parseMinNumber(parsedEnv.MIN_PROFIT_USD, 10, 0, "MIN_PROFIT_USD"), 50),
       0,
       "MIN_LIQUIDATION_DEBT_USD",
     ),
@@ -486,6 +488,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   const liquidationGate = new LiquidationCandidateGate({
     minDebtUsd: config.minLiquidationDebtUsd,
     resolveGasCostUsd: resolveDynamicGasCostUsd,
+    resolveFlashFeeBps: resolveFlashLoanFeeBps,
     ...(priceOracleCache === undefined ? {} : { priceOracle: priceOracleCache }),
     borrowerCooldown,
     logger,
@@ -600,10 +603,11 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       logger,
       metrics,
     });
+  const aaveSnapshotProvider = new AaveSnapshotProvider(config.chain, protocol, registry);
   const hybridDetection = new HybridDetectionPipeline({
     registry,
     eventSource: detectionSource,
-    provider: new AaveSnapshotProvider(config.chain, protocol, registry),
+    provider: aaveSnapshotProvider,
     logger,
     metrics,
     liquidationGate,
@@ -627,6 +631,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     profitabilityEngine: arbScannerEngine,
     logger,
     metrics,
+    logArbDebug: parseBoolean(process.env.LOG_ARB_DEBUG, false),
     publicClientFactory: (chain) =>
       createFailoverPublicClient({
         chain,
@@ -799,7 +804,26 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     },
   });
 
+  const borrowerRescanIntervalMs = parseMinNumber(
+    process.env.BORROWER_FULL_RESCAN_INTERVAL_MS,
+    15 * 60 * 1_000,
+    60_000,
+    "BORROWER_FULL_RESCAN_INTERVAL_MS",
+  );
+  const watchlistRescanner = startBorrowerWatchlistRescanner({
+    chain: config.chain,
+    protocol,
+    provider: aaveSnapshotProvider,
+    cache: hybridDetection.cache,
+    logger,
+    metrics,
+    intervalMs: borrowerRescanIntervalMs,
+  });
+  const memoryMonitor = startMemoryMonitor({ logger });
+
   return new PipelineBotRunner(orchestrator, arbitrageScanner, startupGuard, () => {
+    watchlistRescanner.stop();
+    memoryMonitor.stop();
     priceOracleCache?.stopBackgroundPoll();
   });
 }
@@ -982,6 +1006,7 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
   const replayGate = new LiquidationCandidateGate({
     minDebtUsd: config.minLiquidationDebtUsd,
     resolveGasCostUsd: async () => replayGasCostUsd,
+    resolveFlashFeeBps: async () => config.flashLoanFeeBps,
     ...(priceOracleForReplay === undefined ? {} : { priceOracle: priceOracleForReplay }),
     borrowerCooldown: new BorrowerCooldownRegistry({ cooldownMs: config.borrowerDeadLetterCooldownMs }),
     logger,
@@ -1078,7 +1103,10 @@ async function main(): Promise<void> {
   const metricsServer = startMetricsServer(metrics, logger);
   const dryRunMode = process.argv.includes("--dry-run");
   if (!config.disableSingleInstanceLock && !dryRunMode) {
-    const lock = acquireSingleInstanceLock({ lockPath: resolve(config.singleInstanceLockPath) });
+    const lock = acquireSingleInstanceLock({
+      lockPath: resolve(config.singleInstanceLockPath),
+      onStaleLockRemoved: (stalePid) => logger.warn("stale_lock_removed", { stalePid }),
+    });
     if (lock === null) {
       logger.error("single_instance_lock_rejected", {
         lockPath: config.singleInstanceLockPath,

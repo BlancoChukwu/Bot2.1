@@ -25,6 +25,10 @@ export interface DetectionEventSource {
 export interface BorrowerSnapshotProvider {
   getBorrowersForReserve(chain: SupportedChain, reserve: Address): Promise<Address[]>;
   refreshBorrowers(chain: SupportedChain, accounts: readonly Address[]): Promise<readonly BorrowerSnapshot[]>;
+  refreshWatchlistBorrowers?(
+    chain: SupportedChain,
+    accounts: readonly Address[],
+  ): Promise<readonly BorrowerSnapshot[]>;
   pollBorrowers(chain: SupportedChain): Promise<readonly BorrowerSnapshot[]>;
 }
 

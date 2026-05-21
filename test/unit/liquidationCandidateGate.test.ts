@@ -25,7 +25,8 @@ describe("LiquidationCandidateGate", () => {
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const gate = new LiquidationCandidateGate({
       minDebtUsd: 25,
-      resolveGasCostUsd: async () => 5,
+      resolveGasCostUsd: async () => 0.01,
+      resolveFlashFeeBps: async () => 5,
       borrowerCooldown: new BorrowerCooldownRegistry({ cooldownMs: 60_000, nowMs: () => 0 }),
       logger,
     });

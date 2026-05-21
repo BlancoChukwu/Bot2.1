@@ -1,5 +1,8 @@
 import type { Address } from "viem";
 import type { LiquidationCandidate } from "./aaveV3";
+import { DustLogCooldown } from "../utils/dustLogCooldown";
+
+const sharedDustLogCooldown = new DustLogCooldown();
 
 /** Chainlink/Aave USD prices use 8 decimals in this codebase. */
 const usdPriceScale = 1e8;
@@ -13,6 +16,7 @@ export interface DustFilterInput {
 export type DustFilterReason =
   | "non_positive_debt"
   | "below_min_debt"
+  | "below_profitability_floor"
   | "below_gas_multiple"
   | "oracle_untrusted";
 
@@ -25,12 +29,17 @@ export interface DustFilterDecision {
 export function formatDustReasonLabel(
   reason: DustFilterReason | undefined,
   minDebtUsd: number,
+  effectiveFloorUsd?: number,
 ): string {
   if (reason === undefined) {
     return "passed";
   }
   if (reason === "below_min_debt") {
     return `below_MIN_LIQUIDATION_DEBT_USD(${minDebtUsd})`;
+  }
+  if (reason === "below_profitability_floor") {
+    const floor = effectiveFloorUsd ?? minDebtUsd;
+    return `below_PROFITABILITY_FLOOR(${floor.toFixed(4)})`;
   }
   if (reason === "below_gas_multiple") {
     return "below_GAS_COST_MULTIPLE";
@@ -87,9 +96,19 @@ export function logLiquidationDustDecision(
     readonly stage: string;
     readonly decision: DustFilterDecision;
     readonly minDebtUsd: number;
+    readonly effectiveFloorUsd?: number;
+    readonly dustLogCooldown?: DustLogCooldown;
   },
 ): void {
-  const dustReason = formatDustReasonLabel(meta.decision.reason, meta.minDebtUsd);
+  const cooldown = meta.dustLogCooldown ?? sharedDustLogCooldown;
+  if (meta.decision.isDust && !cooldown.shouldLog(`${meta.chain}:${meta.account}`)) {
+    return;
+  }
+  const dustReason = formatDustReasonLabel(
+    meta.decision.reason,
+    meta.minDebtUsd,
+    meta.effectiveFloorUsd,
+  );
   const line = meta.decision.isDust
     ? `liquidation_dust_filtered | debtUSD: ${meta.decision.debtUsd} | isDust: true | dustReason: ${dustReason} | stage: ${meta.stage}`
     : `liquidation_dust_check_passed | debtUSD: ${meta.decision.debtUsd} | isDust: false | stage: ${meta.stage}`;

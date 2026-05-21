@@ -104,6 +104,7 @@ export async function runPhase2TargetedDustDryRun(
   const gate = new LiquidationCandidateGate({
     minDebtUsd: input.config.minLiquidationDebtUsd,
     resolveGasCostUsd,
+    resolveFlashFeeBps: async () => input.config.flashLoanFeeBps,
     ...(priceOracle === undefined ? {} : { priceOracle }),
     borrowerCooldown: new BorrowerCooldownRegistry({ cooldownMs: input.config.borrowerDeadLetterCooldownMs }),
     logger: input.logger,

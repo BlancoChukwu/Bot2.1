@@ -135,6 +135,7 @@ export interface ArbitrageScannerConfig {
   readonly baseMinProfitThreshold?: bigint;
   readonly arbitrageSlippageBps?: number;
   readonly exactUsdPriceCache?: Pick<PriceOracleCache, "batchGetUsdPrices">;
+  readonly logArbDebug?: boolean;
   readonly nativeGasTokenByChain?: Readonly<Record<SupportedChain, Address>>;
   readonly nativeGasTokenDecimalsByChain?: Readonly<Record<SupportedChain, number>>;
   readonly exactUsdMinProfitRaw?: bigint;
@@ -470,6 +471,26 @@ export class ArbitrageScanner {
       minimumMarginBps: opp.minimumMarginBps,
     };
     const result = await this.config.profitabilityEngine.evaluate(input);
+    const grossProfitUsd = Number(opp.expectedRevenue.raw) / 10 ** 8;
+    const gasCostUsd = Number(opp.estimatedGas.raw) / 10 ** 8;
+    const flashFeeUsd = Number(opp.flashLoanFee.raw) / 10 ** 8;
+    const netProfitUsd = Number(result.netProfit.raw) / 10 ** 8;
+    this.config.logger.info("arbitrage_opportunity_evaluated", {
+      opportunityId: opp.opportunityId,
+      chain: opp.chain,
+      tokenIn: opp.tokenIn,
+      tokenOut: opp.tokenOut,
+      grossProfitUsd,
+      gasCostUsd,
+      flashFeeUsd,
+      netProfitUsd,
+      pass: result.status === "approved",
+      reason: result.status === "approved"
+        ? "approved"
+        : netProfitUsd < 0
+          ? "unprofitable"
+          : "below_threshold",
+    });
     if (result.status === "approved") {
       this.config.metrics.recordNetProfitUsd(Number(result.netProfit.raw) / 10 ** 8);
       this.config.opportunitySink?.push(opp);
@@ -626,15 +647,17 @@ export class ArbitrageScanner {
       amountOut = out;
       quoteSource = "getAmountsOut";
     }
-    this.config.logger.info("arbitrage_quote_debug", {
-      dex: dex.name,
-      quoteSource,
-      tokenIn,
-      tokenOut,
-      amountIn: amountIn.toString(),
-      amountOut: amountOut.toString(),
-      ...(quoteSource === "quoterV2" ? { quoterPoolFee: dex.quoterPoolFee ?? 3_000 } : {}),
-    });
+    if (this.config.logArbDebug) {
+      this.config.logger.info("arbitrage_quote_debug", {
+        dex: dex.name,
+        quoteSource,
+        tokenIn,
+        tokenOut,
+        amountIn: amountIn.toString(),
+        amountOut: amountOut.toString(),
+        ...(quoteSource === "quoterV2" ? { quoterPoolFee: dex.quoterPoolFee ?? 3_000 } : {}),
+      });
+    }
     return amountOut;
   }
 

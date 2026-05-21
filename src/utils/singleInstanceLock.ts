@@ -9,6 +9,7 @@ export interface SingleInstanceLock {
 export interface SingleInstanceLockOptions {
   readonly lockPath: string;
   readonly pid?: number;
+  readonly onStaleLockRemoved?: (stalePid: number) => void;
 }
 
 /**
@@ -33,6 +34,9 @@ export function acquireSingleInstanceLock(options: SingleInstanceLockOptions): S
     }
     try {
       unlinkSync(options.lockPath);
+      if (existingPid !== undefined) {
+        options.onStaleLockRemoved?.(existingPid);
+      }
     } catch {
       return null;
     }

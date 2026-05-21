@@ -50,6 +50,7 @@ export interface AaveV3Protocol {
   getBestLiquidationPair?(
     account: AaveUserAccount,
   ): Promise<Omit<LiquidationCandidate, "account" | "healthFactor">>;
+  listBorrowerAddresses?(): Promise<readonly Address[]>;
   getLastScanStats?(): AaveScanStats;
   subscribeToReserveDataUpdated?(onEvent: (reserve?: Address) => void): Promise<() => void>;
 }
@@ -324,6 +325,13 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
       repayValueUsd: pair.repayValueUsd,
       liquidationBonusBps: pair.liquidationBonusBps,
     };
+  }
+
+  public async listBorrowerAddresses(): Promise<readonly Address[]> {
+    if (this.graphClient === undefined) {
+      throw new Error("Aave subgraph client is required for borrower enumeration");
+    }
+    return fetchAllBorrowers(this.graphClient, this.borrowerPageSize);
   }
 
   public async getLiquidatablePositions(): Promise<LiquidationCandidate[]> {
