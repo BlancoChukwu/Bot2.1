@@ -20,6 +20,10 @@ const dustDedupeWindowMs = 60_000;
 const counts = {
   liquidation_evaluated: 0,
   arbitrage_opportunity_evaluated: 0,
+  arbitrage_quotes_fetched: 0,
+  arbitrage_quotes_succeeded_cycles: 0,
+  hybrid_detection_failure: 0,
+  subgraph_lag_detected: 0,
   memory_stats: 0,
   liquidation_dust_filtered: 0,
   critical_errors: 0,
@@ -30,6 +34,8 @@ const counts = {
   memory_warning: 0,
   txs_sent: 0,
 };
+
+let arbitrageQuotesSucceededTotal = 0;
 
 const dynamicFloors = [];
 const dustTimestampsByAccount = new Map();
@@ -77,6 +83,19 @@ for (const rawLine of readLogLines(logPath)) {
       break;
     case "arbitrage_opportunity_evaluated":
       counts.arbitrage_opportunity_evaluated += 1;
+      break;
+    case "arbitrage_quotes_fetched":
+      counts.arbitrage_quotes_fetched += 1;
+      if (Number(row.quotesSucceeded) > 0) {
+        counts.arbitrage_quotes_succeeded_cycles += 1;
+        arbitrageQuotesSucceededTotal += Number(row.quotesSucceeded);
+      }
+      break;
+    case "hybrid_detection_failure":
+      counts.hybrid_detection_failure += 1;
+      break;
+    case "subgraph_lag_detected":
+      counts.subgraph_lag_detected += 1;
       break;
     case "memory_stats":
       counts.memory_stats += 1;
@@ -139,6 +158,18 @@ const metrics = [
     name: "arbitrage_opportunity_evaluated",
     pass: counts.arbitrage_opportunity_evaluated > 0,
     detail: `${counts.arbitrage_opportunity_evaluated} evaluations`,
+  },
+  {
+    id: 6,
+    name: "arbitrage_quotes_fetched",
+    pass: counts.arbitrage_quotes_succeeded_cycles > 0,
+    detail: `${counts.arbitrage_quotes_fetched} cycles, ${arbitrageQuotesSucceededTotal} successful quotes`,
+  },
+  {
+    id: 7,
+    name: "hybrid_detection_failure",
+    pass: counts.hybrid_detection_failure === 0,
+    detail: `${counts.hybrid_detection_failure} failures`,
   },
   {
     id: 3,

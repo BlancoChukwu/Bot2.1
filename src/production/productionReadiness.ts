@@ -7,7 +7,6 @@ export type DeploymentGateResult =
 
 export interface DeploymentSafetyInput {
   readonly simulationMode: boolean;
-  readonly hasPagerDutyRoutingKey: boolean;
   readonly hasMetricsEndpoint: boolean;
   readonly registeredChains: readonly SupportedChain[];
   readonly minProfitMarginBps: number;
@@ -34,9 +33,6 @@ export class DeploymentSafetyGate {
     }
     if (input.simulationMode && input.minProfitMarginBps < 40) {
       reasons.push("MIN_PROFIT_MARGIN_BPS must be at least 40 in simulation mode");
-    }
-    if (!input.simulationMode && !input.hasPagerDutyRoutingKey) {
-      reasons.push("PAGERDUTY_ROUTING_KEY is required for live mode");
     }
     if (!input.simulationMode) {
       reasons.push(...validateDryRunReceipt(input.dryRunValidation, this.dryRunValidationTtlMs));

@@ -163,6 +163,7 @@ export class ArbitrageScanner {
   private readonly activePolls = new Map<SupportedChain, NodeJS.Timeout>();
   private readonly dedupe = new Map<string, number>();
   private readonly usdAsset: Asset = { symbol: "USD", decimals: 8 };
+  private cycleQuoteStats = createEmptyQuoteCycleStats();
 
   public constructor(config: ArbitrageScannerConfig) {
     this.config = {
@@ -235,6 +236,7 @@ export class ArbitrageScanner {
 
   private async pollChain(chain: SupportedChain): Promise<void> {
     const startedAt = Date.now();
+    this.cycleQuoteStats = createEmptyQuoteCycleStats();
     const client = this.config.publicClientFactory(chain);
     const dexes = this.config.getDexesForChain(chain);
     const pairs = this.config.getMonitoredPairsForChain(chain);
@@ -270,6 +272,7 @@ export class ArbitrageScanner {
         return 0;
       });
       approvedCount = singleResults.reduce<number>((sum, value) => sum + Number(value), 0);
+      this.logQuoteCycleSummary(chain, startedAt, approvedCount);
       this.config.metrics.recordLatency("scan", (Date.now() - startedAt) / 1_000, { chain });
       this.config.metrics.recordArbitrageOpportunityScanned(scanned);
       if (approvedCount > 0) {
@@ -302,6 +305,7 @@ export class ArbitrageScanner {
     });
     approvedCount = multiResults.reduce<number>((sum, value) => sum + Number(value), 0);
 
+    this.logQuoteCycleSummary(chain, startedAt, approvedCount);
     this.config.metrics.recordLatency("scan", (Date.now() - startedAt) / 1_000, { chain });
     this.config.metrics.recordArbitrageOpportunityScanned(scanned);
     if (approvedCount > 0) {
@@ -319,6 +323,35 @@ export class ArbitrageScanner {
     this.config.logger.info(message, meta);
   }
 
+  private logQuoteCycleSummary(chain: SupportedChain, startedAt: number, approvedCount: number): void {
+    const stats = this.cycleQuoteStats;
+    this.config.logger.info("arbitrage_quotes_fetched", {
+      chain,
+      routesAttempted: stats.routesAttempted,
+      quotesSucceeded: stats.quotesSucceeded,
+      quotesFailed: stats.quotesFailed,
+      evaluations: stats.evaluations,
+      durationMs: Date.now() - startedAt,
+    });
+    if (stats.quotesSucceeded > 0 && stats.evaluations === 0) {
+      this.config.logger.info("arbitrage_evaluation_skipped", {
+        chain,
+        skipReasons: stats.skipReasons,
+      });
+    }
+    if (stats.quotesSucceeded > 0 && approvedCount === 0 && stats.evaluations > 0) {
+      this.config.logger.info("arbitrage_evaluation_skipped", {
+        chain,
+        skipReasons: { ...stats.skipReasons, below_threshold: stats.evaluations },
+      });
+    }
+  }
+
+  private recordSkip(reason: string): void {
+    const current = this.cycleQuoteStats.skipReasons[reason] ?? 0;
+    this.cycleQuoteStats.skipReasons[reason] = current + 1;
+  }
+
   private async checkSingleDirection(
     client: ReadOnlyClient,
     chain: SupportedChain,
@@ -326,12 +359,22 @@ export class ArbitrageScanner {
     pair: TokenPairConfig,
     gasPrice: bigint,
   ): Promise<ArbitrageOpportunity | null> {
+    this.cycleQuoteStats.routesAttempted += 1;
     try {
       let best: ArbitrageOpportunity | null = null;
       for (const amountIn of this.probeAmountsIn(chain, pair, true)) {
-        const intermediate = await this.quoteAmountOut(client, route.buyDex, pair.tokenIn, pair.tokenOut, amountIn);
-        const finalAmountOut = await this.quoteAmountOut(client, route.sellDex, pair.tokenOut, pair.tokenIn, intermediate);
+        let intermediate: bigint;
+        let finalAmountOut: bigint;
+        try {
+          intermediate = await this.quoteAmountOut(client, route.buyDex, pair.tokenIn, pair.tokenOut, amountIn);
+          finalAmountOut = await this.quoteAmountOut(client, route.sellDex, pair.tokenOut, pair.tokenIn, intermediate);
+          this.cycleQuoteStats.quotesSucceeded += 2;
+        } catch {
+          this.cycleQuoteStats.quotesFailed += 1;
+          continue;
+        }
         if (finalAmountOut <= amountIn) {
+          this.recordSkip("unprofitable_precheck");
           continue;
         }
 
@@ -347,6 +390,7 @@ export class ArbitrageScanner {
           gasPrice,
         );
         if (!simulation.success) {
+          this.recordSkip("simulation_failed");
           continue;
         }
 
@@ -374,6 +418,7 @@ export class ArbitrageScanner {
           isProfitable: ev.isProfitable,
         });
         if (!ev.isProfitable) {
+          this.recordSkip("unprofitable_precheck");
           continue;
         }
         if (this.config.exactUsdPriceCache !== undefined) {
@@ -405,6 +450,7 @@ export class ArbitrageScanner {
             isProfitable: exactUsd.isProfitable,
           });
           if (exactUsd.isPriceAvailable && !exactUsd.isProfitable) {
+            this.recordSkip("below_exact_usd");
             continue;
           }
         }
@@ -413,6 +459,7 @@ export class ArbitrageScanner {
         const now = Date.now();
         this.pruneDedupe(now);
         if (this.dedupe.has(signature)) {
+          this.recordSkip("dedupe");
           continue;
         }
         this.dedupe.set(signature, now);
@@ -445,6 +492,7 @@ export class ArbitrageScanner {
 
       return best;
     } catch (error) {
+      this.cycleQuoteStats.quotesFailed += 1;
       this.config.logger.info("arbitrage_quote_failed", {
         chain,
         buyDex: route.buyDex.name,
@@ -456,6 +504,7 @@ export class ArbitrageScanner {
   }
 
   private async evaluateOpportunity(opp: ArbitrageOpportunity): Promise<ProfitabilityResult> {
+    this.cycleQuoteStats.evaluations += 1;
     const input: ProfitSimulationInput = {
       chain: opp.chain,
       opportunityId: opp.opportunityId,
@@ -688,6 +737,24 @@ export class ArbitrageScanner {
     await Promise.all(workers);
     return results;
   }
+}
+
+interface QuoteCycleStats {
+  routesAttempted: number;
+  quotesSucceeded: number;
+  quotesFailed: number;
+  evaluations: number;
+  skipReasons: Record<string, number>;
+}
+
+function createEmptyQuoteCycleStats(): QuoteCycleStats {
+  return {
+    routesAttempted: 0,
+    quotesSucceeded: 0,
+    quotesFailed: 0,
+    evaluations: 0,
+    skipReasons: {},
+  };
 }
 
 function tokenAmount(pair: TokenPairConfig, raw: bigint): AssetAmount {

@@ -1,6 +1,7 @@
 import type { Address, Hex } from "viem";
 import type { ChainRegistry } from "../config/chainRegistry";
 import type { AaveReservePair, ChainConfig } from "../config/chains";
+import { SUBGRAPH_ID_CURSOR_START } from "../utils/subgraphIdCursor";
 
 const wad = 1_000_000_000_000_000_000n;
 const bpsDenominator = 10_000n;
@@ -75,7 +76,7 @@ interface AaveEventClient {
 }
 
 interface AaveGraphClient {
-  request<T>(query: string, variables: Record<string, number>): Promise<T>;
+  request<T>(query: string, variables: Record<string, number | string>): Promise<T>;
 }
 
 /** Many hosted Aave V3 subgraphs expose `users` + `userReserves` instead of Messari-style `positions`. */
@@ -299,7 +300,7 @@ export async function getLiquidatablePositions(
 
 export class ViemAaveV3Protocol implements AaveV3Protocol {
   private lastScanStats: AaveScanStats = { scanned: 0, liquidatable: 0 };
-  private nextBorrowerSkip = 0;
+  private nextBorrowerCursor = SUBGRAPH_ID_CURSOR_START;
 
   public constructor(
     private readonly publicClient: AaveReadClient & AaveEventClient,
@@ -339,7 +340,7 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
       throw new Error("Aave subgraph client is required for broad market scanning");
     }
 
-    const page = await fetchBorrowerPage(this.graphClient, this.borrowerPageSize, this.nextBorrowerSkip);
+    const page = await fetchBorrowerPage(this.graphClient, this.borrowerPageSize, this.nextBorrowerCursor);
     const borrowers = extractBorrowerAddresses(page);
     const positions: LiquidationCandidate[] = [];
 
@@ -351,7 +352,7 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
     }
 
     this.lastScanStats = { scanned: borrowers.length, liquidatable: positions.length };
-    this.advanceBorrowerCursor(borrowerPageRowCount(page));
+    this.advanceBorrowerCursor(page, borrowerPageRowCount(page));
     return positions;
   }
 
@@ -377,8 +378,12 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
     });
   }
 
-  private advanceBorrowerCursor(rowsRead: number): void {
-    this.nextBorrowerSkip = rowsRead < this.borrowerPageSize ? 0 : this.nextBorrowerSkip + this.borrowerPageSize;
+  private advanceBorrowerCursor(page: BorrowerPage, rowsRead: number): void {
+    if (rowsRead < this.borrowerPageSize) {
+      this.nextBorrowerCursor = SUBGRAPH_ID_CURSOR_START;
+      return;
+    }
+    this.nextBorrowerCursor = nextBorrowerPageCursor(page, this.nextBorrowerCursor);
   }
 
   private resolveAavePool(): Address {
@@ -414,26 +419,31 @@ async function readUserAccount(
 
 async function fetchAllBorrowers(graphClient: AaveGraphClient, pageSize: number): Promise<Address[]> {
   const borrowers = new Set<Address>();
-  let skip = 0;
+  let lastId = SUBGRAPH_ID_CURSOR_START;
 
   while (true) {
-    const page = await fetchBorrowerPage(graphClient, pageSize, skip);
+    const page = await fetchBorrowerPage(graphClient, pageSize, lastId);
+    const rowCount = borrowerPageRowCount(page);
     const addresses = extractBorrowerAddresses(page);
     for (const address of addresses) {
       borrowers.add(address);
     }
 
-    if (borrowerPageRowCount(page) < pageSize) {
+    if (rowCount < pageSize) {
       break;
     }
-    skip += pageSize;
+    lastId = nextBorrowerPageCursor(page, lastId);
   }
 
   return [...borrowers];
 }
 
-async function fetchBorrowerPage(graphClient: AaveGraphClient, pageSize: number, skip: number): Promise<BorrowerPage> {
-  const variables = { first: pageSize, skip };
+async function fetchBorrowerPage(
+  graphClient: AaveGraphClient,
+  pageSize: number,
+  lastId: string,
+): Promise<BorrowerPage> {
+  const variables = { first: pageSize, lastId };
   const mode = borrowerQueryModeByClient.get(graphClient);
   if (mode === "users") {
     return graphClient.request<BorrowerPage>(borrowerQueryUsers, variables);
@@ -466,6 +476,18 @@ function borrowerPageRowCount(page: BorrowerPage): number {
     return page.userReserves.length;
   }
   return 0;
+}
+
+function nextBorrowerPageCursor(page: BorrowerPage, currentCursor: string): string {
+  const rows = page.positions ?? page.users ?? page.userReserves ?? [];
+  if (rows.length === 0) {
+    return currentCursor;
+  }
+  const last = rows[rows.length - 1]!;
+  if ("id" in last && typeof last.id === "string") {
+    return last.id;
+  }
+  return currentCursor;
 }
 
 function extractBorrowerAddresses(page: BorrowerPage): Address[] {
@@ -526,13 +548,12 @@ function selectBestReservePairForAccount(chain: ChainConfig, account: AaveUserAc
 }
 
 const borrowerQueryPositions = `
-  query AaveV3BorrowersPositions($first: Int!, $skip: Int!) {
+  query AaveV3BorrowersPositions($first: Int!, $lastId: ID!) {
     positions(
       first: $first
-      skip: $skip
       orderBy: id
       orderDirection: asc
-      where: { side: BORROWER, balance_gt: 0 }
+      where: { side: BORROWER, balance_gt: 0, id_gt: $lastId }
     ) {
       id
     }
@@ -540,13 +561,12 @@ const borrowerQueryPositions = `
 `;
 
 const borrowerQueryUsers = `
-  query AaveV3BorrowersUsers($first: Int!, $skip: Int!) {
+  query AaveV3BorrowersUsers($first: Int!, $lastId: ID!) {
     users(
       first: $first
-      skip: $skip
       orderBy: id
       orderDirection: asc
-      where: { borrowedReservesCount_gt: 0 }
+      where: { borrowedReservesCount_gt: 0, id_gt: $lastId }
     ) {
       id
     }

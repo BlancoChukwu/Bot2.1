@@ -16,10 +16,7 @@ $env:SIMULATION_MODE = "false"
 $env:DRY_RUN_SUCCESS = "true"
 $env:DRY_RUN_VALIDATED_AT_MS = $r.validatedAtMs
 $env:DRY_RUN_CONFIG_HASH = $r.configHash
-if (-not $env:PAGERDUTY_ROUTING_KEY) {
-  $env:PAGERDUTY_ROUTING_KEY = "https://webhook.site/session-shadow-validation"
-}
-$env:NODE_OPTIONS = "--max-old-space-size=4096"
+$env:NODE_OPTIONS = "--max-old-space-size=768 --expose-gc"
 
 $log = "logs/live-24h-20260521.log"
 $errLog = "logs/live-24h-20260521.err.log"

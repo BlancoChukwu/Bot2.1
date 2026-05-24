@@ -25,6 +25,7 @@ export interface MultiWsEventSourceConfig {
   readonly chain: SupportedChain;
   readonly logger: LoggerLike;
   readonly metrics: BotMetrics;
+  readonly onBlock?: (blockNumber: bigint) => void;
 }
 
 export class MultiWsEventSource implements DetectionEventSource {
@@ -62,7 +63,7 @@ export class MultiWsEventSource implements DetectionEventSource {
         lastFlashblockLeadMs: 0,
       });
       this.seedProvider(endpoint.name);
-      this.subscribeProvider(endpoint.name, endpoint.wsUrl, handlers);
+      this.subscribeProvider(endpoint.name, endpoint.wsUrl, handlers, endpoint.name === "primary");
     }
     return () => this.stopAll();
   }
@@ -76,7 +77,12 @@ export class MultiWsEventSource implements DetectionEventSource {
     ].filter((entry): entry is { readonly name: string; readonly wsUrl: string } => entry !== undefined);
   }
 
-  private subscribeProvider(providerName: string, wsUrl: string, handlers: DetectionEventHandlers): void {
+  private subscribeProvider(
+    providerName: string,
+    wsUrl: string,
+    handlers: DetectionEventHandlers,
+    isPrimary = false,
+  ): void {
     const chainEntry = this.config.registry.get(this.config.chain);
     const poolAddress = this.config.registry.getResolvedAave(this.config.chain).pool;
     const flashblocks = chainEntry.detection.flashblocksEnabled ? "enabled" : "disabled";
@@ -111,7 +117,8 @@ export class MultiWsEventSource implements DetectionEventSource {
         this.stopFns.push(stop);
       }
     }
-    if (this.config.registry.get(this.config.chain).detection.flashblocksEnabled) {
+    const flashblocksEnabled = this.config.registry.get(this.config.chain).detection.flashblocksEnabled;
+    if (flashblocksEnabled) {
       const stopFlash = wsClient.watchBlockNumber?.({
         onBlockNumber: async (blockNumber) => {
           const started = Date.now();
@@ -138,12 +145,23 @@ export class MultiWsEventSource implements DetectionEventSource {
         this.stopFns.push(stopFlash);
       }
     }
+    if (isPrimary && this.config.onBlock !== undefined) {
+      const stopHeads = wsClient.watchBlockNumber?.({
+        onBlockNumber: (blockNumber) => {
+          this.config.onBlock?.(blockNumber);
+        },
+        onError: (error) => handlers.onError(this.config.chain, error),
+      });
+      if (stopHeads !== undefined) {
+        this.stopFns.push(stopHeads);
+      }
+    }
   }
 
   private scheduleReconnect(providerName: string, wsUrl: string, handlers: DetectionEventHandlers): void {
     const jitter = Math.floor(Math.random() * 150);
     const timer = setTimeout(() => {
-      this.subscribeProvider(providerName, wsUrl, handlers);
+      this.subscribeProvider(providerName, wsUrl, handlers, providerName === "primary");
     }, 500 + jitter);
     this.reconnectTimers.push(timer);
   }

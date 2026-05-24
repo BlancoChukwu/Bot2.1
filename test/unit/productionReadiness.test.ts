@@ -9,12 +9,27 @@ import {
 } from "../../src/production/productionReadiness";
 
 describe("DeploymentSafetyGate", () => {
-  it("blocks live mode when required production safety signals are missing", () => {
+  it("blocks live mode when dry-run validation is missing", () => {
     const gate = new DeploymentSafetyGate();
 
     const result = gate.evaluate({
       simulationMode: false,
-      hasPagerDutyRoutingKey: false,
+      hasMetricsEndpoint: true,
+      registeredChains: ["optimism"],
+      minProfitMarginBps: 50,
+    });
+
+    expect(result).toEqual({
+      status: "blocked",
+      reasons: ["Successful dry-run validation is required before live mode"],
+    });
+  });
+
+  it("allows live mode without PagerDuty when dry-run receipt is valid", () => {
+    const gate = new DeploymentSafetyGate();
+
+    expect(gate.evaluate({
+      simulationMode: false,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
       minProfitMarginBps: 50,
@@ -26,20 +41,14 @@ describe("DeploymentSafetyGate", () => {
         chains: ["optimism"],
         expectedChains: ["optimism"],
       },
-    });
-
-    expect(result).toEqual({
-      status: "blocked",
-      reasons: ["PAGERDUTY_ROUTING_KEY is required for live mode"],
-    });
+    }).status).toBe("allowed");
   });
 
-  it("allows simulation mode without PagerDuty while still requiring chains and metrics", () => {
+  it("allows simulation mode while still requiring chains and metrics", () => {
     const gate = new DeploymentSafetyGate();
 
     expect(gate.evaluate({
       simulationMode: true,
-      hasPagerDutyRoutingKey: false,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
       minProfitMarginBps: 50,
@@ -50,7 +59,6 @@ describe("DeploymentSafetyGate", () => {
     const gate = new DeploymentSafetyGate();
     expect(gate.evaluate({
       simulationMode: true,
-      hasPagerDutyRoutingKey: false,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
       minProfitMarginBps: 40,
@@ -61,7 +69,6 @@ describe("DeploymentSafetyGate", () => {
     const gate = new DeploymentSafetyGate();
     const result = gate.evaluate({
       simulationMode: true,
-      hasPagerDutyRoutingKey: false,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
       minProfitMarginBps: 39,
@@ -76,7 +83,6 @@ describe("DeploymentSafetyGate", () => {
     const gate = new DeploymentSafetyGate();
     const result = gate.evaluate({
       simulationMode: false,
-      hasPagerDutyRoutingKey: true,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
       minProfitMarginBps: 45,
@@ -100,7 +106,6 @@ describe("DeploymentSafetyGate", () => {
 
     const result = gate.evaluate({
       simulationMode: false,
-      hasPagerDutyRoutingKey: true,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
       minProfitMarginBps: 50,
@@ -126,7 +131,6 @@ describe("DeploymentSafetyGate", () => {
     const gate = new DeploymentSafetyGate();
     const result = gate.evaluate({
       simulationMode: false,
-      hasPagerDutyRoutingKey: true,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
       minProfitMarginBps: 50,

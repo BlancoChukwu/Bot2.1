@@ -84,6 +84,7 @@ export interface BotMetrics {
   recordOracleFreshnessMs(chain: string, token: string, freshnessMs: number, source: string): void;
   recordDustFiltered(count?: number): void;
   recordCooldownBlock(count?: number): void;
+  recordSubgraphLag?(blocksBehind: number): void;
   recordError(): void;
   recordLatency(stage: BotLatencyStage, durationSeconds: number, labels?: { readonly chain?: string }): void;
   recordPipelineLatency(
@@ -326,6 +327,11 @@ export function createBotMetrics(): BotMetrics {
     help: "Execution attempts blocked by post-dead-letter borrower cooldown",
     registers: [registry],
   });
+  const subgraphLagTotal = new client.Counter({
+    name: "subgraph_lag_detected_total",
+    help: "Borrower watchlist rescans that observed subgraph indexing lag",
+    registers: [registry],
+  });
 
   return {
     registry,
@@ -378,6 +384,9 @@ export function createBotMetrics(): BotMetrics {
     },
     recordCooldownBlock(count = 1) {
       cooldownBlocksTotal.inc(count);
+    },
+    recordSubgraphLag(blocksBehind) {
+      subgraphLagTotal.inc(Math.max(1, blocksBehind));
     },
     recordError() {
       snapshot.errorsTotal += 1;

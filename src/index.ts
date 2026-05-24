@@ -62,8 +62,21 @@ import {
 import { BorrowerCooldownRegistry } from "./utils/borrowerCooldown";
 import { acquireSingleInstanceLock } from "./utils/singleInstanceLock";
 import { LiquidationCandidateGate } from "./orchestrator/liquidationCandidateGate";
-import { startBorrowerWatchlistRescanner } from "./monitors/borrowerWatchlistRescanner";
+import {
+  createDebouncedBlockRescan,
+  fetchBorrowersNearLiquidation,
+  preLiquidatableHealthFactorWad,
+  startBorrowerWatchlistRescanner,
+} from "./monitors/borrowerWatchlistRescanner";
+import { scheduleHeapSnapshots } from "./utils/heapSnapshotHarness";
 import { startMemoryMonitor } from "./utils/memoryMonitor";
+import { memoryLimitsFromNodeHeap } from "./utils/nodeHeapLimits";
+import { mergeBorrowerAddresses } from "./protocols/borrowerDiscovery";
+import {
+  createBorrowerDiscoveryAdapters,
+  parseBorrowerDiscoveryFromEnv,
+} from "./protocols/borrowerDiscoveryRegistry";
+import { warnIfUnstableWssProvider } from "./utils/wssProviderCheck";
 import { evaluateDustFilter } from "./protocols/liquidationCandidateFilter";
 import { sendDailyPnlSummary, sendLiquidationAlert } from "./utils/telegramAlert";
 import { assertLiquidationReceiverReadiness } from "./production/liquidationReceiverReadiness";
@@ -254,7 +267,6 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
 export function evaluateRuntimeDeploymentSafety(config: RuntimeConfig): DeploymentGateResult {
   return new DeploymentSafetyGate().evaluate({
     simulationMode: config.simulationMode,
-    hasPagerDutyRoutingKey: config.pagerDutyRoutingKey !== undefined,
     hasMetricsEndpoint: true,
     registeredChains: config.chains,
     minProfitMarginBps: config.minProfitMarginBps,
@@ -585,6 +597,75 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     },
   });
   const arbQueue = new ArbitrageOpportunityQueue();
+  const memoryLimits = memoryLimitsFromNodeHeap();
+  const memoryMonitor = startMemoryMonitor({
+    logger,
+    warnBytes: memoryLimits.warnBytes,
+    ceilBytes: memoryLimits.ceilBytes,
+    rssWarnBytes: memoryLimits.rssWarnBytes,
+  });
+  const borrowerRescanIntervalMs = parseMinNumber(
+    process.env.BORROWER_FULL_RESCAN_INTERVAL_MS,
+    15 * 60 * 1_000,
+    60_000,
+    "BORROWER_FULL_RESCAN_INTERVAL_MS",
+  );
+  const blockRescanDebounceMs = parseMinNumber(
+    process.env.BLOCK_RESCAN_DEBOUNCE_MS,
+    2_000,
+    250,
+    "BLOCK_RESCAN_DEBOUNCE_MS",
+  );
+  const subgraphMaxLagBlocks = parseMinNumber(
+    process.env.SUBGRAPH_MAX_LAG_BLOCKS,
+    10,
+    1,
+    "SUBGRAPH_MAX_LAG_BLOCKS",
+  );
+  const subgraphSkipLagBlocks = parseMinNumber(
+    process.env.SUBGRAPH_SKIP_RESCAN_LAG_BLOCKS,
+    50,
+    10,
+    "SUBGRAPH_SKIP_RESCAN_LAG_BLOCKS",
+  );
+  const discoveryAdapters = createBorrowerDiscoveryAdapters(parseBorrowerDiscoveryFromEnv(process.env));
+  const enableNonAaveLiquidation = parseBoolean(process.env.ENABLE_NON_AAVE_LIQUIDATION, false);
+  const mergedFetchBorrowers = async (): Promise<readonly Address[]> => {
+    const aaveNear = await fetchBorrowersNearLiquidation(protocol, preLiquidatableHealthFactorWad);
+    if (discoveryAdapters.length === 0) {
+      return aaveNear;
+    }
+    const merged = await mergeBorrowerAddresses(discoveryAdapters, config.chain);
+    logger.info("borrower_discovery_complete", {
+      chain: config.chain,
+      aaveNearLiquidation: aaveNear.length,
+      protocols: merged.counts,
+      totalUnique: merged.addresses.length,
+    });
+    const unique = new Set<string>(aaveNear.map((address) => address.toLowerCase()));
+    for (const address of merged.addresses) {
+      unique.add(address.toLowerCase());
+    }
+    return [...unique].map((value) => value as Address);
+  };
+  let watchlistRescanner: ReturnType<typeof startBorrowerWatchlistRescanner> | undefined;
+  const onBlockRescan = createDebouncedBlockRescan((reason, blockNumber) => {
+    if (watchlistRescanner === undefined) {
+      return;
+    }
+    logger.info("block_triggered_watchlist_rescan", {
+      chain: config.chain,
+      blockNumber: blockNumber.toString(),
+      reason,
+    });
+    watchlistRescanner.triggerRescan(reason, blockNumber);
+  }, blockRescanDebounceMs);
+  warnIfUnstableWssProvider({
+    logger,
+    ...(config.wsRpcUrlPrimary === undefined ? {} : { primary: config.wsRpcUrlPrimary }),
+    ...(config.wsRpcUrlSecondary === undefined ? {} : { secondary: config.wsRpcUrlSecondary }),
+    ...(config.wsRpcUrlTertiary === undefined ? {} : { tertiary: config.wsRpcUrlTertiary }),
+  });
   const detectionSource = config.wsRpcUrlPrimary === undefined
     ? {
       start: async (handlers: { onReserveUpdated: (event: { chain: SupportedChain; reserve: Address }) => void; onError: (chain: SupportedChain, error: Error) => void }) => {
@@ -602,6 +683,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       chain: config.chain,
       logger,
       metrics,
+      onBlock: onBlockRescan,
     });
   const aaveSnapshotProvider = new AaveSnapshotProvider(config.chain, protocol, registry);
   const hybridDetection = new HybridDetectionPipeline({
@@ -611,6 +693,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     logger,
     metrics,
     liquidationGate,
+    onDetectionFailure: () => memoryMonitor.checkNow(),
   });
   const detection = new PipelineDetectionAdapter({
     chain: config.chain,
@@ -804,13 +887,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     },
   });
 
-  const borrowerRescanIntervalMs = parseMinNumber(
-    process.env.BORROWER_FULL_RESCAN_INTERVAL_MS,
-    15 * 60 * 1_000,
-    60_000,
-    "BORROWER_FULL_RESCAN_INTERVAL_MS",
-  );
-  const watchlistRescanner = startBorrowerWatchlistRescanner({
+  watchlistRescanner = startBorrowerWatchlistRescanner({
     chain: config.chain,
     protocol,
     provider: aaveSnapshotProvider,
@@ -818,8 +895,15 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     logger,
     metrics,
     intervalMs: borrowerRescanIntervalMs,
+    fetchBorrowers: mergedFetchBorrowers,
+    enableNonAaveLiquidation,
+    subgraphLagCheck: {
+      subgraphUrl: config.aaveSubgraphUrl,
+      getChainBlockNumber: async () => publicClient.getBlockNumber(),
+      maxLagBlocks: subgraphMaxLagBlocks,
+      skipRescanWhenLagExceeds: subgraphSkipLagBlocks,
+    },
   });
-  const memoryMonitor = startMemoryMonitor({ logger });
 
   return new PipelineBotRunner(orchestrator, arbitrageScanner, startupGuard, () => {
     watchlistRescanner.stop();
@@ -1099,6 +1183,9 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
 async function main(): Promise<void> {
   const config = parseRuntimeConfig(process.env);
   const logger = createLogger(config.logLevel);
+  if (parseBoolean(process.env.ENABLE_HEAP_SNAPSHOTS, false)) {
+    scheduleHeapSnapshots({ logger });
+  }
   const metrics = createBotMetrics();
   const metricsServer = startMetricsServer(metrics, logger);
   const dryRunMode = process.argv.includes("--dry-run");
@@ -1128,12 +1215,20 @@ async function main(): Promise<void> {
     }
     return;
   }
-  const safety = evaluateRuntimeDeploymentSafety(config);
-  if (safety.status === "blocked") {
-    logger.error("deployment_safety_gate_blocked", { reasons: safety.reasons });
-    metricsServer.close();
-    process.exitCode = 1;
-    return;
+  const skipDeploymentSafetyGate = parseBoolean(process.env.SKIP_DEPLOYMENT_SAFETY_GATE, false);
+  if (skipDeploymentSafetyGate) {
+    logger.warn("deployment_safety_gate_skipped", {
+      reason: "SKIP_DEPLOYMENT_SAFETY_GATE=true",
+      simulationMode: config.simulationMode,
+    });
+  } else {
+    const safety = evaluateRuntimeDeploymentSafety(config);
+    if (safety.status === "blocked") {
+      logger.error("deployment_safety_gate_blocked", { reasons: safety.reasons });
+      metricsServer.close();
+      process.exitCode = 1;
+      return;
+    }
   }
   const bot = buildBot(config, metrics);
   const controller = createShutdownController();

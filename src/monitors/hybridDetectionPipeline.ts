@@ -40,6 +40,7 @@ export interface HybridDetectionPipelineConfig {
   readonly metrics: BotMetrics;
   readonly failureThreshold?: number;
   readonly liquidationGate?: LiquidationCandidateGate;
+  readonly onDetectionFailure?: () => void;
 }
 
 export class HybridDetectionPipeline {
@@ -160,6 +161,7 @@ export class HybridDetectionPipeline {
     this.circuitBreakers.set(circuitKey(chain, breaker), nextState);
     this.config.metrics.recordError();
     this.config.logger.error("hybrid_detection_failure", { chain, breaker, error });
+    this.config.onDetectionFailure?.();
   }
 
   private upsertSnapshots(snapshots: readonly BorrowerSnapshot[]): void {
