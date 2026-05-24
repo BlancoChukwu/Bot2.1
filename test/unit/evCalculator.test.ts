@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   AAVE_V3_BASE_FLASH_FEE_BPS,
+  calculateExactUsdEV,
   calculateFlashLoanArbitrageEV,
+  calculateFlashWrappedLiquidationEv,
   calculateLiquidationEV,
   calculateLiquidationEv,
   MIN_PROFIT_THRESHOLD_BNB,
@@ -50,6 +52,19 @@ describe("calculateLiquidationEv", () => {
     expect(ev.isProfitable).toBe(true);
   });
 
+  it("includes flash-loan fee in liquidation EV for wrapped execution", () => {
+    const ev = calculateFlashWrappedLiquidationEv({
+      repayValueUsd: 1_000,
+      liquidationBonusBps: 500,
+      gasCostUsd: 4,
+      slippageBps: 50,
+      minProfitUsd: 10,
+      flashFeeBps: AAVE_V3_BASE_FLASH_FEE_BPS,
+    });
+    expect(ev.expectedProfitUsd).toBeCloseTo(40.1);
+    expect(ev.isProfitable).toBe(true);
+  });
+
   it("rejects candidates below the configured minimum profit", () => {
     const ev = calculateLiquidationEv({
       repayValueUsd: 1_000,
@@ -85,7 +100,7 @@ describe("calculateLiquidationEv", () => {
       minProfitThreshold: 1n,
     });
 
-    expect(ev.flashFeeWei).toBe(500_000_000_000_000n);
+    expect(ev.flashFeeWei).toBe(900_000_000_000_000n);
     expect(ev.gasCostWei).toBe(500_000_000_000_000n);
     expect(ev.slippageBufferWei).toBe(10_300_000_000_000_000n);
     expect(ev.isProfitable).toBe(true);
@@ -122,5 +137,173 @@ describe("calculateLiquidationEv", () => {
 
     expect(result.success).toBe(true);
     expect(result.gasUsed).toBe(444_000n);
+  });
+
+  it("returns zero gas when estimateGas is missing or throws", async () => {
+    const noEstimate = await simulateFullFlashLoanArbPath(
+      {
+        call: async () => undefined,
+      },
+      {
+        from: "0x0000000000000000000000000000000000000001",
+        to: "0x0000000000000000000000000000000000000002",
+        data: "0x1234",
+        gasPrice: 1_000_000_000n,
+      },
+    );
+    const throwingEstimate = await simulateFullFlashLoanArbPath(
+      {
+        call: async () => undefined,
+        estimateGas: async () => {
+          throw new Error("cannot estimate");
+        },
+      },
+      {
+        from: "0x0000000000000000000000000000000000000001",
+        to: "0x0000000000000000000000000000000000000002",
+        data: "0x1234",
+        gasPrice: 1_000_000_000n,
+      },
+    );
+
+    expect(noEstimate).toEqual({ success: true, gasUsed: 0n });
+    expect(throwingEstimate).toEqual({ success: true, gasUsed: 0n });
+  });
+
+  it("returns failure with stringified non-Error call exceptions", async () => {
+    const result = await simulateFullFlashLoanArbPath(
+      {
+        call: async () => {
+          throw "execution reverted";
+        },
+      },
+      {
+        from: "0x0000000000000000000000000000000000000001",
+        to: "0x0000000000000000000000000000000000000002",
+        data: "0x1234",
+        gasPrice: 1_000_000_000n,
+      },
+    );
+
+    expect(result).toEqual({
+      success: false,
+      gasUsed: 0n,
+      error: "execution reverted",
+    });
+  });
+
+  it("returns Error.message when call throws Error", async () => {
+    const result = await simulateFullFlashLoanArbPath(
+      {
+        call: async () => {
+          throw new Error("flash loan revert");
+        },
+      },
+      {
+        from: "0x0000000000000000000000000000000000000001",
+        to: "0x0000000000000000000000000000000000000002",
+        data: "0x1234",
+        gasPrice: 1_000_000_000n,
+      },
+    );
+
+    expect(result.error).toBe("flash loan revert");
+  });
+
+  it("calculates exact USD EV using token price normalization", async () => {
+    const result = await calculateExactUsdEV(
+      {
+        tokenIn: "0x0000000000000000000000000000000000000001",
+        tokenInDecimals: 6,
+        nativeGasToken: "0x0000000000000000000000000000000000000002",
+        amountIn: 1_000_000_000n,
+        amountOutFinal: 1_008_000_000n,
+        flashFeeBps: 5,
+        gasEstimate: 500_000n,
+        gasPrice: 1_000_000_000n,
+        slippageBps: 50,
+        minProfitUsdRaw: 10_000n,
+      },
+      {
+        batchGetUsdPrices: async () => ({
+          "0x0000000000000000000000000000000000000001": 100_000_000n,
+          "0x0000000000000000000000000000000000000002": 200_000_000_000n,
+        }),
+      },
+    );
+
+    expect(result.revenueUsdRaw).toBe(100_800_000_000n);
+    expect(result.costUsdRaw).toBe(100_654_000_000n);
+    expect(result.netProfitUsdRaw).toBe(146_000_000n);
+    expect(result.isPriceAvailable).toBe(true);
+    expect(result.isProfitable).toBe(true);
+  });
+
+  it("returns unavailable when token or gas price feed is missing", async () => {
+    const result = await calculateExactUsdEV(
+      {
+        tokenIn: "0x0000000000000000000000000000000000000001",
+        tokenInDecimals: 6,
+        nativeGasToken: "0x0000000000000000000000000000000000000002",
+        amountIn: 1_000_000_000n,
+        amountOutFinal: 1_008_000_000n,
+        flashFeeBps: 5,
+        gasEstimate: 500_000n,
+        gasPrice: 1_000_000_000n,
+      },
+      {
+        batchGetUsdPrices: async () => ({
+          "0x0000000000000000000000000000000000000001": 0n,
+          "0x0000000000000000000000000000000000000002": 200_000_000_000n,
+        }),
+      },
+    );
+
+    expect(result).toEqual({
+      netProfitUsdRaw: 0n,
+      revenueUsdRaw: 0n,
+      costUsdRaw: 0n,
+      isPriceAvailable: false,
+      isProfitable: false,
+    });
+  });
+
+  it("validates decimal inputs and non-negative bigint guards", async () => {
+    await expect(calculateExactUsdEV(
+      {
+        tokenIn: "0x0000000000000000000000000000000000000001",
+        tokenInDecimals: 6.5,
+        nativeGasToken: "0x0000000000000000000000000000000000000002",
+        amountIn: 1_000_000_000n,
+        amountOutFinal: 1_008_000_000n,
+        flashFeeBps: 5,
+        gasEstimate: 500_000n,
+        gasPrice: 1_000_000_000n,
+      },
+      { batchGetUsdPrices: async () => ({}) },
+    )).rejects.toThrow(/tokenInDecimals/);
+    await expect(calculateExactUsdEV(
+      {
+        tokenIn: "0x0000000000000000000000000000000000000001",
+        tokenInDecimals: 6,
+        nativeGasToken: "0x0000000000000000000000000000000000000002",
+        nativeGasTokenDecimals: 18.1,
+        amountIn: 1_000_000_000n,
+        amountOutFinal: 1_008_000_000n,
+        flashFeeBps: 5,
+        gasEstimate: 500_000n,
+        gasPrice: 1_000_000_000n,
+      },
+      { batchGetUsdPrices: async () => ({}) },
+    )).rejects.toThrow(/nativeGasTokenDecimals/);
+    expect(() =>
+      calculateLiquidationEV(
+        -1n,
+        1_000_000_000_000_000_000n,
+        500,
+        1_000_000n,
+        1_000_000_000n,
+      ),
+    ).toThrow(/debtToCover/);
   });
 });

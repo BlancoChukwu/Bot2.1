@@ -8,10 +8,16 @@
     "typecheck": "tsc --noEmit",
     "dev": "ts-node src/index.ts",
     "start": "node dist/src/index.js",
+    "bot:status": "node scripts/ensure-single-bot.mjs --status",
+    "bot:stop": "node scripts/ensure-single-bot.mjs --stop",
     "start:sim": "ts-node src/index.ts",
     "start:live": "cross-env SIMULATION_MODE=false ts-node src/index.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:coverage": "vitest run --coverage --pool=forks --no-file-parallelism",
+    "test:watch": "vitest",
+    "benchmark:base": "ts-node test/integration/benchmark.replay.ts",
+    "compile:contracts": "node scripts/compile-liquidation-receiver.mjs",
+    "deploy:liquidation-receiver:base": "ts-node scripts/deploy-liquidation-receiver-base.ts"
   },
   "keywords": [],
   "author": "",
@@ -30,7 +36,9 @@
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^25.6.0",
+    "@vitest/coverage-v8": "^4.1.6",
     "cross-env": "^10.1.0",
+    "solc": "^0.8.26",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5"

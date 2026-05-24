@@ -1,9 +1,16 @@
+import type { Address } from "viem";
+import type { PriceOracleCache } from "./priceOracleCache";
+
 export interface LiquidationEvInput {
   readonly repayValueUsd: number;
   readonly liquidationBonusBps: number;
   readonly gasCostUsd: number;
   readonly slippageBps: number;
   readonly minProfitUsd: number;
+}
+
+export interface FlashWrappedLiquidationEvInput extends LiquidationEvInput {
+  readonly flashFeeBps: number;
 }
 
 export interface LiquidationEv {
@@ -21,7 +28,8 @@ export interface LiquidationEV {
 
 export const MIN_PROFIT_THRESHOLD_WEI = 10_000_000_000_000_000n;
 export const MIN_PROFIT_THRESHOLD_BNB = 150_000_000_000_000_000n;
-export const AAVE_V3_BASE_FLASH_FEE_BPS = 5;
+/** Aave V3 Base flash-loan fee baseline: 0.09% */
+export const AAVE_V3_BASE_FLASH_FEE_BPS = 9;
 
 const bpsDenominator = 10_000;
 const bpsDenominatorWei = 10_000n;
@@ -76,6 +84,18 @@ export function calculateLiquidationEv(input: LiquidationEvInput): LiquidationEv
   };
 }
 
+export function calculateFlashWrappedLiquidationEv(input: FlashWrappedLiquidationEvInput): LiquidationEv {
+  assertNonNegative("flashFeeBps", input.flashFeeBps);
+  const flashFeeUsd = input.repayValueUsd * (input.flashFeeBps / bpsDenominator);
+  return calculateLiquidationEv({
+    repayValueUsd: input.repayValueUsd,
+    liquidationBonusBps: input.liquidationBonusBps,
+    gasCostUsd: input.gasCostUsd + flashFeeUsd,
+    slippageBps: input.slippageBps,
+    minProfitUsd: input.minProfitUsd,
+  });
+}
+
 export interface FlashLoanArbitrageInput {
   readonly amountIn: bigint;
   readonly amountOutFinal: bigint;
@@ -127,6 +147,77 @@ export function calculateFlashLoanArbitrageEV(input: FlashLoanArbitrageInput): F
     gasCostWei,
     slippageBufferWei,
     isProfitable,
+  };
+}
+
+export interface ExactUsdEVInput extends FlashLoanArbitrageInput {
+  readonly tokenIn: Address;
+  readonly tokenInDecimals: number;
+  readonly nativeGasToken: Address;
+  readonly nativeGasTokenDecimals?: number;
+  readonly minProfitUsdRaw?: bigint;
+}
+
+export interface ExactUsdEV {
+  readonly netProfitUsdRaw: bigint;
+  readonly revenueUsdRaw: bigint;
+  readonly costUsdRaw: bigint;
+  readonly isPriceAvailable: boolean;
+  readonly isProfitable: boolean;
+}
+
+export async function calculateExactUsdEV(
+  input: ExactUsdEVInput,
+  priceCache: Pick<PriceOracleCache, "batchGetUsdPrices">,
+): Promise<ExactUsdEV> {
+  assertNonNegativeBigint("amountIn", input.amountIn);
+  assertNonNegativeBigint("amountOutFinal", input.amountOutFinal);
+  assertNonNegative("tokenInDecimals", input.tokenInDecimals);
+  if (!Number.isInteger(input.tokenInDecimals)) {
+    throw new Error("tokenInDecimals must be an integer");
+  }
+
+  const threshold = input.minProfitUsdRaw ?? 15_000_000n;
+  assertNonNegativeBigint("minProfitUsdRaw", threshold);
+  const nativeGasTokenDecimals = input.nativeGasTokenDecimals ?? 18;
+  assertNonNegative("nativeGasTokenDecimals", nativeGasTokenDecimals);
+  if (!Number.isInteger(nativeGasTokenDecimals)) {
+    throw new Error("nativeGasTokenDecimals must be an integer");
+  }
+
+  const prices = await priceCache.batchGetUsdPrices([input.tokenIn, input.nativeGasToken]);
+  const tokenInUsdPriceRaw = prices[input.tokenIn] ?? 0n;
+  const nativeGasUsdPriceRaw = prices[input.nativeGasToken] ?? 0n;
+  if (tokenInUsdPriceRaw <= 0n || nativeGasUsdPriceRaw <= 0n) {
+    return {
+      netProfitUsdRaw: 0n,
+      revenueUsdRaw: 0n,
+      costUsdRaw: 0n,
+      isPriceAvailable: false,
+      isProfitable: false,
+    };
+  }
+
+  const ev = calculateFlashLoanArbitrageEV(input);
+  const revenueUsdRaw = tokenAmountToUsdRaw(
+    input.amountOutFinal,
+    input.tokenInDecimals,
+    tokenInUsdPriceRaw,
+  );
+  const costTokenRaw = input.amountIn + ev.flashFeeWei + ev.slippageBufferWei;
+  const costUsdRaw = tokenAmountToUsdRaw(costTokenRaw, input.tokenInDecimals, tokenInUsdPriceRaw) + weiToUsdRaw(
+    ev.gasCostWei,
+    nativeGasUsdPriceRaw,
+    nativeGasTokenDecimals,
+  );
+
+  const netProfitUsdRaw = revenueUsdRaw - costUsdRaw;
+  return {
+    netProfitUsdRaw,
+    revenueUsdRaw,
+    costUsdRaw,
+    isPriceAvailable: true,
+    isProfitable: netProfitUsdRaw >= threshold,
   };
 }
 
@@ -201,4 +292,12 @@ function toErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function tokenAmountToUsdRaw(amountRaw: bigint, tokenDecimals: number, tokenUsdPriceRaw: bigint): bigint {
+  return (amountRaw * tokenUsdPriceRaw) / 10n ** BigInt(tokenDecimals);
+}
+
+function weiToUsdRaw(weiAmount: bigint, nativeUsdPriceRaw: bigint, nativeTokenDecimals: number): bigint {
+  return (weiAmount * nativeUsdPriceRaw) / 10n ** BigInt(nativeTokenDecimals);
 }

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createChainRegistry } from "../../src/config/chainRegistry";
 import { getChainConfig } from "../../src/config/chains";
 import {
   buildFlashLoanSimpleParams,
@@ -8,6 +9,15 @@ import {
   ViemAaveV3Protocol,
 } from "../../src/protocols/aaveV3";
 
+const protocolRegistry = createChainRegistry({
+  chains: [{
+    chain: "optimism",
+    rpcUrl: "https://optimism.example",
+    fallbackRpcUrls: [],
+    aaveSubgraphUrl: "https://subgraph.example",
+  }],
+});
+
 describe("ViemAaveV3Protocol", () => {
   it("maps Aave pool account data into a typed user account", async () => {
     const account = "0x0000000000000000000000000000000000000001";
@@ -16,6 +26,10 @@ describe("ViemAaveV3Protocol", () => {
         readContract: async () => [1n, 2n, 3n, 4n, 5n, 6n] as const,
       },
       getChainConfig("optimism"),
+      undefined,
+      undefined,
+      50,
+      protocolRegistry,
     );
 
     const userAccount = await protocol.getUserAccount(account);
@@ -37,6 +51,10 @@ describe("ViemAaveV3Protocol", () => {
         readContract: async () => [1n, 2n, 3n, 4n, 5n, 6n] as const,
       },
       getChainConfig("optimism"),
+      undefined,
+      undefined,
+      50,
+      protocolRegistry,
     );
 
     const pair = await protocol.getBestLiquidationPair({
@@ -106,8 +124,8 @@ describe("ViemAaveV3Protocol", () => {
       chain,
       pageSize: 2,
       graphClient: {
-        request: async <T>(_query: string, variables: Record<string, number>): Promise<T> => {
-          if (variables.skip === 0) {
+        request: async <T>(_query: string, variables: Record<string, number | string>): Promise<T> => {
+          if (variables.lastId === "0x0000000000000000000000000000000000000000") {
             return {
               positions: [
                 { account: { id: "0x0000000000000000000000000000000000000001" } },
@@ -133,6 +151,7 @@ describe("ViemAaveV3Protocol", () => {
           ] as const;
         },
       },
+      registry: protocolRegistry,
     });
 
     expect(readAccounts).toHaveLength(2);
@@ -149,19 +168,19 @@ describe("ViemAaveV3Protocol", () => {
       chain,
       pageSize: 2,
       graphClient: {
-        request: async <T>(query: string, variables: Record<string, number>): Promise<T> => {
+        request: async <T>(query: string, variables: Record<string, number | string>): Promise<T> => {
           callCount += 1;
-          if (query.includes("positions") && variables.skip === 0) {
+          if (query.includes("positions") && variables.lastId === "0x0000000000000000000000000000000000000000") {
             throw new Error(
               'Aave subgraph GraphQL errors: [{"message":"Type `Query` has no field `positions`"}]',
             );
           }
-          if (query.includes("users") && variables.skip === 0) {
+          if (query.includes("users") && variables.lastId === "0x0000000000000000000000000000000000000000") {
             return {
               users: [{ id: "0x0000000000000000000000000000000000000001" }, { id: "0x0000000000000000000000000000000000000002" }],
             } as T;
           }
-          if (query.includes("users") && variables.skip === 2) {
+          if (query.includes("users") && variables.lastId === "0x0000000000000000000000000000000000000002") {
             return { users: [] } as T;
           }
           throw new Error(`unexpected query in test: ${query.slice(0, 40)}`);
@@ -181,6 +200,7 @@ describe("ViemAaveV3Protocol", () => {
           ] as const;
         },
       },
+      registry: protocolRegistry,
     });
 
     expect(callCount).toBeGreaterThanOrEqual(2);
@@ -197,8 +217,8 @@ describe("ViemAaveV3Protocol", () => {
       chain,
       pageSize: 2,
       graphClient: {
-        request: async <T>(_query: string, variables: Record<string, number>): Promise<T> => {
-          if (variables.skip === 0) {
+        request: async <T>(_query: string, variables: Record<string, number | string>): Promise<T> => {
+          if (variables.lastId === "0x0000000000000000000000000000000000000000") {
             return {
               positions: [
                 { id: "0x0000000000000000000000000000000000000001-0x38d693ce1df5aadf7bc62595a37d667ad57922e5-BORROWER-0" },
@@ -223,6 +243,7 @@ describe("ViemAaveV3Protocol", () => {
           ] as const;
         },
       },
+      registry: protocolRegistry,
     });
 
     expect(readAccounts).toEqual([
@@ -234,7 +255,7 @@ describe("ViemAaveV3Protocol", () => {
 
   it("scans one borrower page per protocol cycle and advances the cursor", async () => {
     const chain = getChainConfig("optimism");
-    const skips: number[] = [];
+    const cursors: string[] = [];
     const readAccounts: string[] = [];
     const protocol = new ViemAaveV3Protocol(
       {
@@ -245,10 +266,10 @@ describe("ViemAaveV3Protocol", () => {
       },
       chain,
       {
-        request: async <T>(_query: string, variables: Record<string, number>): Promise<T> => {
-          const skip = variables.skip ?? 0;
-          skips.push(skip);
-          const ids = skip === 0
+        request: async <T>(_query: string, variables: Record<string, number | string>): Promise<T> => {
+          const lastId = String(variables.lastId ?? "");
+          cursors.push(lastId);
+          const ids = lastId === "0x0000000000000000000000000000000000000000"
             ? [
                 "0x0000000000000000000000000000000000000001-0x38d693ce1df5aadf7bc62595a37d667ad57922e5-BORROWER-0",
                 "0x0000000000000000000000000000000000000002-0x38d693ce1df5aadf7bc62595a37d667ad57922e5-BORROWER-0",
@@ -262,13 +283,18 @@ describe("ViemAaveV3Protocol", () => {
       },
       undefined,
       2,
+      protocolRegistry,
     );
 
     await protocol.getLiquidatablePositions();
     await protocol.getLiquidatablePositions();
     await protocol.getLiquidatablePositions();
 
-    expect(skips).toEqual([0, 2, 0]);
+    expect(cursors).toEqual([
+      "0x0000000000000000000000000000000000000000",
+      "0x0000000000000000000000000000000000000002-0x38d693ce1df5aadf7bc62595a37d667ad57922e5-BORROWER-0",
+      "0x0000000000000000000000000000000000000000",
+    ]);
     expect(readAccounts).toEqual([
       "0x0000000000000000000000000000000000000001",
       "0x0000000000000000000000000000000000000002",

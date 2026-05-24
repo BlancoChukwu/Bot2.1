@@ -9,6 +9,11 @@ export interface TransactionEnvelope {
   readonly to: Address;
   readonly data: Hex;
   readonly provider: FlashLoanProviderId;
+  readonly contractCall?: {
+    readonly abi: readonly unknown[];
+    readonly functionName: string;
+    readonly args: readonly unknown[];
+  };
 }
 
 export interface TransactionOverrides {
@@ -21,7 +26,7 @@ export interface ExecutionPreflightClient {
   estimateGas(transaction: TransactionEnvelope): Promise<bigint>;
   getGasPrice(chain: SupportedChain): Promise<bigint>;
   getPendingNonce(chain: SupportedChain, account: Address): Promise<number>;
-  simulate(transaction: TransactionEnvelope, overrides: TransactionOverrides): Promise<FinalSimulationResult>;
+  simulateContract(transaction: TransactionEnvelope, overrides: TransactionOverrides): Promise<FinalSimulationResult>;
   send(transaction: TransactionEnvelope, overrides: TransactionOverrides): Promise<Hash>;
   waitForReceipt(hash: Hash): Promise<ExecutionReceipt>;
 }
@@ -68,12 +73,13 @@ export interface SafeExecutionRequest {
   readonly gasProfileKey: string;
   readonly routeInput: RouteSelectionInput;
   buildTransaction(route: SelectedRoute): TransactionEnvelope;
+  buildFlashLoanPreviewTransaction?(route: SelectedRoute): TransactionEnvelope;
 }
 
 export type SafeExecutionResult =
   | { readonly status: "sent"; readonly txHash: Hash }
   | { readonly status: "simulated" }
-  | { readonly status: "rejected"; readonly reason: "route_rejected" | "route_transaction_mismatch" | "final_simulation_failed" | "execution_circuit_open" }
+  | { readonly status: "rejected"; readonly reason: "route_rejected" | "route_transaction_mismatch" | "final_simulation_failed" | "execution_circuit_open" | "dust_filtered" | "borrower_cooldown" }
   | { readonly status: "failed"; readonly reason: "receipt_reorged" | "receipt_reverted" | "send_failed" };
 
 export interface FlashLoanRouteSelector {
@@ -92,7 +98,9 @@ export interface SafeTransactionExecutorConfig {
   readonly bundleRouter?: DynamicBundleRouter;
   readonly privateBundleRiskThresholdBps?: number;
   readonly allowPublicFallbackAfterBundleFailure?: boolean;
+  readonly privateFirstChains?: readonly SupportedChain[];
   readonly dryRunMode?: boolean;
+  readonly rejectBeforePreview?: (request: SafeExecutionRequest) => Promise<string | undefined>;
 }
 
 interface PreflightResult {
@@ -107,10 +115,12 @@ type SelectedRoute = Extract<RouteSelectionResult, { readonly status: "selected"
 export class SafeTransactionExecutor {
   private readonly replacementBumpBps: number;
   private readonly privateBundleRiskThresholdBps: number;
+  private readonly privateFirstChains: Set<SupportedChain>;
 
   public constructor(private readonly config: SafeTransactionExecutorConfig) {
     this.replacementBumpBps = config.replacementBumpBps ?? 1_250;
     this.privateBundleRiskThresholdBps = config.privateBundleRiskThresholdBps ?? 7_000;
+    this.privateFirstChains = new Set(config.privateFirstChains ?? []);
   }
 
   public async execute(request: SafeExecutionRequest): Promise<SafeExecutionResult> {
@@ -139,7 +149,35 @@ export class SafeTransactionExecutor {
         gasPrice: preflight.gasPrice,
         nonce: preflight.nonce,
       };
-      const dryRun = await this.config.client.simulate(transaction, overrides);
+      if (request.buildFlashLoanPreviewTransaction !== undefined) {
+        const previewRejectReason = await this.config.rejectBeforePreview?.(request);
+        if (previewRejectReason !== undefined) {
+          this.releaseNonce(request, preflight.nonce);
+          this.config.logger.warn("flash_loan_preview_rejected", {
+            chain: request.chain,
+            opportunityId: request.opportunityId,
+            reason: previewRejectReason,
+          });
+          if (previewRejectReason === "borrower_cooldown") {
+            return { status: "rejected", reason: "borrower_cooldown" };
+          }
+          const isDustReject = previewRejectReason.startsWith("dust:");
+          return { status: "rejected", reason: isDustReject ? "dust_filtered" : "final_simulation_failed" };
+        }
+        const previewTx = request.buildFlashLoanPreviewTransaction(preflight.route);
+        const preview = await this.config.client.simulateContract(previewTx, overrides);
+        if (!preview.success) {
+          this.releaseNonce(request, preflight.nonce);
+          this.config.logger.warn("flash_loan_preview_rejected", {
+            chain: request.chain,
+            opportunityId: request.opportunityId,
+            reason: preview.reason,
+          });
+          return { status: "rejected", reason: "final_simulation_failed" };
+        }
+      }
+
+      const dryRun = await this.config.client.simulateContract(transaction, overrides);
       if (!dryRun.success) {
         this.releaseNonce(request, preflight.nonce);
         this.config.logger.warn("final_simulation_rejected", {
@@ -158,6 +196,12 @@ export class SafeTransactionExecutor {
         return { status: "simulated" };
       }
 
+      this.recordPipelineLatency(
+        "detection_to_submit_ms",
+        request,
+        transaction.provider,
+        Date.now() - startedAt,
+      );
       return await this.submitWithReplacement(request, transaction, overrides);
     } catch (error) {
       this.config.metrics.recordError();
@@ -207,12 +251,19 @@ export class SafeTransactionExecutor {
     transaction: TransactionEnvelope,
     overrides: TransactionOverrides,
   ): Promise<SafeExecutionResult> {
+    const submissionStartedAt = Date.now();
     const firstHash = await this.sendOrReplaceUnderpriced(request, transaction, overrides);
     if (firstHash === undefined) {
       return { status: "failed", reason: "send_failed" };
     }
     const firstReceipt = await this.config.client.waitForReceipt(firstHash);
     if (firstReceipt.status === "included") {
+      this.recordPipelineLatency(
+        "submit_to_inclusion_ms",
+        request,
+        transaction.provider,
+        Date.now() - submissionStartedAt,
+      );
       return { status: "sent", txHash: firstHash };
     }
     if (firstReceipt.status === "underpriced") {
@@ -226,6 +277,12 @@ export class SafeTransactionExecutor {
       }
       const replacementReceipt = await this.config.client.waitForReceipt(replacementHash);
       if (replacementReceipt.status === "included") {
+        this.recordPipelineLatency(
+          "submit_to_inclusion_ms",
+          request,
+          transaction.provider,
+          Date.now() - submissionStartedAt,
+        );
         return { status: "sent", txHash: replacementHash };
       }
       return toFailedReceipt(replacementReceipt);
@@ -283,6 +340,21 @@ export class SafeTransactionExecutor {
     transaction: TransactionEnvelope,
     overrides: TransactionOverrides,
   ): Promise<Hash> {
+    if (this.config.bundleRouter !== undefined && this.privateFirstChains.has(request.chain)) {
+      this.config.logger.info("private_bundle_route_forced", {
+        chain: request.chain,
+        opportunityId: request.opportunityId,
+      });
+      this.config.metrics.recordBundleSubmission("private_bundle");
+      return this.config.bundleRouter.send({
+        route: "private_bundle",
+        request,
+        transaction,
+        overrides,
+        risk: { riskBps: this.privateBundleRiskThresholdBps, observedCompetitors: 0 },
+      }).catch((error) => this.handleBundleFailure(request, transaction, overrides, error));
+    }
+
     const risk = await this.assessCompetitorRisk(request, transaction, overrides);
     if (
       risk !== undefined
@@ -295,6 +367,7 @@ export class SafeTransactionExecutor {
         riskBps: risk.riskBps,
         observedCompetitors: risk.observedCompetitors,
       });
+      this.config.metrics.recordBundleSubmission("private_bundle");
       return this.config.bundleRouter.send({
         route: "private_bundle",
         request,
@@ -304,6 +377,7 @@ export class SafeTransactionExecutor {
       }).catch((error) => this.handleBundleFailure(request, transaction, overrides, error));
     }
 
+    this.config.metrics.recordBundleSubmission("public_rpc");
     return this.config.client.send(transaction, overrides);
   }
 
@@ -324,6 +398,7 @@ export class SafeTransactionExecutor {
         chain: request.chain,
         opportunityId: request.opportunityId,
       });
+      this.config.metrics.recordBundleSubmission("public_rpc");
       return this.config.client.send(transaction, overrides);
     }
 
@@ -377,6 +452,19 @@ export class SafeTransactionExecutor {
   private async resyncNonce(request: SafeExecutionRequest): Promise<void> {
     const nextNonce = await this.config.client.getPendingNonce(request.chain, request.account);
     this.config.nonceManager.resync(request.chain, request.account, nextNonce);
+  }
+
+  private recordPipelineLatency(
+    stage: "detection_to_submit_ms" | "submit_to_inclusion_ms",
+    request: SafeExecutionRequest,
+    provider: FlashLoanProviderId,
+    durationMs: number,
+  ): void {
+    this.config.metrics.recordPipelineLatency(stage, durationMs, {
+      chain: request.chain,
+      provider,
+      flashblocks: this.config.registry.get(request.chain).detection.flashblocksEnabled ? "enabled" : "disabled",
+    });
   }
 }
 

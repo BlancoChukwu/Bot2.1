@@ -1,20 +1,24 @@
 # Progress snapshot
 
-**Date:** 2026-05-10 (local workspace)
+**Date:** 2026-05-22 (branch `new-team-in-town`)
 
-## Shipped in this session / branch
+## Shipped on this branch
 
-- **Base Aave V3:** Pool / PoolAddressesProvider / UI pool data provider aligned with [bgd-labs aave-address-book](https://github.com/bgd-labs/aave-address-book) (`AaveV3Base`); Optimism/Arbitrum keep shared addresses.
-- **Subgraph:** `BASE_AAVE_SUBGRAPH_URL` + per-chain `aaveSubgraphByChain`; `users` fallback when subgraph has no Messari-style `positions`; reject AaveKit `api.v3.aave.com` for borrower paging.
-- **`npm run start`:** Entry `dist/src/index.js` (matches `tsc` outDir layout).
-- **`MIN_PROFIT_MARGIN_BPS`:** Floor **40 bps** in simulation, **50 bps** in live; deployment gate matches mode.
-- **`ArbitrageScanner`:** Uses `config.minProfitMarginBps` (no hardcoded 120 in pipeline bot).
-- **Observability:** `arbitrage_quote_debug` after each successful QuoterV2 / `getAmountsOut` quote (amounts + route metadata).
-- **Docs / `.env.example`:** Base RPC pattern, subgraph troubleshooting, `USE_PIPELINE_ORCHESTRATOR`.
+- **Memory:** `memoryMonitor.checkNow()` on every `hybrid_detection_failure` plus 60s `memory_stats` backup.
+- **Arbitrage diagnostics:** `arbitrage_quotes_fetched`, `arbitrage_evaluation_skipped`; audit script extended.
+- **WSS:** `wss_provider_unstable_host_detected` for Dwellir-tier hosts; README WSS checklist.
+- **newHeads:** Primary WSS block subscription → debounced watchlist rescan (`block_triggered_watchlist_rescan`).
+- **Subgraph lag:** `subgraph_lag_detected` guard on borrower watchlist rescans.
+- **Multi-protocol discovery:** Moonwell + Seamless subgraph adapters (env-gated); execution gated by `ENABLE_NON_AAVE_LIQUIDATION=false`.
+- **PM2:** `ecosystem.config.cjs` with `max_memory_restart: 3G`.
 
-## Next (ops)
+## Ops after 12h clean session
 
-- Set `ARBITRAGE_RECEIVER_ADDRESS` for arb execution plans.
-- Raise `MIN_PROFIT_MARGIN_BPS` to 80–120 before narrow live runs; keep `SIMULATION_MODE=true` until dry-run + gates pass.
+1. `node scripts/audit-session.mjs logs/<session>.log` — all metrics PASS, `hybrid_detection_failure=0`.
+2. Set `MIN_LIQUIDATION_DEBT_USD=0.35` (not `0` until discovery is live).
+3. `pm2 start ecosystem.config.cjs`.
 
-This file is intentional local/history context; rotate or trim if you prefer a slimmer repo.
+## Deferred
+
+- Morpho Blue / Compound V3 adapters.
+- FTRL provider scoring upgrade (`docs/plans/ftrl-provider-scoring-upgrade.plan.md`).

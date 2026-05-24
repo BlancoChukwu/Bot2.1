@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createBotMetrics, createLogger } from "../../src/bot";
 import { createChainRegistry } from "../../src/config/chainRegistry";
 import {
@@ -100,5 +100,29 @@ describe("HybridDetectionPipeline", () => {
     await pipeline.start();
 
     expect(pipeline.getCircuitBreakerState("optimism", "rpc").status).toBe("open");
+  });
+
+  it("invokes onDetectionFailure when the event source reports an error", async () => {
+    const onDetectionFailure = vi.fn();
+    const pipeline = new HybridDetectionPipeline({
+      registry,
+      eventSource: {
+        start: (handlers) => {
+          handlers.onError("optimism", new Error("websocket down"));
+          return () => undefined;
+        },
+      },
+      provider: {
+        getBorrowersForReserve: async () => [],
+        refreshBorrowers: async () => [],
+        pollBorrowers: async () => [],
+      },
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      onDetectionFailure,
+    });
+
+    await pipeline.start();
+    expect(onDetectionFailure).toHaveBeenCalledTimes(1);
   });
 });

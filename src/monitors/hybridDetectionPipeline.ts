@@ -6,6 +6,7 @@ import {
   ReserveAwareBorrowerCache,
   type BorrowerSnapshot,
 } from "./reserveAwareBorrowerCache";
+import type { LiquidationCandidateGate } from "../orchestrator/liquidationCandidateGate";
 
 export interface DetectionReserveEvent {
   readonly chain: SupportedChain;
@@ -24,6 +25,10 @@ export interface DetectionEventSource {
 export interface BorrowerSnapshotProvider {
   getBorrowersForReserve(chain: SupportedChain, reserve: Address): Promise<Address[]>;
   refreshBorrowers(chain: SupportedChain, accounts: readonly Address[]): Promise<readonly BorrowerSnapshot[]>;
+  refreshWatchlistBorrowers?(
+    chain: SupportedChain,
+    accounts: readonly Address[],
+  ): Promise<readonly BorrowerSnapshot[]>;
   pollBorrowers(chain: SupportedChain): Promise<readonly BorrowerSnapshot[]>;
 }
 
@@ -34,6 +39,8 @@ export interface HybridDetectionPipelineConfig {
   readonly logger: LoggerLike;
   readonly metrics: BotMetrics;
   readonly failureThreshold?: number;
+  readonly liquidationGate?: LiquidationCandidateGate;
+  readonly onDetectionFailure?: () => void;
 }
 
 export class HybridDetectionPipeline {
@@ -76,10 +83,16 @@ export class HybridDetectionPipeline {
 
   public async pollFallback(chain: SupportedChain): Promise<void> {
     const startedAt = Date.now();
+    const resolvedAave = this.config.registry.getResolvedAave(chain);
     try {
       const snapshots = await this.config.provider.pollBorrowers(chain);
       this.upsertSnapshots(snapshots);
-      this.config.logger.info("fallback_poll_complete", { chain, borrowers: snapshots.length });
+      this.config.logger.info("fallback_poll_complete", {
+        chain,
+        borrowers: snapshots.length,
+        pool: resolvedAave.pool,
+        poolAddressesProvider: resolvedAave.poolAddressesProvider,
+      });
     } catch (error) {
       this.recordFailure(chain, "subgraph", error);
     } finally {
@@ -103,14 +116,30 @@ export class HybridDetectionPipeline {
 
   private async handleReserveUpdated(event: DetectionReserveEvent): Promise<void> {
     const startedAt = Date.now();
+    const resolvedAave = this.config.registry.getResolvedAave(event.chain);
     try {
-      const borrowers = await this.config.provider.getBorrowersForReserve(event.chain, event.reserve);
-      const snapshots = await this.config.provider.refreshBorrowers(event.chain, borrowers);
+      const borrowers = this.getCachedBorrowersForReserve(event.chain, event.reserve);
+      const targetBorrowers = borrowers.length > 0
+        ? borrowers
+        : await this.config.provider.getBorrowersForReserve(event.chain, event.reserve);
+      if (targetBorrowers.length === 0) {
+        this.config.logger.info("reserve_event_refresh_skipped_no_borrowers", {
+          chain: event.chain,
+          reserve: event.reserve,
+        });
+        return;
+      }
+      const snapshots = await this.config.provider.refreshBorrowers(event.chain, targetBorrowers);
       this.upsertSnapshots(snapshots);
+      if (this.config.liquidationGate !== undefined && snapshots.length > 0) {
+        await this.config.liquidationGate.auditBorrowerSnapshots(event.chain, snapshots);
+      }
       this.config.logger.info("reserve_event_refresh_complete", {
         chain: event.chain,
         reserve: event.reserve,
-        borrowers: borrowers.length,
+        borrowers: targetBorrowers.length,
+        pool: resolvedAave.pool,
+        poolAddressesProvider: resolvedAave.poolAddressesProvider,
       });
     } catch (error) {
       this.recordFailure(event.chain, "rpc", error);
@@ -132,12 +161,27 @@ export class HybridDetectionPipeline {
     this.circuitBreakers.set(circuitKey(chain, breaker), nextState);
     this.config.metrics.recordError();
     this.config.logger.error("hybrid_detection_failure", { chain, breaker, error });
+    this.config.onDetectionFailure?.();
   }
 
   private upsertSnapshots(snapshots: readonly BorrowerSnapshot[]): void {
     for (const snapshot of snapshots) {
       this.cache.upsert(snapshot);
     }
+  }
+
+  private getCachedBorrowersForReserve(chain: SupportedChain, reserve: Address): Address[] {
+    const lowerReserve = reserve.toLowerCase();
+    const unique = new Set<Address>();
+    for (const snapshot of this.cache.listSnapshots(chain)) {
+      const touchesReserve = snapshot.reserves.some(
+        (entry) => entry.assetAddress.toLowerCase() === lowerReserve,
+      );
+      if (touchesReserve) {
+        unique.add(snapshot.account);
+      }
+    }
+    return [...unique];
   }
 }
 

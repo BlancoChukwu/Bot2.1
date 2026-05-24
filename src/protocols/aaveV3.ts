@@ -1,5 +1,7 @@
 import type { Address, Hex } from "viem";
+import type { ChainRegistry } from "../config/chainRegistry";
 import type { AaveReservePair, ChainConfig } from "../config/chains";
+import { SUBGRAPH_ID_CURSOR_START } from "../utils/subgraphIdCursor";
 
 const wad = 1_000_000_000_000_000_000n;
 const bpsDenominator = 10_000n;
@@ -22,6 +24,8 @@ export interface LiquidationCandidate {
   readonly debtToCover: bigint;
   readonly repayValueUsd: number;
   readonly liquidationBonusBps: number;
+  readonly effectiveLiquidationBonusBps?: number;
+  readonly closeFactorBps?: number;
   readonly collateralReceivedWei?: bigint;
   readonly bonusPercentage?: number;
   readonly gasEstimate?: bigint;
@@ -43,8 +47,13 @@ export interface AaveScanStats {
 
 export interface AaveV3Protocol {
   getLiquidatablePositions(): Promise<LiquidationCandidate[]>;
+  getUserAccount?(account: Address): Promise<AaveUserAccount>;
+  getBestLiquidationPair?(
+    account: AaveUserAccount,
+  ): Promise<Omit<LiquidationCandidate, "account" | "healthFactor">>;
+  listBorrowerAddresses?(): Promise<readonly Address[]>;
   getLastScanStats?(): AaveScanStats;
-  subscribeToReserveDataUpdated?(onEvent: () => void): Promise<() => void>;
+  subscribeToReserveDataUpdated?(onEvent: (reserve?: Address) => void): Promise<() => void>;
 }
 
 interface AaveReadClient {
@@ -61,13 +70,13 @@ interface AaveEventClient {
     readonly address: Address;
     readonly abi: typeof aavePoolAbi;
     readonly eventName: "ReserveDataUpdated";
-    readonly onLogs: () => void;
+    readonly onLogs: (logs: readonly unknown[]) => void;
     readonly onError?: (error: Error) => void;
   }): () => void;
 }
 
 interface AaveGraphClient {
-  request<T>(query: string, variables: Record<string, number>): Promise<T>;
+  request<T>(query: string, variables: Record<string, number | string>): Promise<T>;
 }
 
 /** Many hosted Aave V3 subgraphs expose `users` + `userReserves` instead of Messari-style `positions`. */
@@ -85,6 +94,7 @@ export interface AavePositionScannerClient {
   readonly publicClient: AaveReadClient;
   readonly graphClient: AaveGraphClient;
   readonly pageSize?: number;
+  readonly registry: Pick<ChainRegistry, "getResolvedAave">;
 }
 
 interface BorrowerPage {
@@ -109,6 +119,13 @@ export const aavePoolAbi = [
       { name: "ltv", type: "uint256" },
       { name: "healthFactor", type: "uint256" },
     ],
+  },
+  {
+    type: "function",
+    name: "FLASHLOAN_PREMIUM_TOTAL",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "uint128" }],
   },
   {
     type: "function",
@@ -146,6 +163,51 @@ export const aavePoolAbi = [
       { name: "variableBorrowRate", type: "uint256", indexed: false },
       { name: "liquidityIndex", type: "uint256", indexed: false },
       { name: "variableBorrowIndex", type: "uint256", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "Supply",
+    inputs: [
+      { name: "reserve", type: "address", indexed: true },
+      { name: "user", type: "address", indexed: true },
+      { name: "onBehalfOf", type: "address", indexed: true },
+      { name: "amount", type: "uint256", indexed: false },
+      { name: "referralCode", type: "uint16", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "Borrow",
+    inputs: [
+      { name: "reserve", type: "address", indexed: true },
+      { name: "user", type: "address", indexed: true },
+      { name: "onBehalfOf", type: "address", indexed: true },
+      { name: "amount", type: "uint256", indexed: false },
+      { name: "interestRateMode", type: "uint8", indexed: false },
+      { name: "borrowRate", type: "uint256", indexed: false },
+      { name: "referralCode", type: "uint16", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "Repay",
+    inputs: [
+      { name: "reserve", type: "address", indexed: true },
+      { name: "user", type: "address", indexed: true },
+      { name: "repayer", type: "address", indexed: true },
+      { name: "amount", type: "uint256", indexed: false },
+      { name: "useATokens", type: "bool", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "Withdraw",
+    inputs: [
+      { name: "reserve", type: "address", indexed: true },
+      { name: "user", type: "address", indexed: true },
+      { name: "to", type: "address", indexed: true },
+      { name: "amount", type: "uint256", indexed: false },
     ],
   },
 ] as const;
@@ -224,9 +286,10 @@ export async function getLiquidatablePositions(
 ): Promise<LiquidationCandidate[]> {
   const borrowers = await fetchAllBorrowers(optimismClient.graphClient, optimismClient.pageSize ?? 1_000);
   const positions: LiquidationCandidate[] = [];
+  const resolvedPool = optimismClient.registry.getResolvedAave(optimismClient.chain.name).pool;
 
   for (const account of borrowers) {
-    const userAccount = await readUserAccount(optimismClient.publicClient, optimismClient.chain, account);
+    const userAccount = await readUserAccount(optimismClient.publicClient, account, resolvedPool);
     if (calculateHealthFactor(userAccount) < wad) {
       positions.push(toLiquidationCandidate(userAccount, firstReservePair(optimismClient.chain)));
     }
@@ -237,7 +300,7 @@ export async function getLiquidatablePositions(
 
 export class ViemAaveV3Protocol implements AaveV3Protocol {
   private lastScanStats: AaveScanStats = { scanned: 0, liquidatable: 0 };
-  private nextBorrowerSkip = 0;
+  private nextBorrowerCursor = SUBGRAPH_ID_CURSOR_START;
 
   public constructor(
     private readonly publicClient: AaveReadClient & AaveEventClient,
@@ -245,16 +308,17 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
     private readonly graphClient?: AaveGraphClient,
     private readonly eventClient: AaveEventClient = publicClient,
     private readonly borrowerPageSize = 50,
+    private readonly registry?: Pick<ChainRegistry, "getResolvedAave">,
   ) {}
 
   public async getUserAccount(account: Address): Promise<AaveUserAccount> {
-    return readUserAccount(this.publicClient, this.chain, account);
+    return readUserAccount(this.publicClient, account, this.resolveAavePool());
   }
 
   public async getBestLiquidationPair(
-    _account: AaveUserAccount,
+    account: AaveUserAccount,
   ): Promise<Omit<LiquidationCandidate, "account" | "healthFactor">> {
-    const pair = firstReservePair(this.chain);
+    const pair = selectBestReservePairForAccount(this.chain, account);
     return {
       collateralAsset: pair.collateralAsset,
       debtAsset: pair.debtAsset,
@@ -264,12 +328,19 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
     };
   }
 
+  public async listBorrowerAddresses(): Promise<readonly Address[]> {
+    if (this.graphClient === undefined) {
+      throw new Error("Aave subgraph client is required for borrower enumeration");
+    }
+    return fetchAllBorrowers(this.graphClient, this.borrowerPageSize);
+  }
+
   public async getLiquidatablePositions(): Promise<LiquidationCandidate[]> {
     if (this.graphClient === undefined) {
       throw new Error("Aave subgraph client is required for broad market scanning");
     }
 
-    const page = await fetchBorrowerPage(this.graphClient, this.borrowerPageSize, this.nextBorrowerSkip);
+    const page = await fetchBorrowerPage(this.graphClient, this.borrowerPageSize, this.nextBorrowerCursor);
     const borrowers = extractBorrowerAddresses(page);
     const positions: LiquidationCandidate[] = [];
 
@@ -281,7 +352,7 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
     }
 
     this.lastScanStats = { scanned: borrowers.length, liquidatable: positions.length };
-    this.advanceBorrowerCursor(borrowerPageRowCount(page));
+    this.advanceBorrowerCursor(page, borrowerPageRowCount(page));
     return positions;
   }
 
@@ -289,31 +360,47 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
     return this.lastScanStats;
   }
 
-  public async subscribeToReserveDataUpdated(onEvent: () => void): Promise<() => void> {
+  public async subscribeToReserveDataUpdated(onEvent: (reserve?: Address) => void): Promise<() => void> {
     if (this.eventClient.watchContractEvent === undefined) {
       return () => undefined;
     }
 
     return this.eventClient.watchContractEvent({
-      address: this.chain.aave.pool,
+      address: this.resolveAavePool(),
       abi: aavePoolAbi,
       eventName: "ReserveDataUpdated",
-      onLogs: onEvent,
+      onLogs: (logs) => {
+        for (const log of logs) {
+          const reserve = (log as { readonly args?: { readonly reserve?: Address } }).args?.reserve;
+          onEvent(reserve);
+        }
+      },
     });
   }
 
-  private advanceBorrowerCursor(rowsRead: number): void {
-    this.nextBorrowerSkip = rowsRead < this.borrowerPageSize ? 0 : this.nextBorrowerSkip + this.borrowerPageSize;
+  private advanceBorrowerCursor(page: BorrowerPage, rowsRead: number): void {
+    if (rowsRead < this.borrowerPageSize) {
+      this.nextBorrowerCursor = SUBGRAPH_ID_CURSOR_START;
+      return;
+    }
+    this.nextBorrowerCursor = nextBorrowerPageCursor(page, this.nextBorrowerCursor);
+  }
+
+  private resolveAavePool(): Address {
+    if (this.registry === undefined) {
+      throw new Error("ViemAaveV3Protocol requires chain registry for resolved Aave addresses");
+    }
+    return this.registry.getResolvedAave(this.chain.name).pool;
   }
 }
 
 async function readUserAccount(
   publicClient: AaveReadClient,
-  chain: ChainConfig,
   account: Address,
+  pool: Address,
 ): Promise<AaveUserAccount> {
   const result = await publicClient.readContract({
-    address: chain.aave.pool,
+    address: pool,
     abi: aavePoolAbi,
     functionName: "getUserAccountData",
     args: [account],
@@ -332,26 +419,31 @@ async function readUserAccount(
 
 async function fetchAllBorrowers(graphClient: AaveGraphClient, pageSize: number): Promise<Address[]> {
   const borrowers = new Set<Address>();
-  let skip = 0;
+  let lastId = SUBGRAPH_ID_CURSOR_START;
 
   while (true) {
-    const page = await fetchBorrowerPage(graphClient, pageSize, skip);
+    const page = await fetchBorrowerPage(graphClient, pageSize, lastId);
+    const rowCount = borrowerPageRowCount(page);
     const addresses = extractBorrowerAddresses(page);
     for (const address of addresses) {
       borrowers.add(address);
     }
 
-    if (borrowerPageRowCount(page) < pageSize) {
+    if (rowCount < pageSize) {
       break;
     }
-    skip += pageSize;
+    lastId = nextBorrowerPageCursor(page, lastId);
   }
 
   return [...borrowers];
 }
 
-async function fetchBorrowerPage(graphClient: AaveGraphClient, pageSize: number, skip: number): Promise<BorrowerPage> {
-  const variables = { first: pageSize, skip };
+async function fetchBorrowerPage(
+  graphClient: AaveGraphClient,
+  pageSize: number,
+  lastId: string,
+): Promise<BorrowerPage> {
+  const variables = { first: pageSize, lastId };
   const mode = borrowerQueryModeByClient.get(graphClient);
   if (mode === "users") {
     return graphClient.request<BorrowerPage>(borrowerQueryUsers, variables);
@@ -384,6 +476,18 @@ function borrowerPageRowCount(page: BorrowerPage): number {
     return page.userReserves.length;
   }
   return 0;
+}
+
+function nextBorrowerPageCursor(page: BorrowerPage, currentCursor: string): string {
+  const rows = page.positions ?? page.users ?? page.userReserves ?? [];
+  if (rows.length === 0) {
+    return currentCursor;
+  }
+  const last = rows[rows.length - 1]!;
+  if ("id" in last && typeof last.id === "string") {
+    return last.id;
+  }
+  return currentCursor;
 }
 
 function extractBorrowerAddresses(page: BorrowerPage): Address[] {
@@ -421,14 +525,35 @@ function firstReservePair(chain: ChainConfig): AaveReservePair {
   return pair;
 }
 
+function selectBestReservePairForAccount(chain: ChainConfig, account: AaveUserAccount): AaveReservePair {
+  const pairs = chain.aave.reservePairs;
+  const first = pairs[0];
+  if (first === undefined) {
+    throw new Error(`No Aave reserve pairs configured for ${chain.name}`);
+  }
+
+  const collateralHeavy = account.totalCollateralBase > account.totalDebtBase * 2n;
+  const sorted = [...pairs].sort((left, right) => {
+    const bonusDiff = right.liquidationBonusBps - left.liquidationBonusBps;
+    if (bonusDiff !== 0) {
+      return bonusDiff;
+    }
+    const repayDiff = right.repayValueUsd - left.repayValueUsd;
+    if (repayDiff !== 0) {
+      return repayDiff;
+    }
+    return 0;
+  });
+  return collateralHeavy ? sorted[0] ?? first : first;
+}
+
 const borrowerQueryPositions = `
-  query AaveV3BorrowersPositions($first: Int!, $skip: Int!) {
+  query AaveV3BorrowersPositions($first: Int!, $lastId: ID!) {
     positions(
       first: $first
-      skip: $skip
       orderBy: id
       orderDirection: asc
-      where: { side: BORROWER, balance_gt: 0 }
+      where: { side: BORROWER, balance_gt: 0, id_gt: $lastId }
     ) {
       id
     }
@@ -436,13 +561,12 @@ const borrowerQueryPositions = `
 `;
 
 const borrowerQueryUsers = `
-  query AaveV3BorrowersUsers($first: Int!, $skip: Int!) {
+  query AaveV3BorrowersUsers($first: Int!, $lastId: ID!) {
     users(
       first: $first
-      skip: $skip
       orderBy: id
       orderDirection: asc
-      where: { borrowedReservesCount_gt: 0 }
+      where: { borrowedReservesCount_gt: 0, id_gt: $lastId }
     ) {
       id
     }

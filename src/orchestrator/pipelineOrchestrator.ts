@@ -8,6 +8,7 @@ import type { LiquidationCandidate } from "../protocols/aaveV3";
 import type { RouteSelectionInput } from "../profitability/flashLoanProviderRouter";
 import type { Opportunity } from "../types/opportunity";
 import { fromLiquidationCandidate } from "../types/opportunity";
+import type { LiquidationCandidateGate } from "./liquidationCandidateGate";
 
 export interface PipelineLoopOptions {
   readonly pollIntervalMs: number;
@@ -61,8 +62,14 @@ export interface PipelineOrchestratorConfig {
   readonly opportunityRanker?: PipelineOpportunityRanker;
   readonly outcomeObserver?: PipelineOutcomeObserver;
   readonly cycleObserver?: (summary: PipelineRunSummary) => void | Promise<void>;
-  buildExecutionRequest(candidate: LiquidationCandidate): SafeExecutionRequest | undefined;
-  buildExecutionRequestForOpportunity?(opportunity: Opportunity): SafeExecutionRequest | undefined;
+  readonly sequencerGuard?: {
+    isUp(chain: SupportedChain): Promise<boolean>;
+  };
+  buildExecutionRequest(candidate: LiquidationCandidate): SafeExecutionRequest | undefined | Promise<SafeExecutionRequest | undefined>;
+  buildExecutionRequestForOpportunity?(
+    opportunity: Opportunity,
+  ): SafeExecutionRequest | undefined | Promise<SafeExecutionRequest | undefined>;
+  readonly liquidationGate?: LiquidationCandidateGate;
 }
 
 export interface PipelineRunSummary {
@@ -165,6 +172,13 @@ export class PipelineOrchestrator {
   }
 
   private async runChain(chain: SupportedChain, summary: MutablePipelineRunSummary): Promise<void> {
+    if (this.config.sequencerGuard !== undefined) {
+      const sequencerUp = await this.config.sequencerGuard.isUp(chain);
+      if (!sequencerUp) {
+        this.config.logger.warn("pipeline_execution_paused_sequencer_down", { chain });
+        return;
+      }
+    }
     if (this.config.registry.get(chain).circuitBreakers.execution.status === "open") {
       this.config.logger.warn("pipeline_execution_circuit_open", { chain });
       return;
@@ -179,9 +193,12 @@ export class PipelineOrchestrator {
       }
     }
 
-    const baseCandidates = degraded
+    const rawCandidates = degraded
       ? this.createFreshCandidates(chain)
       : createReserveAwareCandidates(this.config.detection.cache, chain);
+    const baseCandidates = this.config.liquidationGate === undefined
+      ? rawCandidates
+      : await this.config.liquidationGate.filterCandidates(chain, rawCandidates, "pipeline_enqueue");
     const baseOpportunities = baseCandidates.map((candidate) => fromLiquidationCandidate(candidate));
     const extraOpportunities = await this.config.detection.collectExtraOpportunities?.(chain) ?? [];
     const plans = await this.buildExecutionPlans(chain, [...baseOpportunities, ...extraOpportunities], summary);
@@ -212,8 +229,15 @@ export class PipelineOrchestrator {
   ): Promise<PipelineExecutionPlan[]> {
     const plans: PipelineExecutionPlan[] = [];
     for (const opportunity of opportunities) {
+      if (
+        opportunity.kind === "liquidation"
+        && this.config.liquidationGate !== undefined
+        && this.config.liquidationGate.isBorrowerBlocked(chain, opportunity.candidate.account)
+      ) {
+        continue;
+      }
       try {
-        const request = this.buildExecutionRequest(opportunity);
+        const request = await this.buildExecutionRequest(opportunity);
         if (request !== undefined) {
           plans.push({
             chain,
@@ -244,6 +268,18 @@ export class PipelineOrchestrator {
     summary: MutablePipelineRunSummary,
   ): Promise<void> {
     const { request } = plan;
+    if (
+      plan.opportunity.kind === "liquidation"
+      && this.config.liquidationGate !== undefined
+      && this.config.liquidationGate.isBorrowerBlocked(plan.chain, plan.opportunity.candidate.account)
+    ) {
+      this.config.logger.info("pipeline_execution_skipped_borrower_cooldown", {
+        chain: plan.chain,
+        account: plan.opportunity.candidate.account,
+        opportunityId: request.opportunityId,
+      });
+      return;
+    }
     summary.attempted += 1;
     this.config.metrics.recordLiquidationAttempt();
     this.config.logger.info("pipeline_execution_started", {
@@ -300,6 +336,14 @@ export class PipelineOrchestrator {
 
     if (result.status === "rejected") {
       summary.rejected += 1;
+      if (result.reason === "dust_filtered" || result.reason === "borrower_cooldown") {
+        this.config.logger.info("pipeline_execution_skipped_guard", {
+          chain: request.chain,
+          opportunityId: request.opportunityId,
+          reason: result.reason,
+        });
+        return;
+      }
     } else {
       summary.failed += 1;
       this.config.metrics.recordError();
@@ -314,6 +358,10 @@ export class PipelineOrchestrator {
   }
 
   private deadLetter(request: SafeExecutionRequest, reason: string): void {
+    if (reason === "dust_filtered" || reason === "borrower_cooldown") {
+      return;
+    }
+    this.config.liquidationGate?.recordDeadLetter(request.chain, request.account, reason);
     this.config.deadLetters.enqueue({
       chain: request.chain,
       opportunityId: request.opportunityId,
@@ -327,6 +375,9 @@ export class PipelineOrchestrator {
     candidate: LiquidationCandidate,
     reason: string,
   ): void {
+    if (reason !== "dust_filtered") {
+      this.config.liquidationGate?.recordDeadLetter(chain, candidate.account, reason);
+    }
     this.config.deadLetters.enqueue({
       chain,
       opportunityId: `${chain}:${candidate.account}:${candidate.debtAsset}`,
@@ -422,7 +473,7 @@ export class PipelineOrchestrator {
     }
   }
 
-  private buildExecutionRequest(opportunity: Opportunity): SafeExecutionRequest | undefined {
+  private async buildExecutionRequest(opportunity: Opportunity): Promise<SafeExecutionRequest | undefined> {
     if (this.config.buildExecutionRequestForOpportunity !== undefined) {
       return this.config.buildExecutionRequestForOpportunity(opportunity);
     }

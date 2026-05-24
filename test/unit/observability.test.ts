@@ -43,4 +43,20 @@ describe("observability foundations", () => {
     expect(output).toContain('stage="scan"');
     expect(output).toContain('chain="optimism"');
   });
+
+  it("records provider + flashblocks tagged pipeline latency histograms", async () => {
+    const metrics = createBotMetrics();
+
+    metrics.recordPipelineLatency("event_to_detection_ms", 87, {
+      chain: "base",
+      provider: "primary",
+      flashblocks: "enabled",
+    });
+
+    const output = await metrics.registry.metrics();
+    expect(output).toContain("pipeline_latency_ms_bucket");
+    expect(output).toContain('stage="event_to_detection_ms"');
+    expect(output).toContain('provider="primary"');
+    expect(output).toContain('flashblocks="enabled"');
+  });
 });

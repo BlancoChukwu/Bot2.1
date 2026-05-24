@@ -357,6 +357,7 @@ describe("PipelineOrchestrator", () => {
       registry: {
         listChains: () => ["optimism"],
         get: () => openChain,
+        getResolvedAave: () => openChain.chainConfig.aave,
         setCircuitBreakerState: () => undefined,
       },
       detection: detection(cache),
@@ -387,6 +388,34 @@ describe("PipelineOrchestrator", () => {
     expect(deadLetters.list()).toHaveLength(1);
     expect(deadLetters.list()[0]?.opportunityId).toBe("op-2");
     expect(deadLetters.droppedCount()).toBe(1);
+  });
+
+  it("pauses execution when sequencer guard reports downtime", async () => {
+    const cache = new ReserveAwareBorrowerCache();
+    cache.upsert(snapshot());
+    let attempts = 0;
+    const orchestrator = new PipelineOrchestrator({
+      registry: registry(),
+      detection: detection(cache),
+      executor: {
+        execute: async () => {
+          attempts += 1;
+          return { status: "sent", txHash: "0xabc" };
+        },
+      },
+      deadLetters: new PipelineDeadLetterQueue(),
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      sequencerGuard: {
+        isUp: async () => false,
+      },
+      buildExecutionRequest: (candidate) => requestFor(candidate.account),
+    });
+
+    const summary = await orchestrator.runOnce();
+
+    expect(attempts).toBe(0);
+    expect(summary.attempted).toBe(0);
   });
 
   it("rejects invalid dead-letter queue capacity", () => {

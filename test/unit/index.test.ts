@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateRuntimeDeploymentSafety, parseRuntimeConfig } from "../../src/index";
+import { assertArbitrageOracleReadiness, evaluateRuntimeDeploymentSafety, parseRuntimeConfig } from "../../src/index";
 
 describe("parseRuntimeConfig", () => {
   it("parses a valid Optimism runtime config", () => {
@@ -30,6 +30,8 @@ describe("parseRuntimeConfig", () => {
       process.env.RPC_URL = "https://optimism.example";
       process.env.AAVE_SUBGRAPH_URL = "https://subgraph.example";
       process.env.PRIVATE_KEY = "0x0000000000000000000000000000000000000000000000000000000000000001";
+      process.env.SIMULATION_MODE = "true";
+      process.env.USE_PIPELINE_ORCHESTRATOR = "false";
 
       const config = parseRuntimeConfig(process.env);
 
@@ -56,6 +58,90 @@ describe("parseRuntimeConfig", () => {
 
     expect(config.chains).toEqual(["optimism", "arbitrum"]);
     expect(config.chain).toBe("optimism");
+  });
+
+  it("parses optional arbitrage USD threshold and feed registry JSON", () => {
+    const config = parseRuntimeConfig({
+      CHAIN: "base",
+      RPC_URL: "https://base.example",
+      BASE_AAVE_SUBGRAPH_URL:
+        "https://gateway.thegraph.com/api/0809d0adbd54399dd534c899c2c7ca91/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF",
+      PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+      ARBITRAGE_MIN_PROFIT_USD: "0.25",
+      PRICE_FEED_REGISTRY_JSON: JSON.stringify({
+        base: {
+          "0x4200000000000000000000000000000000000006": {
+            feed: "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70",
+            priceDecimals: 8,
+          },
+        },
+      }),
+    });
+
+    expect(config.arbitrageMinProfitUsd).toBe(0.25);
+    expect(config.priceFeedRegistry?.base["0x4200000000000000000000000000000000000006"]?.feed)
+      .toBe("0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70");
+  });
+
+  it("uses canonical Base Chainlink feeds when no override is provided", () => {
+    const config = parseRuntimeConfig({
+      CHAIN: "base",
+      RPC_URL: "https://base.example",
+      BASE_AAVE_SUBGRAPH_URL:
+        "https://gateway.thegraph.com/api/0809d0adbd54399dd534c899c2c7ca91/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF",
+      PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+    });
+
+    expect(config.priceFeedRegistry?.base["0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"]?.feed)
+      .toBe("0x7e860098F58bBFC8648a4311b374B1D669a2bc6B");
+    expect(config.priceFeedRegistry?.base["0x4200000000000000000000000000000000000006"]?.feed)
+      .toBe("0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70");
+    expect(config.priceFeedRegistry?.base["0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"]?.feed)
+      .toBe("0x07DA0E54543a844a80ABE69c8A12F22B3aA59f9D");
+  });
+
+  it("rejects live pipeline startup when required Base token feeds are missing", () => {
+    expect(() =>
+      parseRuntimeConfig({
+        CHAIN: "base",
+        RPC_URL: "https://base.example",
+        BASE_AAVE_SUBGRAPH_URL:
+          "https://gateway.thegraph.com/api/0809d0adbd54399dd534c899c2c7ca91/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF",
+        PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+        USE_PIPELINE_ORCHESTRATOR: "true",
+        SIMULATION_MODE: "false",
+        LIQUIDATION_RECEIVER_ADDRESS: "0x00000000000000000000000000000000000000A1",
+        PRICE_FEED_REGISTRY_JSON: JSON.stringify({
+          base: {
+            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913": {
+              feed: "0x7e860098F58bBFC8648a4311b374B1D669a2bc6B",
+              priceDecimals: 8,
+            },
+          },
+        }),
+      }),
+    ).toThrow(/Missing feeds/);
+  });
+
+  it("rejects live startup when feed values are stale or non-positive", async () => {
+    const config = parseRuntimeConfig({
+      CHAIN: "base",
+      RPC_URL: "https://base.example",
+      BASE_AAVE_SUBGRAPH_URL:
+        "https://gateway.thegraph.com/api/0809d0adbd54399dd534c899c2c7ca91/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF",
+      PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+      USE_PIPELINE_ORCHESTRATOR: "true",
+      SIMULATION_MODE: "false",
+      LIQUIDATION_RECEIVER_ADDRESS: "0x00000000000000000000000000000000000000A1",
+    });
+
+    await expect(assertArbitrageOracleReadiness(config, {
+      batchGetUsdPrices: async () => ({
+        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913": 0n, // non-positive (or stale -> guarded to 0)
+        "0x4200000000000000000000000000000000000006": 350_000_000_000n,
+        "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf": 100_000_000_000_000n,
+      }),
+    })).rejects.toThrow(/startup rejected/i);
   });
 
   it("defaults to the non-negotiable 0.5 percent minimum net profit margin", () => {
@@ -141,13 +227,24 @@ describe("parseRuntimeConfig", () => {
     ).toThrow(/api\.v3\.aave\.com/);
   });
 
-  it("rejects polling intervals other than exactly 400ms", () => {
+  it("allows polling intervals above the latency floor", () => {
+    const config = parseRuntimeConfig({
+      RPC_URL: "https://optimism.example",
+      AAVE_SUBGRAPH_URL: "https://subgraph.example",
+      PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+      POLL_INTERVAL_MS: "401",
+    });
+
+    expect(config.pollIntervalMs).toBe(401);
+  });
+
+  it("rejects polling intervals below the latency floor", () => {
     expect(() =>
       parseRuntimeConfig({
         RPC_URL: "https://optimism.example",
         AAVE_SUBGRAPH_URL: "https://subgraph.example",
         PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
-        POLL_INTERVAL_MS: "401",
+        POLL_INTERVAL_MS: "99",
       }),
     ).toThrow(/POLL_INTERVAL_MS/);
   });
@@ -161,6 +258,19 @@ describe("parseRuntimeConfig", () => {
         SIMULATION_MODE: "false",
       }),
     ).toThrow(/placeholder private key/i);
+  });
+
+  it("requires LIQUIDATION_RECEIVER_ADDRESS in live pipeline mode", () => {
+    expect(() =>
+      parseRuntimeConfig({
+        CHAIN: "optimism",
+        RPC_URL: "https://optimism.example",
+        AAVE_SUBGRAPH_URL: "https://subgraph.example",
+        PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+        USE_PIPELINE_ORCHESTRATOR: "true",
+        SIMULATION_MODE: "false",
+      }),
+    ).toThrow(/LIQUIDATION_RECEIVER_ADDRESS/);
   });
 
   it("rejects profit margin below live floor (50 bps)", () => {

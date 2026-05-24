@@ -9,6 +9,11 @@ import type { LiquidationCandidate } from "./protocols/aaveV3";
 import { calculateLiquidationEV } from "./utils/evCalculator";
 
 export type BotLatencyStage = "scan" | "execution" | "poll_cycle";
+export type PipelineLatencyStage =
+  | "event_to_detection_ms"
+  | "detection_to_submit_ms"
+  | "submit_to_inclusion_ms"
+  | "flashblocks_lead_ms";
 export interface LogContext {
   readonly chain?: string;
   readonly opportunityId?: string;
@@ -61,6 +66,8 @@ export interface BotMetricsSnapshot {
   readonly arbitrageApproved: number;
   readonly arbitrageExecuted: number;
   readonly netProfitUsd: number;
+  readonly publicRpcSubmissions: number;
+  readonly privateBundleSubmissions: number;
 }
 
 export interface BotMetrics {
@@ -73,8 +80,22 @@ export interface BotMetrics {
   recordArbitrageApproved(count: number): void;
   recordArbitrageExecuted(count: number): void;
   recordNetProfitUsd(amountUsd: number): void;
+  recordBundleSubmission(route: "public_rpc" | "private_bundle"): void;
+  recordOracleFreshnessMs(chain: string, token: string, freshnessMs: number, source: string): void;
+  recordDustFiltered(count?: number): void;
+  recordCooldownBlock(count?: number): void;
+  recordSubgraphLag?(blocksBehind: number): void;
   recordError(): void;
   recordLatency(stage: BotLatencyStage, durationSeconds: number, labels?: { readonly chain?: string }): void;
+  recordPipelineLatency(
+    stage: PipelineLatencyStage,
+    durationMs: number,
+    labels: {
+      readonly chain: string;
+      readonly provider: string;
+      readonly flashblocks: "enabled" | "disabled";
+    },
+  ): void;
   snapshot(): BotMetricsSnapshot;
 }
 
@@ -210,6 +231,8 @@ export function createBotMetrics(): BotMetrics {
     arbitrageApproved: number;
     arbitrageExecuted: number;
     netProfitUsd: number;
+    publicRpcSubmissions: number;
+    privateBundleSubmissions: number;
   } = {
     positionsScanned: 0,
     liquidationsAttempted: 0,
@@ -220,6 +243,8 @@ export function createBotMetrics(): BotMetrics {
     arbitrageApproved: 0,
     arbitrageExecuted: 0,
     netProfitUsd: 0,
+    publicRpcSubmissions: 0,
+    privateBundleSubmissions: 0,
   };
   const positionsScannedTotal = new client.Counter({
     name: "positions_scanned_total",
@@ -272,6 +297,41 @@ export function createBotMetrics(): BotMetrics {
     labelNames: ["stage", "chain"],
     registers: [registry],
   });
+  const bundleRouteSubmissions = new client.Counter({
+    name: "bundle_route_submissions_total",
+    help: "Execution submissions by route type",
+    labelNames: ["route"],
+    registers: [registry],
+  });
+  const pipelineLatencyMilliseconds = new client.Histogram({
+    name: "pipeline_latency_ms",
+    help: "Pipeline latency by provider and Flashblocks mode",
+    labelNames: ["stage", "chain", "provider", "flashblocks"],
+    buckets: [5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 1_000, 2_000, 5_000],
+    registers: [registry],
+  });
+  const oracleFreshnessMs = new client.Histogram({
+    name: "oracle_freshness_ms",
+    help: "Age of the underlying oracle price sample in milliseconds",
+    labelNames: ["chain", "token", "source"],
+    buckets: [1_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000],
+    registers: [registry],
+  });
+  const dustFilteredTotal = new client.Counter({
+    name: "dust_filtered_total",
+    help: "Liquidation candidates rejected as dust before enqueue or preview",
+    registers: [registry],
+  });
+  const cooldownBlocksTotal = new client.Counter({
+    name: "cooldown_blocks_total",
+    help: "Execution attempts blocked by post-dead-letter borrower cooldown",
+    registers: [registry],
+  });
+  const subgraphLagTotal = new client.Counter({
+    name: "subgraph_lag_detected_total",
+    help: "Borrower watchlist rescans that observed subgraph indexing lag",
+    registers: [registry],
+  });
 
   return {
     registry,
@@ -308,12 +368,40 @@ export function createBotMetrics(): BotMetrics {
       snapshot.netProfitUsd += amountUsd;
       netProfitUsd.set(snapshot.netProfitUsd);
     },
+    recordBundleSubmission(route) {
+      if (route === "private_bundle") {
+        snapshot.privateBundleSubmissions += 1;
+      } else {
+        snapshot.publicRpcSubmissions += 1;
+      }
+      bundleRouteSubmissions.inc({ route });
+    },
+    recordOracleFreshnessMs(chain, token, freshnessMs, source) {
+      oracleFreshnessMs.observe({ chain, token, source }, Math.max(0, freshnessMs));
+    },
+    recordDustFiltered(count = 1) {
+      dustFilteredTotal.inc(count);
+    },
+    recordCooldownBlock(count = 1) {
+      cooldownBlocksTotal.inc(count);
+    },
+    recordSubgraphLag(blocksBehind) {
+      subgraphLagTotal.inc(Math.max(1, blocksBehind));
+    },
     recordError() {
       snapshot.errorsTotal += 1;
       errorsTotal.inc();
     },
     recordLatency(stage, durationSeconds, labels = {}) {
       latencySeconds.observe({ stage, chain: labels.chain ?? "unknown" }, durationSeconds);
+    },
+    recordPipelineLatency(stage, durationMs, labels) {
+      pipelineLatencyMilliseconds.observe({
+        stage,
+        chain: labels.chain,
+        provider: labels.provider,
+        flashblocks: labels.flashblocks,
+      }, Math.max(0, durationMs));
     },
     snapshot() {
       return { ...snapshot };
