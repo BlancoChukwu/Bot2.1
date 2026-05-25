@@ -908,6 +908,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   return new PipelineBotRunner(orchestrator, arbitrageScanner, startupGuard, () => {
     watchlistRescanner.stop();
     memoryMonitor.stop();
+    arbQueue.stop();
     priceOracleCache?.stopBackgroundPoll();
   });
 }

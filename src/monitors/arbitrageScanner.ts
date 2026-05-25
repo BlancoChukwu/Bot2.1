@@ -2,6 +2,7 @@ import { encodeFunctionData, parseUnits, type Address } from "viem";
 import type { BotMetrics, LoggerLike } from "../bot";
 import type { ChainRegistry, FlashLoanProviderId } from "../config/chainRegistry";
 import type { SupportedChain } from "../config/chains";
+import { getChainConfig } from "../config/chains";
 import { aavePoolAbi } from "../protocols/aaveV3";
 import { encodeArbitrageRoute } from "../protocols/arbitrageFlashLoanReceiver";
 import type { Asset, AssetAmount } from "../utils/typedAssetMath";
@@ -162,6 +163,7 @@ export class ArbitrageScanner {
   };
   private readonly activePolls = new Map<SupportedChain, NodeJS.Timeout>();
   private readonly dedupe = new Map<string, number>();
+  private dedupePruneTimer: NodeJS.Timeout | undefined;
   private readonly usdAsset: Asset = { symbol: "USD", decimals: 8 };
   private cycleQuoteStats = createEmptyQuoteCycleStats();
 
@@ -197,6 +199,8 @@ export class ArbitrageScanner {
   public start(): void {
     const chains = this.config.registry.listChains();
     chains.forEach((chain) => this.startChainPolling(chain));
+    this.dedupePruneTimer = setInterval(() => this.pruneDedupe(Date.now()), 60_000);
+    this.dedupePruneTimer.unref?.();
     this.config.logger.info("arbitrage_scanner_started", {
       chains,
       pollIntervalMs: this.config.pollIntervalMs,
@@ -207,6 +211,10 @@ export class ArbitrageScanner {
   public stop(): void {
     this.activePolls.forEach((t) => clearTimeout(t));
     this.activePolls.clear();
+    if (this.dedupePruneTimer !== undefined) {
+      clearInterval(this.dedupePruneTimer);
+      this.dedupePruneTimer = undefined;
+    }
     this.dedupe.clear();
     this.config.logger.info("arbitrage_scanner_stopped");
   }
@@ -771,6 +779,6 @@ function buySell(
   };
 }
 
-function aavePoolAddress(_chain: SupportedChain): Address {
-  return "0x794a61358d6845594f94dc1db02a252b5b4814ad";
+function aavePoolAddress(chain: SupportedChain): Address {
+  return getChainConfig(chain).aave.pool;
 }

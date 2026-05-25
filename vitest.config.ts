@@ -6,6 +6,8 @@ export default defineConfig({
     globals: true,
     include: ["test/**/*.test.ts"],
     pool: "forks",
+    isolate: true,
+    clearMocks: true,
     fileParallelism: false,
     testTimeout: 10_000,
     hookTimeout: 10_000,

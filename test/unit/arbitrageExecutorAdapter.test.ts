@@ -4,6 +4,7 @@ import { buildArbitrageExecutionRequest } from "../../src/executors/arbitrageExe
 import { aavePoolAbi } from "../../src/protocols/aaveV3";
 import type { ArbitrageOpportunity } from "../../src/monitors/arbitrageScanner";
 import { createAssetAmount } from "../../src/utils/typedAssetMath";
+import { getChainConfig } from "../../src/config/chains";
 
 function opportunity(): ArbitrageOpportunity {
   const usd = { symbol: "USD", decimals: 8 } as const;
@@ -41,6 +42,7 @@ describe("buildArbitrageExecutionRequest", () => {
     expect(request.routeInput.minimumMarginBps).toBe(50);
 
     const tx = request.buildTransaction({ status: "selected", provider: "aaveV3", netProfit: createAssetAmount({ symbol: "USD", decimals: 8 }, 1n), marginBps: 1n });
+    expect(tx.to).toBe(getChainConfig("base").aave.pool);
     const decoded = decodeFunctionData({
       abi: aavePoolAbi,
       data: tx.data,

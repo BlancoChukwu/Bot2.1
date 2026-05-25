@@ -11,10 +11,13 @@ export class ArbitrageOpportunityQueue implements ArbitrageOpportunitySink {
   private readonly seen = new Map<string, number>();
   private readonly maxEntriesPerChain: number;
   private readonly dedupeWindowMs: number;
+  private seenPruneTimer: NodeJS.Timeout | undefined;
 
   public constructor(config: ArbitrageOpportunityQueueConfig = {}) {
     this.maxEntriesPerChain = config.maxEntriesPerChain ?? 500;
     this.dedupeWindowMs = config.dedupeWindowMs ?? 60_000;
+    this.seenPruneTimer = setInterval(() => this.pruneSeen(), 60_000);
+    this.seenPruneTimer.unref?.();
   }
 
   public push(opportunity: ArbitrageOpportunity): void {
@@ -36,6 +39,14 @@ export class ArbitrageOpportunityQueue implements ArbitrageOpportunitySink {
     const queued = this.opportunities.get(chain) ?? [];
     this.opportunities.set(chain, []);
     return queued;
+  }
+
+  public stop(): void {
+    if (this.seenPruneTimer !== undefined) {
+      clearInterval(this.seenPruneTimer);
+      this.seenPruneTimer = undefined;
+    }
+    this.seen.clear();
   }
 
   private pruneSeen(): void {

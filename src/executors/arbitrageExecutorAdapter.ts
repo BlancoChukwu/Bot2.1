@@ -5,6 +5,7 @@ import { encodeArbitrageRoute } from "../protocols/arbitrageFlashLoanReceiver";
 import type { SafeExecutionRequest } from "./safeTransactionExecutor";
 import { createAssetAmount, type Asset } from "../utils/typedAssetMath";
 import type { FlashLoanProviderId } from "../config/chainRegistry";
+import { getChainConfig } from "../config/chains";
 const usdAsset: Asset = { symbol: "USD", decimals: 8 };
 
 export interface ArbitrageExecutionAdapterConfig {
@@ -68,8 +69,5 @@ function minAmountOut(expectedOut: bigint, minimumMarginBps: number): bigint {
 }
 
 function aavePoolAddress(opportunity: ArbitrageOpportunity): Address {
-  // The pool address is constant across supported chains in this repo.
-  return opportunity.chain === "base"
-    ? "0x794a61358d6845594f94dc1db02a252b5b4814ad"
-    : "0x794a61358d6845594f94dc1db02a252b5b4814ad";
+  return getChainConfig(opportunity.chain).aave.pool;
 }
