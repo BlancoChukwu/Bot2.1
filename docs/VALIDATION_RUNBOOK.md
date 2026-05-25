@@ -1,0 +1,161 @@
+# Base watchlist validation runbook
+
+## Gate 0
+
+```bash
+npm test
+npm run typecheck
+```
+
+## P0 pre-flight (before soak)
+
+Clear stale lock and confirm no bot is running:
+
+```powershell
+cd "e:\Mini PC\optimism-aave-v3-liquidator-ts"
+npm run bot:stop
+npm run bot:status
+```
+
+`bot:stop` kills live bot PIDs and removes a stale `.runtime/bot.lock` when the holder is dead.
+
+## P0 debug HF sweep (run before soak)
+
+Answers whether `liquidatable: 0` is calm market vs `MIN_LIQUIDATION_DEBT_USD` vs seed coverage.
+
+```bash
+npm run debug:hf-sweep-base
+```
+
+Probe with $1 debt floor (exposes min-debt gate):
+
+```bash
+npx ts-node scripts/debug-hf-sweep-base.ts --min-debt-base 100000000
+```
+
+- Exit **0** — verdict in JSON summary (`MARKET_CALM`, `MIN_DEBT_GATE_LIKELY_CULPRIT`, etc.)
+- Exit **2** — probe finds liquidatable positions that env min-debt blocks (fix `.env` for sim, e.g. `MIN_LIQUIDATION_DEBT_USD=1`)
+
+Default env min debt when unset: `max(MIN_PROFIT_USD, 50)` → typically **$50** USD (8-decimal base units on-chain).
+
+### Calm-market baseline (accepted 2026-05-24)
+
+P0 debug sweep on Base (`npm run debug:hf-sweep-base`) — **accepted** for Phase 1 soak greenlight:
+
+| Field | Value |
+| --- | --- |
+| `stillUnhealthyAfterLiquidation` | **1** |
+| `probeLiquidatableCount` / `envLiquidatableCount` | **0** / **0** |
+| `blockedByEnvMinDebtOnly` | **0** |
+| Summary `verdict` | `INVESTIGATE_SEED_COVERAGE_OR_HF` (script label; see resolution below) |
+
+**Exact log line** (`still_unhealthy_after_liquidation`):
+
+```json
+{"msg":"still_unhealthy_after_liquidation","address":"0xb17c285422CAB46Bfddc552A811957a7899D44a7","healthFactor":"0.9384595626472435","debtUsd":"0.01"}
+```
+
+**Single-address investigation** (`npx ts-node scripts/investigate-address-watchlist.ts 0xb17c285422CAB46Bfddc552A811957a7899D44a7`):
+
+| Check | Result |
+| --- | --- |
+| Current HF (`getUserAccountData`) | **0.938** (< 1.0) |
+| `debtUsd` | **~$0.009** (on-chain `totalDebtBase` ≈ 902 841) |
+| `sweepLiquidatable` (env `minDebtUsd` = 50) | **false** — debt ≪ $50 floor |
+| `inWatchlistAfterColdStart` (50k-block RPC replay) | **false** |
+| `inTieredSweepTargets` | **false** |
+| Last `LiquidationCall` for user (chunked pool logs) | block **46162328** (~**296k** blocks before head; outside 50k cold-start window) |
+| `LiquidationCall` in last 50k blocks | **0** logs |
+
+**Resolution (not a soak blocker):**
+
+1. **Not an HF sweep bug** — direct `getUserAccountData` and `sweepHealthFactors` agree; HF uses index `[5]` on pool `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5`.
+2. **Not economically liquidatable** — residual **dust** after partial liquidation; intentionally below `MIN_LIQUIDATION_DEBT_USD` / revenue gate (≪ $500).
+3. **Watchlist gap is historical coverage, not live-path failure** — user was liquidated ~296k blocks ago; default `COLD_START_LOOKBACK_BLOCKS=50000` does not replay that far. Live `LiquidationCall` WS/replay **does** add the borrower when the bot is running at liquidation time.
+4. **No code change required for P0** — extending cold-start to 300k+ blocks only to track $0.01 dust is high RPC cost with zero liquidation value.
+
+**Soak greenlight:** proceed with **2h detached simulation** when runtime checks pass (Redis, breaker, gap replay, RSS). `liquidatable: 0` in calm market is expected until debt ≥ env min debt and HF < 1.
+
+### Watchlist staleness failure + fix (2026-05-25)
+
+**Failure (`simulation-20260525-050746.log`, ~72 min):**
+
+- Only **one** `watchlist_sweep_complete` (startup `pollFallback` only).
+- **105** `watchlist_stale` warnings; `ageMs` climbed **60s → 107s** (pass target: **< 30s**).
+- Root cause: no periodic HF sweep after cold start — `stalenessGuard` was never refreshed.
+
+**Fix (Phase 1.4 tiered sweep):**
+
+- `WatchlistCoordinator.sweepAndRefresh` / `runTieredSweep` — records HF on every successful multicall read, refreshes `stalenessGuard`.
+- Tiering: HF unknown or **< 1.15** → every block; HF **≥ 1.15** → every **100** blocks (`lowTierEveryBlocks`).
+- **Primary WSS `onBlock`** → `pollBorrowers` + cache upsert (rebuilt `dist` required).
+- **No WSS** fallback → `PipelineOrchestrator.watchlistSweep` each poll cycle.
+
+**Re-soak verification checklist:**
+
+```powershell
+npm run build
+# Start Simulation Bot.cmd
+Select-String -Path logs\simulation-*.log -Pattern 'watchlist_sweep_complete' | Measure-Object   # expect many
+Select-String -Path logs\simulation-*.log -Pattern 'watchlist_stale' | Measure-Object          # expect 0 after ~60s warmup
+```
+
+Pass: multiple `watchlist_sweep_complete` (~1 per Base block), no sustained `watchlist_stale`, then run full **2h** detached soak.
+
+**Re-soak spot-check (`simulation-20260525-064215.log`, first ~3 min after fix):**
+
+- **79** `watchlist_sweep_complete` (~2s apart, per-block WSS hook)
+- **0** `watchlist_stale`
+- Tiering active: `scanned: 56` per block (high-signal subset of ~1482 watchlist; low tier on block % 100)
+- Redis + rescanner disabled confirmed at startup
+
+Proceed with full **2h** detached soak on this build.
+
+## Multicall batch probe (before soak)
+
+```bash
+npm run probe:multicall-base
+```
+
+Target: **< 400 ms per multicall batch** (not total sweep). On Base mainnet RPC (2026-05-25): batch 500 ≈ 700–1200 ms → use **250** (`MULTICALL_BATCH_SIZE=250`, default in `index.ts`). Subgraph quota may force RPC log seed during probe; cold-start path still works.
+
+## Block cursor (production)
+
+Set `REDIS_URL` so `lastProcessedBlock` survives restarts. Start portable Redis from `.runtime/redis/` if needed. Without Redis, startup logs `block_cursor_in_memory` at **error** level.
+
+## Phase 1 — 2h soak (Base)
+
+```env
+CHAIN=base
+USE_EVENT_WATCHLIST=true
+ENABLE_HEAP_SNAPSHOTS=true
+SIMULATION_MODE=true
+REDIS_URL=redis://127.0.0.1:6379
+```
+
+**Single instance only.** After calm-market baseline above is accepted and Redis is up:
+
+1. `npm run bot:stop`
+2. Double-click **`Start Simulation Bot.cmd`** (detached — survives closing Cursor/terminal; do **not** use background `npm run start:sim` in IDE for 2h)
+3. Tail: `Get-Content logs\simulation-*.log -Wait -Tail 20` (path in `logs\latest-session.txt`)
+
+Pass criteria:
+
+- Runtime **≥ 2 hours** without parent-shell exit
+- RSS stable between heap snapshots at T+5m and T+35m
+- No repeated `borrower_watchlist_rescan_failed` / `watchlist_circuit_breaker_open` storms
+- `watchlist_gap_replay_complete` on restart after brief stop
+- `watchlist_sweep_complete` with reasonable `watchlistSize`
+
+## Revenue gate — liquidation path (Base)
+
+Before Phase 2 arb diagnostics:
+
+1. Debug sweep + soak logs show candidate with `HF < 1.0` and debt above threshold, or documented calm market
+2. `buildLiquidationExecutionRequest` succeeds in sim
+3. Dry-run preview passes deployment safety gate
+4. Live: one tx with `liquidation_path_validated` log, or signed dry-run receipt
+
+## 72h stable
+
+Continuous run on Base with `USE_EVENT_WATCHLIST=true` before Ethereum / Morpho expansion.

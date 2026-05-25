@@ -9,6 +9,7 @@ import type { RouteSelectionInput } from "../profitability/flashLoanProviderRout
 import type { Opportunity } from "../types/opportunity";
 import { fromLiquidationCandidate } from "../types/opportunity";
 import type { LiquidationCandidateGate } from "./liquidationCandidateGate";
+import type { StalenessGuard } from "../monitors/stalenessGuard";
 
 export interface PipelineLoopOptions {
   readonly pollIntervalMs: number;
@@ -70,6 +71,9 @@ export interface PipelineOrchestratorConfig {
     opportunity: Opportunity,
   ): SafeExecutionRequest | undefined | Promise<SafeExecutionRequest | undefined>;
   readonly liquidationGate?: LiquidationCandidateGate;
+  readonly watchlistStaleness?: StalenessGuard;
+  /** Event-watchlist periodic HF sweep (e.g. when block WS subscription is unavailable). */
+  readonly watchlistSweep?: (chain: SupportedChain) => Promise<void>;
 }
 
 export interface PipelineRunSummary {
@@ -172,6 +176,31 @@ export class PipelineOrchestrator {
   }
 
   private async runChain(chain: SupportedChain, summary: MutablePipelineRunSummary): Promise<void> {
+    if (this.config.watchlistSweep !== undefined) {
+      try {
+        await this.config.watchlistSweep(chain);
+      } catch (error) {
+        this.config.metrics.recordError();
+        this.config.logger.error("watchlist_sweep_failed", { chain, error });
+      }
+    }
+
+    const staleness = this.config.watchlistStaleness?.check();
+    if (staleness === "critical") {
+      this.config.logger.error("watchlist_stale_critical", {
+        chain,
+        ageMs: this.config.watchlistStaleness?.ageMs(),
+      });
+      this.config.metrics.recordError();
+      return;
+    }
+    if (staleness === "stale") {
+      this.config.logger.warn("watchlist_stale", {
+        chain,
+        ageMs: this.config.watchlistStaleness?.ageMs(),
+      });
+    }
+
     if (this.config.sequencerGuard !== undefined) {
       const sequencerUp = await this.config.sequencerGuard.isUp(chain);
       if (!sequencerUp) {

@@ -5,6 +5,7 @@ export interface RescanCircuitBreakerConfig {
   readonly cooldownMs?: number;
   readonly logger?: LoggerLike;
   readonly onOpen?: () => void;
+  readonly onClose?: () => void;
 }
 
 /**
@@ -64,6 +65,7 @@ export class RescanCircuitBreaker {
       this.failures = 0;
       this.cooldownTimer = undefined;
       this.config.logger?.info("watchlist_circuit_breaker_closed", { cooldownMs });
+      this.config.onClose?.();
     }, cooldownMs);
     this.cooldownTimer.unref?.();
   }

@@ -11,31 +11,31 @@ $launchers = @(
     Name = "Aave Liquidator (Production).lnk"
     Cmd  = "Start Production Bot.cmd"
     Icon = 137
-    Desc = "Live bot: build + dist/src/index.js, SIMULATION_MODE=false"
+    Desc = "Live: dist build, SIMULATION_MODE=false, safety gate ON, detached + logs"
   },
   @{
     Name = "Aave Liquidator (Production No Gate).lnk"
     Cmd  = "Start Production Bot (No Gate).cmd"
     Icon = 79
-    Desc = "Live bot with SKIP_DEPLOYMENT_SAFETY_GATE=true (no PagerDuty/dry-run gate)"
+    Desc = "Live: dist build, SKIP_DEPLOYMENT_SAFETY_GATE=true, detached + logs"
   },
   @{
     Name = "Aave Liquidator (Simulation).lnk"
     Cmd  = "Start Simulation Bot.cmd"
     Icon = 138
-    Desc = "Safe mode: build + dist/src/index.js, SIMULATION_MODE=true"
+    Desc = "Soak: dist build, SIMULATION_MODE=true, event watchlist, detached 2h+ logs"
   },
   @{
     Name = "Aave Liquidator (Stop).lnk"
     Cmd  = "Stop Bot.cmd"
     Icon = 131
-    Desc = "Stop running bot processes for this repo"
+    Desc = "Stop bot processes and clear stale .runtime\bot.lock"
   },
   @{
     Name = "Aave Liquidator (Live ts-node).lnk"
     Cmd  = "Start Live Bot.cmd"
     Icon = 137
-    Desc = "Legacy live launcher via npm run start:live (ts-node)"
+    Desc = "Live dev: npm run start:live (ts-node), safety gate ON, detached + logs"
   }
 )
 

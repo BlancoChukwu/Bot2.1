@@ -6,6 +6,7 @@ import {
   type BorrowerSnapshotProvider,
   type DetectionEventSource,
 } from "../../src/monitors/hybridDetectionPipeline";
+import { RescanCircuitBreaker } from "../../src/monitors/rescanCircuitBreaker";
 import type { BorrowerSnapshot } from "../../src/monitors/reserveAwareBorrowerCache";
 
 const account = "0x0000000000000000000000000000000000000001";
@@ -57,6 +58,37 @@ describe("HybridDetectionPipeline", () => {
 
     expect(pipeline.cache.get("optimism", account)).toMatchObject({ account });
     pipeline.stop();
+  });
+
+  it("skips fallback polling while rescan circuit breaker is cooling down", async () => {
+    let pollCalls = 0;
+    const provider: BorrowerSnapshotProvider = {
+      getBorrowersForReserve: async () => [],
+      refreshBorrowers: async () => [],
+      pollBorrowers: async () => {
+        pollCalls += 1;
+        throw new Error("subgraph quota");
+      },
+    };
+    const rescanBreaker = new RescanCircuitBreaker({
+      threshold: 1,
+      cooldownMs: 60_000,
+      logger: createLogger("silent"),
+    });
+    const pipeline = new HybridDetectionPipeline({
+      registry,
+      eventSource: { start: () => () => undefined },
+      provider,
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      rescanBreaker,
+    });
+
+    await pipeline.pollFallback("optimism");
+    await pipeline.pollFallback("optimism");
+    await pipeline.pollFallback("optimism");
+
+    expect(pollCalls).toBe(1);
   });
 
   it("uses fallback polling to seed the reserve-aware cache", async () => {

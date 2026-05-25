@@ -96,6 +96,14 @@ export interface BotMetrics {
       readonly flashblocks: "enabled" | "disabled";
     },
   ): void;
+  setWatchlistSize(chain: string, size: number): void;
+  setWatchlistLastUpdateAge(chain: string, ageSeconds: number): void;
+  setWatchlistCircuitBreakerOpen(chain: string, open: boolean): void;
+  recordWatchlistGapReplay(chain: string): void;
+  recordWatchlistSweepLatency(
+    durationSeconds: number,
+    labels: { readonly chain: string; readonly batchSize: number; readonly addresses: number },
+  ): void;
   snapshot(): BotMetricsSnapshot;
 }
 
@@ -332,6 +340,37 @@ export function createBotMetrics(): BotMetrics {
     help: "Borrower watchlist rescans that observed subgraph indexing lag",
     registers: [registry],
   });
+  const watchlistSizeTotal = new client.Gauge({
+    name: "watchlist_size_total",
+    help: "Borrower addresses in the event-driven watchlist",
+    labelNames: ["chain"],
+    registers: [registry],
+  });
+  const watchlistLastUpdateAgeSeconds = new client.Gauge({
+    name: "watchlist_last_update_age_seconds",
+    help: "Seconds since the watchlist last received activity",
+    labelNames: ["chain"],
+    registers: [registry],
+  });
+  const watchlistCircuitBreakerOpen = new client.Gauge({
+    name: "watchlist_circuit_breaker_open",
+    help: "Rescan circuit breaker open (1) or closed (0)",
+    labelNames: ["chain"],
+    registers: [registry],
+  });
+  const watchlistGapReplayTotal = new client.Counter({
+    name: "watchlist_gap_replay_total",
+    help: "Gap replay cycles completed for the event watchlist",
+    labelNames: ["chain"],
+    registers: [registry],
+  });
+  const watchlistSweepLatencySeconds = new client.Histogram({
+    name: "watchlist_sweep_latency_seconds",
+    help: "Multicall HF sweep latency",
+    labelNames: ["chain", "batch_size"],
+    buckets: [0.05, 0.1, 0.2, 0.4, 0.75, 1, 2, 5],
+    registers: [registry],
+  });
 
   return {
     registry,
@@ -402,6 +441,24 @@ export function createBotMetrics(): BotMetrics {
         provider: labels.provider,
         flashblocks: labels.flashblocks,
       }, Math.max(0, durationMs));
+    },
+    setWatchlistSize(chain, size) {
+      watchlistSizeTotal.set({ chain }, size);
+    },
+    setWatchlistLastUpdateAge(chain, ageSeconds) {
+      watchlistLastUpdateAgeSeconds.set({ chain }, Math.max(0, ageSeconds));
+    },
+    setWatchlistCircuitBreakerOpen(chain, open) {
+      watchlistCircuitBreakerOpen.set({ chain }, open ? 1 : 0);
+    },
+    recordWatchlistGapReplay(chain) {
+      watchlistGapReplayTotal.inc({ chain });
+    },
+    recordWatchlistSweepLatency(durationSeconds, labels) {
+      watchlistSweepLatencySeconds.observe(
+        { chain: labels.chain, batch_size: String(labels.batchSize) },
+        Math.max(0, durationSeconds),
+      );
     },
     snapshot() {
       return { ...snapshot };

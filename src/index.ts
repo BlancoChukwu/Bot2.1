@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { createWalletClient, http, parseAbiItem, parseEther, type Address, type Hex } from "viem";
+import { createWalletClient, http, parseAbiItem, parseEther, type Address, type Hex, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
@@ -38,9 +38,15 @@ import { HealthFactorMonitor } from "./monitors/healthFactorMonitor";
 import { ArbitrageOpportunityQueue } from "./monitors/arbitrageOpportunityQueue";
 import { ArbitrageScanner } from "./monitors/arbitrageScanner";
 import { AaveSnapshotProvider } from "./monitors/aaveSnapshotProvider";
-import { HybridDetectionPipeline } from "./monitors/hybridDetectionPipeline";
+import { HybridDetectionPipeline, type BorrowerSnapshotProvider } from "./monitors/hybridDetectionPipeline";
+import { RescanCircuitBreaker } from "./monitors/rescanCircuitBreaker";
 import { MultiWsEventSource } from "./monitors/MultiWsEventSource";
-import { createReserveAwareCandidates, ReserveAwareBorrowerCache } from "./monitors/reserveAwareBorrowerCache";
+import { WatchlistCoordinator } from "./monitors/watchlistCoordinator";
+import {
+  createReserveAwareCandidates,
+  ReserveAwareBorrowerCache,
+  type BorrowerSnapshot,
+} from "./monitors/reserveAwareBorrowerCache";
 import { PipelineDetectionAdapter } from "./orchestrator/pipelineDetectionAdapter";
 import { PipelineDeadLetterQueue, PipelineOrchestrator } from "./orchestrator/pipelineOrchestrator";
 import { BayesianHazardModel, NoRegretOpportunityRanker } from "./optimization/hazardPrediction";
@@ -648,18 +654,49 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     }
     return [...unique].map((value) => value as Address);
   };
+  const useEventWatchlist = parseBoolean(process.env.USE_EVENT_WATCHLIST, false)
+    && config.chain === "base";
+  const watchlistBlockHooks: {
+    coordinator: WatchlistCoordinator | undefined;
+    upsertSnapshots: ((snapshots: readonly BorrowerSnapshot[]) => void) | undefined;
+  } = {
+    coordinator: undefined,
+    upsertSnapshots: undefined,
+  };
   let watchlistRescanner: ReturnType<typeof startBorrowerWatchlistRescanner> | undefined;
-  const onBlockRescan = createDebouncedBlockRescan((reason, blockNumber) => {
-    if (watchlistRescanner === undefined) {
-      return;
+  const onBlockRescan = useEventWatchlist
+    ? undefined
+    : createDebouncedBlockRescan((reason, blockNumber) => {
+      if (watchlistRescanner === undefined) {
+        return;
+      }
+      logger.info("block_triggered_watchlist_rescan", {
+        chain: config.chain,
+        blockNumber: blockNumber.toString(),
+        reason,
+      });
+      watchlistRescanner.triggerRescan(reason, blockNumber);
+    }, blockRescanDebounceMs);
+  const onBlockWatchlistSweep = useEventWatchlist
+    ? (blockNumber: bigint) => {
+      const coordinator = watchlistBlockHooks.coordinator;
+      if (coordinator === undefined) {
+        return;
+      }
+      void coordinator.pollBorrowers(config.chain)
+        .then((snapshots) => {
+          watchlistBlockHooks.upsertSnapshots?.(snapshots);
+        })
+        .catch((error) => {
+          logger.error("watchlist_block_sweep_failed", {
+            chain: config.chain,
+            blockNumber: blockNumber.toString(),
+            error: String(error),
+          });
+        });
     }
-    logger.info("block_triggered_watchlist_rescan", {
-      chain: config.chain,
-      blockNumber: blockNumber.toString(),
-      reason,
-    });
-    watchlistRescanner.triggerRescan(reason, blockNumber);
-  }, blockRescanDebounceMs);
+    : undefined;
+  const onBlockHandler = onBlockWatchlistSweep ?? onBlockRescan;
   warnIfUnstableWssProvider({
     logger,
     ...(config.wsRpcUrlPrimary === undefined ? {} : { primary: config.wsRpcUrlPrimary }),
@@ -683,18 +720,69 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       chain: config.chain,
       logger,
       metrics,
-      onBlock: onBlockRescan,
+      ...(onBlockHandler === undefined ? {} : { onBlock: onBlockHandler }),
     });
+  const rescanBreaker = new RescanCircuitBreaker({
+    logger,
+    onOpen: () => {
+      metrics.recordError();
+      metrics.setWatchlistCircuitBreakerOpen(config.chain, true);
+    },
+    onClose: () => metrics.setWatchlistCircuitBreakerOpen(config.chain, false),
+  });
   const aaveSnapshotProvider = new AaveSnapshotProvider(config.chain, protocol, registry);
+  const minDebtBase = BigInt(Math.trunc(config.minLiquidationDebtUsd * 1e8));
+  const multicallBatchSize = parseMinNumber(
+    process.env.MULTICALL_BATCH_SIZE,
+    250,
+    50,
+    "MULTICALL_BATCH_SIZE",
+  );
+  let watchlistCoordinator: WatchlistCoordinator | undefined;
+  let borrowerProvider: BorrowerSnapshotProvider = aaveSnapshotProvider;
+  if (useEventWatchlist) {
+    watchlistCoordinator = new WatchlistCoordinator({
+      chain: config.chain,
+      protocol,
+      registry,
+      readClient: publicClient as unknown as PublicClient,
+      ...(config.wsRpcUrlPrimary === undefined
+        ? {}
+        : { wsClient: eventClient as unknown as PublicClient }),
+      poolAddress: activePoolAddress,
+      logger,
+      metrics,
+      minDebtBase,
+      multicallBatchSize,
+      ...(process.env.REDIS_URL === undefined ? {} : { redisUrl: process.env.REDIS_URL }),
+      coldStartLookbackBlocks: BigInt(parseMinNumber(
+        process.env.COLD_START_LOOKBACK_BLOCKS,
+        50_000,
+        1_000,
+        "COLD_START_LOOKBACK_BLOCKS",
+      )),
+    });
+    borrowerProvider = watchlistCoordinator;
+    watchlistBlockHooks.coordinator = watchlistCoordinator;
+    logger.info("event_watchlist_enabled", { chain: config.chain, pool: activePoolAddress });
+  }
   const hybridDetection = new HybridDetectionPipeline({
     registry,
     eventSource: detectionSource,
-    provider: aaveSnapshotProvider,
+    provider: borrowerProvider,
     logger,
     metrics,
     liquidationGate,
+    rescanBreaker,
     onDetectionFailure: () => memoryMonitor.checkNow(),
   });
+  if (useEventWatchlist) {
+    watchlistBlockHooks.upsertSnapshots = (snapshots) => {
+      for (const snapshot of snapshots) {
+        hybridDetection.cache.upsert(snapshot);
+      }
+    };
+  }
   const detection = new PipelineDetectionAdapter({
     chain: config.chain,
     monitor,
@@ -755,6 +843,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         provider: activeChainConfig.aave.poolAddressesProvider,
       });
     }
+    if (watchlistCoordinator !== undefined) {
+      await watchlistCoordinator.start();
+    }
     const resolvedFlashLoanFeeBps = await resolveFlashLoanFeeBps();
     router.setProviderFee(
       "aaveV3",
@@ -796,6 +887,17 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     executor,
     deadLetters: new PipelineDeadLetterQueue(),
     liquidationGate,
+    ...(watchlistCoordinator === undefined ? {} : { watchlistStaleness: watchlistCoordinator.stalenessGuard }),
+    ...(watchlistCoordinator !== undefined && config.wsRpcUrlPrimary === undefined
+      ? {
+        watchlistSweep: async (chain) => {
+          const snapshots = await watchlistCoordinator.pollBorrowers(chain);
+          for (const snapshot of snapshots) {
+            hybridDetection.cache.upsert(snapshot);
+          }
+        },
+      }
+      : {}),
     logger,
     metrics,
     sequencerGuard: {
@@ -887,26 +989,35 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     },
   });
 
-  watchlistRescanner = startBorrowerWatchlistRescanner({
-    chain: config.chain,
-    protocol,
-    provider: aaveSnapshotProvider,
-    cache: hybridDetection.cache,
-    logger,
-    metrics,
-    intervalMs: borrowerRescanIntervalMs,
-    fetchBorrowers: mergedFetchBorrowers,
-    enableNonAaveLiquidation,
-    subgraphLagCheck: {
-      subgraphUrl: config.aaveSubgraphUrl,
-      getChainBlockNumber: async () => publicClient.getBlockNumber(),
-      maxLagBlocks: subgraphMaxLagBlocks,
-      skipRescanWhenLagExceeds: subgraphSkipLagBlocks,
-    },
-  });
+  if (!useEventWatchlist) {
+    watchlistRescanner = startBorrowerWatchlistRescanner({
+      chain: config.chain,
+      protocol,
+      provider: borrowerProvider,
+      cache: hybridDetection.cache,
+      logger,
+      metrics,
+      intervalMs: borrowerRescanIntervalMs,
+      rescanBreaker,
+      fetchBorrowers: mergedFetchBorrowers,
+      enableNonAaveLiquidation,
+      subgraphLagCheck: {
+        subgraphUrl: config.aaveSubgraphUrl,
+        getChainBlockNumber: async () => publicClient.getBlockNumber(),
+        maxLagBlocks: subgraphMaxLagBlocks,
+        skipRescanWhenLagExceeds: subgraphSkipLagBlocks,
+      },
+    });
+  } else {
+    logger.info("borrower_watchlist_rescanner_disabled", {
+      chain: config.chain,
+      reason: "USE_EVENT_WATCHLIST",
+    });
+  }
 
-  return new PipelineBotRunner(orchestrator, arbitrageScanner, startupGuard, () => {
-    watchlistRescanner.stop();
+  return new PipelineBotRunner(orchestrator, arbitrageScanner, startupGuard, async () => {
+    watchlistRescanner?.stop();
+    await watchlistCoordinator?.stop();
     memoryMonitor.stop();
     arbQueue.stop();
     priceOracleCache?.stopBackgroundPoll();
@@ -918,7 +1029,7 @@ class PipelineBotRunner implements BotRunner {
     private readonly orchestrator: PipelineOrchestrator,
     private readonly arbitrageScanner: ArbitrageScanner,
     private readonly startupGuard?: () => Promise<void>,
-    private readonly onShutdown?: () => void,
+    private readonly onShutdown?: () => void | Promise<void>,
   ) {}
 
   public async runPollingLoop(options: PollingLoopOptions): Promise<void> {
@@ -930,7 +1041,7 @@ class PipelineBotRunner implements BotRunner {
       await this.orchestrator.runLoop(options);
     } finally {
       this.arbitrageScanner.stop();
-      this.onShutdown?.();
+      await this.onShutdown?.();
     }
   }
 }

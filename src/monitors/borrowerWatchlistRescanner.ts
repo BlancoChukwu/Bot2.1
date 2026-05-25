@@ -28,6 +28,7 @@ export interface BorrowerWatchlistRescannerConfig {
   readonly fetchBorrowers?: () => Promise<readonly Address[]>;
   readonly subgraphLagCheck?: SubgraphLagCheckConfig;
   readonly enableNonAaveLiquidation?: boolean;
+  readonly rescanBreaker?: RescanCircuitBreaker;
 }
 
 export interface BorrowerWatchlistRescannerHandle {
@@ -39,7 +40,7 @@ export function startBorrowerWatchlistRescanner(
   config: BorrowerWatchlistRescannerConfig,
 ): BorrowerWatchlistRescannerHandle {
   const intervalMs = config.intervalMs ?? 15 * 60 * 1_000;
-  const breaker = new RescanCircuitBreaker({
+  const breaker = config.rescanBreaker ?? new RescanCircuitBreaker({
     logger: config.logger,
     onOpen: () => config.metrics.recordError(),
   });

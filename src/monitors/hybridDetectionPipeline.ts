@@ -7,6 +7,7 @@ import {
   type BorrowerSnapshot,
 } from "./reserveAwareBorrowerCache";
 import type { LiquidationCandidateGate } from "../orchestrator/liquidationCandidateGate";
+import { RescanCircuitBreaker } from "./rescanCircuitBreaker";
 
 export interface DetectionReserveEvent {
   readonly chain: SupportedChain;
@@ -41,6 +42,7 @@ export interface HybridDetectionPipelineConfig {
   readonly failureThreshold?: number;
   readonly liquidationGate?: LiquidationCandidateGate;
   readonly onDetectionFailure?: () => void;
+  readonly rescanBreaker?: RescanCircuitBreaker;
 }
 
 export class HybridDetectionPipeline {
@@ -84,20 +86,26 @@ export class HybridDetectionPipeline {
   public async pollFallback(chain: SupportedChain): Promise<void> {
     const startedAt = Date.now();
     const resolvedAave = this.config.registry.getResolvedAave(chain);
-    try {
-      const snapshots = await this.config.provider.pollBorrowers(chain);
-      this.upsertSnapshots(snapshots);
-      this.config.logger.info("fallback_poll_complete", {
-        chain,
-        borrowers: snapshots.length,
-        pool: resolvedAave.pool,
-        poolAddressesProvider: resolvedAave.poolAddressesProvider,
-      });
-    } catch (error) {
-      this.recordFailure(chain, "subgraph", error);
-    } finally {
-      this.config.metrics.recordLatency("scan", (Date.now() - startedAt) / 1_000, { chain });
-    }
+    const breaker = this.config.rescanBreaker ?? new RescanCircuitBreaker({
+      logger: this.config.logger,
+      onOpen: () => this.config.metrics.recordError(),
+    });
+    await breaker.execute(
+      async () => {
+        const snapshots = await this.config.provider.pollBorrowers(chain);
+        this.upsertSnapshots(snapshots);
+        this.config.logger.info("fallback_poll_complete", {
+          chain,
+          borrowers: snapshots.length,
+          pool: resolvedAave.pool,
+          poolAddressesProvider: resolvedAave.poolAddressesProvider,
+        });
+      },
+      (error) => {
+        this.recordFailure(chain, "subgraph", error);
+      },
+    );
+    this.config.metrics.recordLatency("scan", (Date.now() - startedAt) / 1_000, { chain });
   }
 
   public getCircuitBreakerState(chain: SupportedChain, name: CircuitBreakerName): CircuitBreakerState {

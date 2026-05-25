@@ -1,7 +1,8 @@
 import type { Address, Hex } from "viem";
 import type { ChainRegistry } from "../config/chainRegistry";
 import type { AaveReservePair, ChainConfig } from "../config/chains";
-import { SUBGRAPH_ID_CURSOR_START } from "../utils/subgraphIdCursor";
+
+export const ZERO_CURSOR_ID = "0x0000000000000000000000000000000000000000";
 
 const wad = 1_000_000_000_000_000_000n;
 const bpsDenominator = 10_000n;
@@ -79,16 +80,6 @@ interface AaveGraphClient {
   request<T>(query: string, variables: Record<string, number | string>): Promise<T>;
 }
 
-/** Many hosted Aave V3 subgraphs expose `users` + `userReserves` instead of Messari-style `positions`. */
-const borrowerQueryModeByClient = new WeakMap<AaveGraphClient, "positions" | "users">();
-
-function isSubgraphMissingPositionsError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  return error.message.includes("positions") && error.message.includes("no field");
-}
-
 export interface AavePositionScannerClient {
   readonly chain: ChainConfig;
   readonly publicClient: AaveReadClient;
@@ -98,11 +89,7 @@ export interface AavePositionScannerClient {
 }
 
 interface BorrowerPage {
-  /** Legacy Aave protocol-subgraphs (`users` / `userReserves`). */
-  readonly users?: readonly { readonly id: string }[];
-  readonly userReserves?: readonly { readonly user?: { readonly id: string }; readonly userAddress?: string }[];
-  /** The Graph Network Aave V3 deployments (Messari-style schema: `positions` + `BORROWER`). */
-  readonly positions?: readonly { readonly id?: string; readonly account?: { readonly id: string } }[];
+  readonly positions?: readonly { readonly id: string }[];
 }
 
 export const aavePoolAbi = [
@@ -210,6 +197,19 @@ export const aavePoolAbi = [
       { name: "amount", type: "uint256", indexed: false },
     ],
   },
+  {
+    type: "event",
+    name: "LiquidationCall",
+    inputs: [
+      { name: "collateralAsset", type: "address", indexed: true },
+      { name: "debtAsset", type: "address", indexed: true },
+      { name: "user", type: "address", indexed: true },
+      { name: "debtToCover", type: "uint256", indexed: false },
+      { name: "liquidatedCollateralAmount", type: "uint256", indexed: false },
+      { name: "liquidator", type: "address", indexed: false },
+      { name: "receiveAToken", type: "bool", indexed: false },
+    ],
+  },
 ] as const;
 
 export interface LiquidationCallParams {
@@ -300,7 +300,7 @@ export async function getLiquidatablePositions(
 
 export class ViemAaveV3Protocol implements AaveV3Protocol {
   private lastScanStats: AaveScanStats = { scanned: 0, liquidatable: 0 };
-  private nextBorrowerCursor = SUBGRAPH_ID_CURSOR_START;
+  private lastBorrowerCursorId = ZERO_CURSOR_ID;
 
   public constructor(
     private readonly publicClient: AaveReadClient & AaveEventClient,
@@ -340,7 +340,7 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
       throw new Error("Aave subgraph client is required for broad market scanning");
     }
 
-    const page = await fetchBorrowerPage(this.graphClient, this.borrowerPageSize, this.nextBorrowerCursor);
+    const page = await fetchBorrowerPage(this.graphClient, this.borrowerPageSize, this.lastBorrowerCursorId);
     const borrowers = extractBorrowerAddresses(page);
     const positions: LiquidationCandidate[] = [];
 
@@ -351,8 +351,11 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
       }
     }
 
+    const rowsRead = borrowerPageRowCount(page);
     this.lastScanStats = { scanned: borrowers.length, liquidatable: positions.length };
-    this.advanceBorrowerCursor(page, borrowerPageRowCount(page));
+    this.lastBorrowerCursorId = rowsRead < this.borrowerPageSize
+      ? ZERO_CURSOR_ID
+      : lastBorrowerPageCursorId(page) ?? ZERO_CURSOR_ID;
     return positions;
   }
 
@@ -376,14 +379,6 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
         }
       },
     });
-  }
-
-  private advanceBorrowerCursor(page: BorrowerPage, rowsRead: number): void {
-    if (rowsRead < this.borrowerPageSize) {
-      this.nextBorrowerCursor = SUBGRAPH_ID_CURSOR_START;
-      return;
-    }
-    this.nextBorrowerCursor = nextBorrowerPageCursor(page, this.nextBorrowerCursor);
   }
 
   private resolveAavePool(): Address {
@@ -419,20 +414,24 @@ async function readUserAccount(
 
 async function fetchAllBorrowers(graphClient: AaveGraphClient, pageSize: number): Promise<Address[]> {
   const borrowers = new Set<Address>();
-  let lastId = SUBGRAPH_ID_CURSOR_START;
+  let lastId = ZERO_CURSOR_ID;
 
   while (true) {
     const page = await fetchBorrowerPage(graphClient, pageSize, lastId);
-    const rowCount = borrowerPageRowCount(page);
-    const addresses = extractBorrowerAddresses(page);
-    for (const address of addresses) {
-      borrowers.add(address);
-    }
-
-    if (rowCount < pageSize) {
+    const positions = page.positions ?? [];
+    if (positions.length === 0) {
       break;
     }
-    lastId = nextBorrowerPageCursor(page, lastId);
+    for (const position of positions) {
+      const address = extractAddressFromPositionId(position.id);
+      if (address !== undefined) {
+        borrowers.add(address.toLowerCase() as Address);
+      }
+      lastId = position.id;
+    }
+    if (positions.length < pageSize) {
+      break;
+    }
   }
 
   return [...borrowers];
@@ -443,58 +442,24 @@ async function fetchBorrowerPage(
   pageSize: number,
   lastId: string,
 ): Promise<BorrowerPage> {
-  const variables = { first: pageSize, lastId };
-  const mode = borrowerQueryModeByClient.get(graphClient);
-  if (mode === "users") {
-    return graphClient.request<BorrowerPage>(borrowerQueryUsers, variables);
-  }
-  if (mode === "positions") {
-    return graphClient.request<BorrowerPage>(borrowerQueryPositions, variables);
-  }
-
-  try {
-    const page = await graphClient.request<BorrowerPage>(borrowerQueryPositions, variables);
-    borrowerQueryModeByClient.set(graphClient, "positions");
-    return page;
-  } catch (error) {
-    if (!isSubgraphMissingPositionsError(error)) {
-      throw error;
-    }
-    borrowerQueryModeByClient.set(graphClient, "users");
-    return graphClient.request<BorrowerPage>(borrowerQueryUsers, variables);
-  }
+  return graphClient.request<BorrowerPage>(borrowerQueryPositions, { first: pageSize, lastId });
 }
 
 function borrowerPageRowCount(page: BorrowerPage): number {
-  if (page.positions !== undefined) {
-    return page.positions.length;
-  }
-  if (page.users !== undefined) {
-    return page.users.length;
-  }
-  if (page.userReserves !== undefined) {
-    return page.userReserves.length;
-  }
-  return 0;
+  return page.positions?.length ?? 0;
 }
 
-function nextBorrowerPageCursor(page: BorrowerPage, currentCursor: string): string {
-  const rows = page.positions ?? page.users ?? page.userReserves ?? [];
-  if (rows.length === 0) {
-    return currentCursor;
+function lastBorrowerPageCursorId(page: BorrowerPage): string | undefined {
+  const positions = page.positions;
+  if (positions === undefined || positions.length === 0) {
+    return undefined;
   }
-  const last = rows[rows.length - 1]!;
-  if ("id" in last && typeof last.id === "string") {
-    return last.id;
-  }
-  return currentCursor;
+  return positions[positions.length - 1]?.id;
 }
 
 function extractBorrowerAddresses(page: BorrowerPage): Address[] {
-  const fromUsers = (page.users ?? []).map((user) => user.id);
-  const fromReserves = (page.userReserves ?? []).map((reserve) => reserve.user?.id ?? reserve.userAddress);
-  const fromPositions = (page.positions ?? []).map((row) => row.account?.id ?? extractAddressFromPositionId(row.id));
-  return [...fromUsers, ...fromReserves, ...fromPositions]
+  return (page.positions ?? [])
+    .map((row) => extractAddressFromPositionId(row.id))
     .filter((value): value is string => value !== undefined)
     .map((value) => value.toLowerCase())
     .filter((value): value is Address => /^0x[a-f0-9]{40}$/.test(value));
@@ -548,25 +513,12 @@ function selectBestReservePairForAccount(chain: ChainConfig, account: AaveUserAc
 }
 
 const borrowerQueryPositions = `
-  query AaveV3BorrowersPositions($first: Int!, $lastId: ID!) {
+  query AaveV3BorrowersPositions($first: Int!, $lastId: String!) {
     positions(
       first: $first
       orderBy: id
       orderDirection: asc
       where: { side: BORROWER, balance_gt: 0, id_gt: $lastId }
-    ) {
-      id
-    }
-  }
-`;
-
-const borrowerQueryUsers = `
-  query AaveV3BorrowersUsers($first: Int!, $lastId: ID!) {
-    users(
-      first: $first
-      orderBy: id
-      orderDirection: asc
-      where: { borrowedReservesCount_gt: 0, id_gt: $lastId }
     ) {
       id
     }
