@@ -112,6 +112,35 @@ function stopBots() {
   const killed = new Set();
   for (const proc of processes) {
     try {
+      process.kill(proc.pid, "SIGINT");
+    } catch (error) {
+      if (error.code !== "ESRCH") {
+        killed.add(proc.pid);
+      }
+    }
+  }
+
+  const gracefulDeadlineMs = Date.now() + 8_000;
+  while (Date.now() < gracefulDeadlineMs) {
+    const remaining = listBotProcesses();
+    if (remaining.length === 0) {
+      break;
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+  }
+
+  for (const proc of listBotProcesses()) {
+    try {
+      process.kill(proc.pid, "SIGTERM");
+    } catch (error) {
+      if (error.code !== "ESRCH") {
+        killed.add(proc.pid);
+      }
+    }
+  }
+
+  for (const proc of listBotProcesses()) {
+    try {
       process.kill(proc.pid);
       killed.add(proc.pid);
     } catch (error) {

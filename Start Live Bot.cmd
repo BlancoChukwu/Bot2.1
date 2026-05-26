@@ -13,7 +13,7 @@ echo Mode: npm run start:live (ts-node src\index.ts), SIMULATION_MODE=false
 echo Safety gate: ON (dry-run receipt required — see .env.example)
 echo Launch: detached (no build step — uses src directly)
 echo Logs: logs\latest-session.txt
-echo Stop: Stop Bot.cmd or npm run bot:stop
+echo Stop: Stop Bot.cmd (graceful) or npm run bot:stop
 echo.
 
 set BOT_LOG_PREFIX=live-tsnode

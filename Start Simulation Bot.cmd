@@ -12,7 +12,7 @@ echo.
 echo Mode: SIMULATION_MODE=true, USE_EVENT_WATCHLIST from .env
 echo Launch: detached (2h+ soak — survives closing this window)
 echo Logs: logs\latest-session.txt
-echo Stop: Stop Bot.cmd or npm run bot:stop
+echo Stop: Stop Bot.cmd (graceful) or npm run bot:stop
 echo Redis: start .runtime\redis\redis-server.exe if REDIS_URL is set
 echo.
 
