@@ -59,7 +59,9 @@ async function main(): Promise<void> {
     watchlist,
     cursor,
     logger: { info: () => undefined, warn: () => undefined, error: () => undefined },
-    coldStartLookbackBlocks: BigInt(process.env.COLD_START_LOOKBACK_BLOCKS ?? "50000"),
+    coldStartLookbackBlocks: BigInt(
+      process.env.COLD_START_LOOKBACK_BLOCKS ?? "750000",
+    ),
   });
   await eventWatchlist.coldStartFromLogs(50_000n);
   const inWatchlist = watchlist.addresses().map((a) => a.toLowerCase()).includes(target);

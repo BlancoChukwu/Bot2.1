@@ -111,6 +111,41 @@ Pass: multiple `watchlist_sweep_complete` (~1 per Base block), no sustained `wat
 
 Proceed with full **2h** detached soak on this build.
 
+2026-05-25 — 3.65 h Base soak (simulation-20260525-080621.log) — GREEN
+- Periodic sweeps: 6,573 (tiered high-signal every block)
+- Staleness: 0 warnings
+- Memory: RSS 160→297 MB (heap-t5 vs heap-t35 passed)
+- liquidatable: 0 (calm market accepted)
+- Next gate: liquidation path proof required before Phase 1b
+
+2026-05-25 — Fork revenue-path proof (fork-proof-post-fix.log) — GREEN
+- `liquidation_path_candidate` fired on drifted borrower (`cold_start_full_sweep`)
+- Scanned 28,704 addresses, 2 liquidatable, quotes path proven
+- Phase 1 complete on Base Aave V3
+- Next: ship Phase 1b metrics/alerts → 72h live run
+
+## Phase 1b — Watchlist metrics + alerts
+
+Prometheus scrape target: `http://127.0.0.1:9090/metrics` (started with bot).
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `watchlist_size_total` | gauge | `chain` |
+| `watchlist_last_update_age_seconds` | gauge | `chain` |
+| `watchlist_circuit_breaker_open` | gauge | `chain` |
+| `watchlist_gap_replay_total` | counter | `chain` |
+| `watchlist_stale_evaluations_total` | counter | `chain`, `severity` |
+| `process_rss_bytes` | gauge | — |
+
+Alert rules: [`prometheus/alerts/bot_critical.yml`](../prometheus/alerts/bot_critical.yml) — also served at `GET /alerts` on port 9090. Load into Prometheus with:
+
+```yaml
+rule_files:
+  - prometheus/alerts/bot_critical.yml
+```
+
+Pass before 72h live: `watchlist_circuit_breaker_open == 0`, `max(watchlist_last_update_age_seconds) < 60`, RSS stable, `watchlist_gap_replay_total` increments on restart.
+
 ## Multicall batch probe (before soak)
 
 ```bash
@@ -155,6 +190,13 @@ Before Phase 2 arb diagnostics:
 2. `buildLiquidationExecutionRequest` succeeds in sim
 3. Dry-run preview passes deployment safety gate
 4. Live: one tx with `liquidation_path_validated` log, or signed dry-run receipt
+
+### Immediate next action — liquidation path proof (mandatory)
+
+**Completed 2026-05-25** — fork proof GREEN (`fork-proof-post-fix.log`). Proceed to Phase 1b metrics + 72h live run.
+
+- **Option A (fastest):** run on Base fork with a deliberate test borrower (`HF < 1.05`, debt `> $500`), force sweep, verify `liquidation_path_candidate` and successful quote path.
+- **Option B:** wait for a volatile window and monitor Base Aave V3 liquidations live (Dune/DeFiLlama), then capture the same proof in production logs.
 
 ## 72h stable
 

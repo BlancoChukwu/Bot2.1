@@ -1,4 +1,6 @@
 import client from "prom-client";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import express, { type Request, type Response } from "express";
 import type { Server } from "http";
 import { formatEther } from "viem";
@@ -100,10 +102,12 @@ export interface BotMetrics {
   setWatchlistLastUpdateAge(chain: string, ageSeconds: number): void;
   setWatchlistCircuitBreakerOpen(chain: string, open: boolean): void;
   recordWatchlistGapReplay(chain: string): void;
+  recordWatchlistStaleEvaluation(chain: string, severity: "stale" | "critical"): void;
   recordWatchlistSweepLatency(
     durationSeconds: number,
     labels: { readonly chain: string; readonly batchSize: number; readonly addresses: number },
   ): void;
+  setProcessRssBytes(bytes: number): void;
   snapshot(): BotMetricsSnapshot;
 }
 
@@ -364,6 +368,17 @@ export function createBotMetrics(): BotMetrics {
     labelNames: ["chain"],
     registers: [registry],
   });
+  const watchlistStaleEvaluationsTotal = new client.Counter({
+    name: "watchlist_stale_evaluations_total",
+    help: "Pipeline cycles that observed a stale or critical watchlist",
+    labelNames: ["chain", "severity"],
+    registers: [registry],
+  });
+  const processRssBytes = new client.Gauge({
+    name: "process_rss_bytes",
+    help: "Process resident set size in bytes (for MemoryHighRSS alert)",
+    registers: [registry],
+  });
   const watchlistSweepLatencySeconds = new client.Histogram({
     name: "watchlist_sweep_latency_seconds",
     help: "Multicall HF sweep latency",
@@ -454,6 +469,12 @@ export function createBotMetrics(): BotMetrics {
     recordWatchlistGapReplay(chain) {
       watchlistGapReplayTotal.inc({ chain });
     },
+    recordWatchlistStaleEvaluation(chain, severity) {
+      watchlistStaleEvaluationsTotal.inc({ chain, severity });
+    },
+    setProcessRssBytes(bytes) {
+      processRssBytes.set(Math.max(0, bytes));
+    },
     recordWatchlistSweepLatency(durationSeconds, labels) {
       watchlistSweepLatencySeconds.observe(
         { chain: labels.chain, batch_size: String(labels.batchSize) },
@@ -466,10 +487,18 @@ export function createBotMetrics(): BotMetrics {
   };
 }
 
+const defaultPrometheusAlertsPath = resolve(
+  process.cwd(),
+  "prometheus",
+  "alerts",
+  "bot_critical.yml",
+);
+
 export function startMetricsServer(
   metrics: BotMetrics,
   logger: LoggerLike,
   port = 9090,
+  alertsPath = process.env.PROMETHEUS_ALERTS_PATH ?? defaultPrometheusAlertsPath,
 ): Server {
   const app = express();
   app.get("/healthz", (_request: Request, response: Response) => {
@@ -479,6 +508,20 @@ export function startMetricsServer(
     response.setHeader("content-type", metrics.registry.contentType);
     response.send(await metrics.registry.metrics());
   });
+  try {
+    const alertRules = readFileSync(alertsPath, "utf8");
+    app.get("/alerts", (_request: Request, response: Response) => {
+      response.setHeader("content-type", "text/yaml; charset=utf-8");
+      response.send(alertRules);
+    });
+    logger.info("prometheus_alerts_registered", {
+      port,
+      path: alertsPath,
+      rules: (alertRules.match(/- alert:/g) ?? []).length,
+    });
+  } catch (error) {
+    logger.warn("prometheus_alerts_missing", { path: alertsPath, error: String(error) });
+  }
 
   const server = app.listen(port, () => {
     logger.info("metrics_server_started", { port });

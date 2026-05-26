@@ -74,6 +74,7 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
         : { coldStartLookbackBlocks: this.config.coldStartLookbackBlocks }),
     });
     await this.seedColdStart();
+    await this.runColdStartFullSweep(this.config.chain);
     await this.eventWatchlist.start();
     this.stalenessGuard.record();
     this.publishWatchlistMetrics();
@@ -195,6 +196,51 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
   private publishWatchlistMetrics(): void {
     this.config.metrics?.setWatchlistSize(this.config.chain, this.watchlist.size());
     this.config.metrics?.setWatchlistLastUpdateAge(this.config.chain, this.stalenessGuard.ageMs() / 1_000);
+  }
+
+  private async runColdStartFullSweep(chain: SupportedChain): Promise<readonly BorrowerSnapshot[]> {
+    const targets = this.watchlist.addresses() as Address[];
+    if (targets.length === 0) {
+      this.stalenessGuard.record();
+      return [];
+    }
+
+    const sweepStartedAt = Date.now();
+    const liquidatable = await sweepHealthFactors(targets, {
+      client: this.config.readClient,
+      poolAddress: this.config.poolAddress,
+      watchlist: this.watchlist,
+      ...(this.config.multicallBatchSize === undefined
+        ? {}
+        : { batchSize: this.config.multicallBatchSize }),
+      minDebtBase: this.config.minDebtBase,
+    });
+
+    const snapshots: BorrowerSnapshot[] = [];
+    for (const account of liquidatable) {
+      const refreshed = await this.snapshotProvider.refreshBorrowers(chain, [account.address]);
+      snapshots.push(...refreshed);
+      for (const snapshot of refreshed) {
+        this.config.logger.info("liquidation_path_candidate", {
+          chain,
+          account: snapshot.account,
+          healthFactor: snapshot.healthFactor.toString(),
+          debtBase: account.totalDebtBase.toString(),
+          stage: "cold_start_full_sweep",
+        });
+      }
+    }
+
+    this.stalenessGuard.record();
+    this.publishWatchlistMetrics();
+    this.config.logger.info("cold_start_full_sweep_complete", {
+      chain,
+      scanned: targets.length,
+      liquidatable: snapshots.length,
+      watchlistSize: this.watchlist.size(),
+      durationMs: Date.now() - sweepStartedAt,
+    });
+    return snapshots;
   }
 
   private async seedColdStart(): Promise<void> {

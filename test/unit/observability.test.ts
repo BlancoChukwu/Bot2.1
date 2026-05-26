@@ -59,4 +59,22 @@ describe("observability foundations", () => {
     expect(output).toContain('provider="primary"');
     expect(output).toContain('flashblocks="enabled"');
   });
+
+  it("exposes Phase 1b watchlist gauges and counters on /metrics", async () => {
+    const metrics = createBotMetrics();
+    metrics.setWatchlistSize("base", 1482);
+    metrics.setWatchlistLastUpdateAge("base", 12);
+    metrics.setWatchlistCircuitBreakerOpen("base", false);
+    metrics.recordWatchlistGapReplay("base");
+    metrics.recordWatchlistStaleEvaluation("base", "stale");
+    metrics.setProcessRssBytes(400_000_000);
+
+    const output = await metrics.registry.metrics();
+    expect(output).toContain("watchlist_size_total");
+    expect(output).toContain("watchlist_last_update_age_seconds");
+    expect(output).toContain("watchlist_circuit_breaker_open");
+    expect(output).toContain("watchlist_gap_replay_total");
+    expect(output).toContain("watchlist_stale_evaluations_total");
+    expect(output).toContain("process_rss_bytes");
+  });
 });

@@ -10,6 +10,7 @@ export interface MemoryMonitorConfig {
   readonly ceilBytes?: number;
   readonly rssWarnBytes?: number;
   readonly intervalMs?: number;
+  readonly onRssSample?: (rssBytes: number) => void;
   readonly onCeilingHit?: () => void;
   readonly exitProcess?: (code: number) => never;
 }
@@ -63,6 +64,7 @@ function applyMemorySample(
     ceilBytes,
     ...(rssWarnBytes === undefined ? {} : { rssWarnBytes }),
   });
+  config.onRssSample?.(rss);
   if (emitStats) {
     config.logger.info("memory_stats", {
       heapUsedMb: sample.heapUsedMb,

@@ -609,6 +609,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     warnBytes: memoryLimits.warnBytes,
     ceilBytes: memoryLimits.ceilBytes,
     rssWarnBytes: memoryLimits.rssWarnBytes,
+    onRssSample: (rssBytes) => metrics.setProcessRssBytes(rssBytes),
   });
   const borrowerRescanIntervalMs = parseMinNumber(
     process.env.BORROWER_FULL_RESCAN_INTERVAL_MS,
@@ -757,7 +758,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       ...(process.env.REDIS_URL === undefined ? {} : { redisUrl: process.env.REDIS_URL }),
       coldStartLookbackBlocks: BigInt(parseMinNumber(
         process.env.COLD_START_LOOKBACK_BLOCKS,
-        50_000,
+        config.chain === "base" ? 750_000 : 50_000,
         1_000,
         "COLD_START_LOOKBACK_BLOCKS",
       )),

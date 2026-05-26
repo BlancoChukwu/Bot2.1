@@ -191,6 +191,7 @@ export class PipelineOrchestrator {
         chain,
         ageMs: this.config.watchlistStaleness?.ageMs(),
       });
+      this.config.metrics.recordWatchlistStaleEvaluation(chain, "critical");
       this.config.metrics.recordError();
       return;
     }
@@ -199,6 +200,7 @@ export class PipelineOrchestrator {
         chain,
         ageMs: this.config.watchlistStaleness?.ageMs(),
       });
+      this.config.metrics.recordWatchlistStaleEvaluation(chain, "stale");
     }
 
     if (this.config.sequencerGuard !== undefined) {

@@ -1,0 +1,20 @@
+groups:
+  - name: bot_critical
+    rules:
+      - alert: WatchlistStale
+        expr: max(watchlist_last_update_age_seconds) > 60
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Watchlist stale — pipeline may be paused"
+          description: "watchlist_last_update_age_seconds exceeded 60s for {{ $labels.chain }}"
+
+      - alert: MemoryHighRSS
+        expr: process_rss_bytes > 629145600
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "RSS exceeding 600 MB — check for memory leak"
+          description: "process_rss_bytes={{ $value }} (> 629145600)"
