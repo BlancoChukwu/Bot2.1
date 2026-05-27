@@ -3,6 +3,7 @@ import type { BotMetrics, LoggerLike } from "../bot";
 import type { ChainRegistry } from "../config/chainRegistry";
 import type { SupportedChain } from "../config/chains";
 import type { AaveV3Protocol } from "../protocols/aaveV3";
+import type { BorrowerIndexProvider } from "../indexing/BorrowerIndexProvider";
 import { BlockCursor, createBlockCursor } from "../utils/blockCursor";
 import { AaveSnapshotProvider } from "./aaveSnapshotProvider";
 import type { BorrowerSnapshotProvider } from "./hybridDetectionPipeline";
@@ -10,10 +11,20 @@ import { BoundedWatchlist } from "./boundedWatchlist";
 import { EventDrivenWatchlist } from "./eventDrivenWatchlist";
 import {
   filterAddressesForSweep,
+  filterReadsBelowHealthFactor,
+  PIPELINE_DIAGNOSTIC_HF_WAD,
+  readHealthFactors,
   sweepHealthFactors,
+  type HealthFactorRead,
 } from "./healthFactorSweep";
 import type { BorrowerSnapshot } from "./reserveAwareBorrowerCache";
 import { StalenessGuard } from "./stalenessGuard";
+import {
+  discoverBorrowersFromLogs,
+  filterAccountsWithDebt,
+} from "./onChainBorrowerDiscovery";
+import { parseWatchlistReserveAllowlist } from "../config/watchlistReserveAllowlist";
+import { filterSnapshotsByAllowlist } from "../config/watchlistReserveFilter";
 
 export interface WatchlistCoordinatorConfig {
   readonly chain: SupportedChain;
@@ -29,16 +40,30 @@ export interface WatchlistCoordinatorConfig {
   readonly lowTierEveryBlocks?: bigint;
   readonly redisUrl?: string;
   readonly coldStartLookbackBlocks?: bigint;
+  readonly fullSweepIntervalMs?: number;
+  readonly onSnapshots?: (snapshots: readonly BorrowerSnapshot[]) => void;
+  readonly reorgSafeDepth?: bigint;
+  readonly gapChunkBlocks?: bigint;
+  readonly gapChunkDelayMs?: number;
+  readonly borrowerIndexProvider?: BorrowerIndexProvider;
+  readonly reserveAllowlist?: readonly Address[];
+  readonly onChainColdStartLookbackBlocks?: bigint;
+  readonly onChainColdStartMaxBlocks?: bigint;
+  /** Archive-capable HTTP RPC for log backfill (not Flashblocks pending-only). */
+  readonly coldStartReadClient?: PublicClient;
 }
 
 export class WatchlistCoordinator implements BorrowerSnapshotProvider {
   public readonly stalenessGuard = new StalenessGuard();
   public readonly watchlist = new BoundedWatchlist();
+  private borrowersDiscovered = 0;
+  private diagnosticSampleCursor = 0;
   private readonly snapshotProvider: AaveSnapshotProvider;
   private cursor: BlockCursor | undefined;
   private eventWatchlist: EventDrivenWatchlist | undefined;
   private started = false;
   private sweepInFlight = false;
+  private fullSweepTimer: NodeJS.Timeout | undefined;
 
   public constructor(private readonly config: WatchlistCoordinatorConfig) {
     this.snapshotProvider = new AaveSnapshotProvider(
@@ -69,9 +94,15 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
         this.stalenessGuard.record();
         this.publishWatchlistMetrics();
       },
+      onAccountsActivity: (accounts) => {
+        void this.refreshActiveAccounts(accounts);
+      },
       ...(this.config.coldStartLookbackBlocks === undefined
         ? {}
         : { coldStartLookbackBlocks: this.config.coldStartLookbackBlocks }),
+      ...(this.config.reorgSafeDepth === undefined ? {} : { reorgSafeDepth: this.config.reorgSafeDepth }),
+      ...(this.config.gapChunkBlocks === undefined ? {} : { gapChunkBlocks: this.config.gapChunkBlocks }),
+      ...(this.config.gapChunkDelayMs === undefined ? {} : { gapChunkDelayMs: this.config.gapChunkDelayMs }),
     });
     await this.seedColdStart();
     await this.runColdStartFullSweep(this.config.chain);
@@ -79,22 +110,39 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
     this.stalenessGuard.record();
     this.publishWatchlistMetrics();
     this.started = true;
+    const fullSweepIntervalMs = this.config.fullSweepIntervalMs ?? 60_000;
+    this.fullSweepTimer = setInterval(() => {
+      Promise.resolve()
+        .then(() => this.pollBorrowers(this.config.chain))
+        .catch((error) => {
+          this.config.logger.error("watchlist_full_safety_sweep_failed", {
+            chain: this.config.chain,
+            error: String(error),
+          });
+        });
+    }, fullSweepIntervalMs);
+    this.fullSweepTimer.unref?.();
     this.config.logger.info("watchlist_coordinator_started", {
       chain: this.config.chain,
       watchlistSize: this.watchlist.size(),
       pool: this.config.poolAddress,
       cursorBackend: this.cursor.backend,
+      fullSweepIntervalMs,
     });
   }
 
   public async stop(): Promise<void> {
+    if (this.fullSweepTimer !== undefined) {
+      clearInterval(this.fullSweepTimer);
+      this.fullSweepTimer = undefined;
+    }
     this.eventWatchlist?.stop();
     await this.cursor?.close();
     this.started = false;
   }
 
-  public async getBorrowersForReserve(chain: SupportedChain, reserve: Address): Promise<Address[]> {
-    return this.snapshotProvider.getBorrowersForReserve(chain, reserve);
+  public async getBorrowersForReserve(_chain: SupportedChain, _reserve: Address): Promise<Address[]> {
+    return this.watchlist.addresses() as Address[];
   }
 
   public async refreshBorrowers(
@@ -109,6 +157,38 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
     accounts: readonly Address[],
   ): Promise<readonly BorrowerSnapshot[]> {
     return this.snapshotProvider.refreshWatchlistBorrowers(chain, accounts);
+  }
+
+  public async refreshBorrowersForDiagnostics(
+    chain: SupportedChain,
+    accounts: readonly Address[],
+  ): Promise<readonly BorrowerSnapshot[]> {
+    return this.snapshotProvider.refreshBorrowersForDiagnostics(chain, accounts);
+  }
+
+  /** Rotating multicall HF sample for pipeline_cycle_diagnostics (success gate). */
+  public async sampleDiagnosticHealthFactors(batchSize = 120): Promise<readonly HealthFactorRead[]> {
+    const addresses = this.watchlist.addresses() as Address[];
+    if (addresses.length === 0) {
+      return [];
+    }
+    const size = Math.min(batchSize, addresses.length);
+    const start = this.diagnosticSampleCursor % addresses.length;
+    const batch: Address[] = [];
+    for (let i = 0; i < size; i += 1) {
+      batch.push(addresses[(start + i) % addresses.length]!);
+    }
+    this.diagnosticSampleCursor = (start + size) % addresses.length;
+    const reads = await readHealthFactors(batch, {
+      client: this.config.readClient,
+      poolAddress: this.config.poolAddress,
+      minDebtBase: this.config.minDebtBase,
+      watchlist: this.watchlist,
+      ...(this.config.multicallBatchSize === undefined
+        ? {}
+        : { batchSize: this.config.multicallBatchSize }),
+    });
+    return filterReadsBelowHealthFactor(reads, PIPELINE_DIAGNOSTIC_HF_WAD, this.config.minDebtBase);
   }
 
   public async sweepAndRefresh(
@@ -128,6 +208,60 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
 
   public async pollBorrowers(chain: SupportedChain): Promise<readonly BorrowerSnapshot[]> {
     return this.runTieredSweep(chain);
+  }
+
+  public async refreshPriorityAccounts(accounts: readonly Address[]): Promise<void> {
+    return this.refreshActiveAccounts(accounts);
+  }
+
+  public registerBorrowers(accounts: readonly Address[], blockNumber?: bigint): number {
+    if (accounts.length === 0) {
+      return 0;
+    }
+    const block = blockNumber ?? 0n;
+    let added = 0;
+    for (const account of accounts) {
+      const before = this.watchlist.size();
+      this.watchlist.add(account, block);
+      if (this.watchlist.size() > before) {
+        added += 1;
+      }
+    }
+    this.borrowersDiscovered += added;
+    if (added > 0) {
+      this.stalenessGuard.record();
+      this.publishWatchlistMetrics();
+      this.config.logger.info("watchlist_borrowers_registered", {
+        chain: this.config.chain,
+        added,
+        watchlistSize: this.watchlist.size(),
+        borrowersDiscovered: this.borrowersDiscovered,
+      });
+    }
+    return added;
+  }
+
+  public getWatchlistStats(): { readonly watchlistSize: number; readonly borrowersDiscovered: number } {
+    return {
+      watchlistSize: this.watchlist.size(),
+      borrowersDiscovered: this.borrowersDiscovered,
+    };
+  }
+
+  private async refreshActiveAccounts(accounts: readonly Address[]): Promise<void> {
+    if (!this.started || accounts.length === 0) {
+      return;
+    }
+    const snapshots = await this.snapshotProvider.refreshWatchlistBorrowers(this.config.chain, accounts);
+    if (snapshots.length === 0) {
+      return;
+    }
+    this.config.onSnapshots?.(snapshots);
+    this.config.logger.info("watchlist_event_target_refresh_complete", {
+      chain: this.config.chain,
+      touchedAccounts: accounts.length,
+      refreshed: snapshots.length,
+    });
   }
 
   private async runTieredSweep(
@@ -245,7 +379,13 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
 
   private async seedColdStart(): Promise<void> {
     try {
-      const addresses = await this.config.protocol.listBorrowerAddresses?.();
+      const seeded = this.config.borrowerIndexProvider === undefined
+        ? {
+          source: "subgraph" as const,
+          accounts: await this.config.protocol.listBorrowerAddresses?.() ?? [],
+        }
+        : await this.config.borrowerIndexProvider.seed(this.config.chain);
+      const addresses = seeded.accounts;
       if (addresses !== undefined && addresses.length > 0) {
         const blockNumber = await this.config.readClient.getBlockNumber();
         for (const address of addresses) {
@@ -254,6 +394,7 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
         this.config.logger.info("watchlist_cold_start_subgraph", {
           chain: this.config.chain,
           borrowers: addresses.length,
+          source: seeded.source,
         });
         return;
       }
@@ -267,20 +408,59 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
       });
     }
 
-    const lookback = this.config.coldStartLookbackBlocks ?? 50_000n;
+    const lookback = this.config.onChainColdStartLookbackBlocks
+      ?? this.config.coldStartLookbackBlocks
+      ?? 200_000n;
+    const maxBlocks = this.config.onChainColdStartMaxBlocks ?? 200_000n;
+    const coldStartClient = this.config.coldStartReadClient ?? this.config.readClient;
     try {
-      if (this.eventWatchlist === undefined) {
-        throw new Error("event watchlist not initialized");
+      const discovery = await discoverBorrowersFromLogs({
+        chain: this.config.chain,
+        poolAddress: this.config.poolAddress,
+        client: coldStartClient,
+        lookbackBlocks: lookback,
+        maxBlocks,
+        chunkBlocks: 5_000n,
+      });
+      const withDebt = await filterAccountsWithDebt(
+        this.config.readClient,
+        this.config.poolAddress,
+        discovery.accounts,
+      );
+      const blockNumber = await this.config.readClient.getBlockNumber();
+      for (const address of withDebt) {
+        this.watchlist.add(address, blockNumber);
       }
-      await this.eventWatchlist.coldStartFromLogs(lookback);
+      if (this.watchlist.size() === 0 && this.eventWatchlist !== undefined) {
+        await this.eventWatchlist.coldStartFromLogs(lookback);
+      }
       const size = this.watchlist.size();
       if (size === 0) {
-        throw new Error("RPC cold-start fallback returned zero borrowers");
+        throw new Error("on-chain and log cold-start returned zero borrowers");
       }
-      this.config.logger.info("watchlist_cold_start_rpc_fallback", {
+      this.borrowersDiscovered = this.watchlist.size();
+      const beforePrune = withDebt;
+      await this.pruneWatchlistByReserveAllowlist();
+      if (this.watchlist.size() < 100 && beforePrune.length >= 100) {
+        for (const account of beforePrune) {
+          this.watchlist.add(account, blockNumber);
+        }
+        this.config.logger.warn("watchlist_reserve_allowlist_prune_reverted", {
+          chain: this.config.chain,
+          restored: beforePrune.length,
+          watchlistSize: this.watchlist.size(),
+        });
+      }
+      this.config.logger.info("watchlist_cold_start_on_chain", {
         chain: this.config.chain,
         lookbackBlocks: lookback.toString(),
-        watchlistSize: size,
+        borrowLogs: discovery.borrowLogs,
+        discovered: discovery.accounts.length,
+        withDebt: withDebt.length,
+        borrowersDiscovered: this.borrowersDiscovered,
+        watchlistSize: this.watchlist.size(),
+        elapsedMs: discovery.elapsedMs,
+        blocksScanned: discovery.blocksScanned.toString(),
       });
     } catch (error) {
       this.config.logger.error("watchlist_cold_start_critical", {
@@ -289,5 +469,39 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
         watchlistSize: this.watchlist.size(),
       });
     }
+  }
+
+  private async pruneWatchlistByReserveAllowlist(): Promise<void> {
+    const allowlist = this.config.reserveAllowlist
+      ?? parseWatchlistReserveAllowlist(process.env.WATCHLIST_RESERVE_ALLOWLIST, this.config.chain);
+    if (allowlist.length === 0) {
+      return;
+    }
+    const accounts = this.watchlist.addresses() as Address[];
+    if (accounts.length === 0) {
+      return;
+    }
+    const allowed = new Set<string>();
+    const batchSize = this.config.multicallBatchSize ?? 250;
+    for (let i = 0; i < accounts.length; i += batchSize) {
+      const batch = accounts.slice(i, i + batchSize);
+      const snapshots = await this.snapshotProvider.refreshBorrowers(this.config.chain, batch);
+      for (const snapshot of filterSnapshotsByAllowlist(snapshots, allowlist)) {
+        allowed.add(snapshot.account.toLowerCase());
+      }
+    }
+    let pruned = 0;
+    for (const account of accounts) {
+      if (!allowed.has(account.toLowerCase())) {
+        this.watchlist.remove(account);
+        pruned += 1;
+      }
+    }
+    this.config.logger.info("watchlist_reserve_allowlist_prune", {
+      chain: this.config.chain,
+      pruned,
+      remaining: this.watchlist.size(),
+      allowlistSize: allowlist.length,
+    });
   }
 }

@@ -18,6 +18,7 @@ import {
   ReserveAwareBorrowerCache,
   type BorrowerSnapshot,
 } from "../monitors/reserveAwareBorrowerCache";
+import { getCycleDiagnosticsCollector } from "../observability/cycleDiagnostics";
 
 const baseUsdcDecimals = 6;
 const baseWethDecimals = 18;
@@ -93,6 +94,26 @@ export class LiquidationCandidateGate {
         ...profitability,
         pass: gatePass,
       });
+      const diagnosticRow = {
+        kind: "liquidation" as const,
+        account: candidate.account,
+        stage,
+        grossProfitUsd: resolved.debtUsd * (candidate.liquidationBonusBps / 10_000),
+        gasCostUsd,
+        netDeltaUsd: profitability.netProfitUsd,
+        failureMarginBps: profitability.effectiveFloor > 0
+          ? Math.round((profitability.netProfitUsd / profitability.effectiveFloor) * 10_000)
+          : 0,
+        passed: gatePass,
+      };
+      if (!gatePass) {
+        getCycleDiagnosticsCollector().record({
+          ...diagnosticRow,
+          skipReason: `below_effective_floor_${profitability.effectiveFloor.toFixed(2)}`,
+        });
+      } else {
+        getCycleDiagnosticsCollector().record(diagnosticRow);
+      }
 
       const decision = this.buildFilterDecision(resolved, profitability.pass, gasCostUsd);
       logLiquidationDustDecision(this.config.logger, {
@@ -118,13 +139,61 @@ export class LiquidationCandidateGate {
     return kept;
   }
 
-  /** WS reserve-event path: force-refresh oracle prices before dust evaluation. */
+  public recordHealthFactorDiagnostics(
+    chain: SupportedChain,
+    reads: readonly { readonly account: Address; readonly healthFactor: bigint }[],
+    stage: string,
+  ): void {
+    const hfScale = 1_000_000_000_000_000_000n;
+    const nearLiquidationHf = 1_050_000_000_000_000_000n;
+    const diagnosticCapHf = 1_500_000_000_000_000_000n;
+    for (const row of reads) {
+      const hf = row.healthFactor;
+      if (hf >= diagnosticCapHf) {
+        continue;
+      }
+      const hfFloat = Number(hf) / Number(hfScale);
+      const nearLiquidation = hf < nearLiquidationHf;
+      getCycleDiagnosticsCollector().record({
+        kind: "liquidation",
+        account: row.account,
+        stage,
+        grossProfitUsd: 0,
+        gasCostUsd: 0,
+        netDeltaUsd: 0,
+        failureMarginBps: Math.round((1 - hfFloat) * 10_000),
+        skipReason: nearLiquidation ? `hf_${hfFloat.toFixed(4)}` : `healthy_hf_${hfFloat.toFixed(4)}`,
+        passed: false,
+      });
+      this.config.logger.info("liquidation_evaluated", {
+        chain,
+        account: row.account,
+        stage,
+        healthFactor: hf.toString(),
+        hfFloat,
+        nearLiquidation,
+        pass: false,
+      });
+    }
+  }
+
+  /** WS reserve-event path: HF diagnostics + profitability filter for near-liquidation only. */
   public async auditBorrowerSnapshots(
     chain: SupportedChain,
     snapshots: readonly BorrowerSnapshot[],
   ): Promise<void> {
+    this.recordHealthFactorDiagnostics(
+      chain,
+      snapshots.map((snapshot) => ({
+        account: snapshot.account,
+        healthFactor: snapshot.healthFactor,
+      })),
+      "ws_reserve_event",
+    );
+    const nearLiquidationHf = 1_050_000_000_000_000_000n;
+    const nearSnapshots = snapshots.filter((snapshot) => snapshot.healthFactor < nearLiquidationHf);
     const cache = new ReserveAwareBorrowerCache();
-    for (const snapshot of snapshots) {
+    for (const snapshot of nearSnapshots) {
       cache.upsert(snapshot);
     }
     const candidates = createReserveAwareCandidates(cache, chain);

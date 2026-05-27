@@ -5,6 +5,13 @@ import type { BoundedWatchlist } from "./boundedWatchlist";
 const WAD = 1_000_000_000_000_000_000n;
 const DEFAULT_BATCH = 250;
 const PRE_LIQUIDATABLE_WAD = 1_150_000_000_000_000_000n;
+export const PIPELINE_DIAGNOSTIC_HF_WAD = 1_500_000_000_000_000_000n;
+
+export interface HealthFactorRead {
+  readonly address: Address;
+  readonly healthFactor: bigint;
+  readonly totalDebtBase: bigint;
+}
 
 export interface LiquidatableAccount {
   readonly address: Address;
@@ -21,13 +28,12 @@ export interface HealthFactorSweepConfig {
   readonly watchlist?: BoundedWatchlist;
 }
 
-export async function sweepHealthFactors(
+export async function readHealthFactors(
   addresses: readonly Address[],
   config: HealthFactorSweepConfig,
-): Promise<LiquidatableAccount[]> {
+): Promise<readonly HealthFactorRead[]> {
   const batchSize = config.batchSize ?? DEFAULT_BATCH;
-  const minDebt = config.minDebtBase ?? 0n;
-  const liquidatable: LiquidatableAccount[] = [];
+  const reads: HealthFactorRead[] = [];
 
   for (let i = 0; i < addresses.length; i += batchSize) {
     const batch = addresses.slice(i, i + batchSize);
@@ -51,17 +57,40 @@ export async function sweepHealthFactors(
       const debt = data[1];
       const address = batch[j]!;
       config.watchlist?.updateHealthFactor(address, hf);
-      if (hf < WAD && debt > minDebt) {
-        liquidatable.push({
-          address,
-          healthFactor: hf,
-          totalDebtBase: debt,
-        });
-      }
+      reads.push({ address, healthFactor: hf, totalDebtBase: debt });
     }
   }
 
+  return reads;
+}
+
+export async function sweepHealthFactors(
+  addresses: readonly Address[],
+  config: HealthFactorSweepConfig,
+): Promise<LiquidatableAccount[]> {
+  const minDebt = config.minDebtBase ?? 0n;
+  const liquidatable: LiquidatableAccount[] = [];
+  const reads = await readHealthFactors(addresses, config);
+  for (const row of reads) {
+    if (row.healthFactor < WAD && row.totalDebtBase > minDebt) {
+      liquidatable.push({
+        address: row.address,
+        healthFactor: row.healthFactor,
+        totalDebtBase: row.totalDebtBase,
+      });
+    }
+  }
   return liquidatable;
+}
+
+export function filterReadsBelowHealthFactor(
+  reads: readonly HealthFactorRead[],
+  maxHealthFactorWad: bigint,
+  minDebtBase = 0n,
+): readonly HealthFactorRead[] {
+  return reads.filter(
+    (row) => row.healthFactor < maxHealthFactorWad && row.totalDebtBase > minDebtBase,
+  );
 }
 
 export function filterAddressesForSweep(

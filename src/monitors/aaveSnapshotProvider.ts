@@ -10,6 +10,8 @@ const weth = createAsset({ symbol: "WETH", decimals: 18 });
 const usdc = createAsset({ symbol: "USDC", decimals: 6 });
 const liquidationHealthFactor = 1_000_000_000_000_000_000n;
 const preLiquidatableHealthFactor = 1_050_000_000_000_000_000n;
+/** Pipeline / reserve-event diagnostics (success gate: HF < 1.5). */
+export const pipelineDiagnosticHealthFactor = 1_500_000_000_000_000_000n;
 
 export class AaveSnapshotProvider {
   public constructor(
@@ -18,9 +20,19 @@ export class AaveSnapshotProvider {
     private readonly registry: Pick<ChainRegistry, "getResolvedAave">,
   ) {}
 
-  public async getBorrowersForReserve(_chain: SupportedChain, _reserve: Address): Promise<Address[]> {
-    // Reserve events are resolved primarily against the in-memory hot cache.
-    return [];
+  public async getBorrowersForReserve(_chain: SupportedChain, reserve: Address): Promise<Address[]> {
+    const candidates = await this.protocol.getLiquidatablePositions();
+    const lowerReserve = reserve.toLowerCase();
+    const accounts = new Set<Address>();
+    for (const candidate of candidates) {
+      if (
+        candidate.collateralAsset.toLowerCase() === lowerReserve
+        || candidate.debtAsset.toLowerCase() === lowerReserve
+      ) {
+        accounts.add(candidate.account);
+      }
+    }
+    return [...accounts];
   }
 
   public async refreshBorrowers(_chain: SupportedChain, accounts: readonly Address[]): Promise<readonly BorrowerSnapshot[]> {
@@ -32,6 +44,13 @@ export class AaveSnapshotProvider {
     accounts: readonly Address[],
   ): Promise<readonly BorrowerSnapshot[]> {
     return this.refreshBorrowersWithThreshold(accounts, preLiquidatableHealthFactor);
+  }
+
+  public async refreshBorrowersForDiagnostics(
+    _chain: SupportedChain,
+    accounts: readonly Address[],
+  ): Promise<readonly BorrowerSnapshot[]> {
+    return this.refreshBorrowersWithThreshold(accounts, pipelineDiagnosticHealthFactor);
   }
 
   private async refreshBorrowersWithThreshold(

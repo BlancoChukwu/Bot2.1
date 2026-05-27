@@ -10,6 +10,8 @@ import type { Opportunity } from "../types/opportunity";
 import { fromLiquidationCandidate } from "../types/opportunity";
 import type { LiquidationCandidateGate } from "./liquidationCandidateGate";
 import type { StalenessGuard } from "../monitors/stalenessGuard";
+import { getCycleDiagnosticsCollector } from "../observability/cycleDiagnostics";
+import type { SimFailureCircuitBreaker } from "../executors/simFailureCircuitBreaker";
 
 export interface PipelineLoopOptions {
   readonly pollIntervalMs: number;
@@ -74,6 +76,13 @@ export interface PipelineOrchestratorConfig {
   readonly watchlistStaleness?: StalenessGuard;
   /** Event-watchlist periodic HF sweep (e.g. when block WS subscription is unavailable). */
   readonly watchlistSweep?: (chain: SupportedChain) => Promise<void>;
+  readonly simFailureCircuit?: SimFailureCircuitBreaker;
+  readonly blocksPerCycle?: () => number;
+  readonly watchlistStats?: () => { readonly watchlistSize: number; readonly borrowersDiscovered: number };
+  /** Rotating HF multicall sample — feeds pipeline_cycle_diagnostics each cycle. */
+  readonly watchlistDiagnosticSample?: (
+    chain: SupportedChain,
+  ) => Promise<readonly { readonly account: Address; readonly healthFactor: bigint }[]>;
 }
 
 export interface PipelineRunSummary {
@@ -84,6 +93,10 @@ export interface PipelineRunSummary {
   readonly rejected: number;
   readonly failed: number;
   readonly deadLetters: number;
+  readonly revenue_this_cycle: number;
+  readonly evaluations: number;
+  readonly sims: number;
+  readonly opps_per_block: number;
 }
 
 export interface PipelineDeadLetter {
@@ -165,8 +178,25 @@ export class PipelineOrchestrator {
     try {
       for (const chain of this.config.registry.listChains()) {
         await this.runChain(chain, summary);
+        if (this.config.watchlistDiagnosticSample !== undefined && this.config.liquidationGate !== undefined) {
+          const hfReads = await this.config.watchlistDiagnosticSample(chain);
+          if (hfReads.length > 0) {
+            this.config.liquidationGate.recordHealthFactorDiagnostics(chain, hfReads, "pipeline_cycle_sample");
+          }
+        }
       }
-      const frozen = freezeSummary(summary);
+      const diagnostics = getCycleDiagnosticsCollector();
+      const blocksDelta = Math.max(1, this.config.blocksPerCycle?.() ?? 1);
+      const frozen = freezeSummary(summary, diagnostics.snapshot(summary.sent, blocksDelta));
+      const watchlistStats = this.config.watchlistStats?.();
+      if (watchlistStats !== undefined) {
+        this.config.logger.info("watchlist_cycle_stats", {
+          watchlistSize: watchlistStats.watchlistSize,
+          borrowersDiscovered: watchlistStats.borrowersDiscovered,
+        });
+      }
+      diagnostics.emit(this.config.logger, summary.sent, blocksDelta);
+      diagnostics.reset();
       this.config.logger.info("pipeline_cycle_complete", frozen);
       await this.config.cycleObserver?.(frozen);
       return frozen;
@@ -358,6 +388,8 @@ export class PipelineOrchestrator {
     }
     if (result.status === "simulated") {
       summary.simulated += 1;
+      getCycleDiagnosticsCollector().recordSim();
+      this.config.simFailureCircuit?.recordSuccess();
       this.config.logger.info("pipeline_execution_simulated", {
         chain: request.chain,
         opportunityId: request.opportunityId,
@@ -367,6 +399,7 @@ export class PipelineOrchestrator {
 
     if (result.status === "rejected") {
       summary.rejected += 1;
+      this.config.simFailureCircuit?.recordSimFailure(result.reason);
       if (result.reason === "dust_filtered" || result.reason === "borrower_cooldown") {
         this.config.logger.info("pipeline_execution_skipped_guard", {
           chain: request.chain,
@@ -378,6 +411,7 @@ export class PipelineOrchestrator {
     } else {
       summary.failed += 1;
       this.config.metrics.recordError();
+      this.config.simFailureCircuit?.recordSimFailure(result.reason);
     }
 
     this.deadLetter(request, result.reason);
@@ -570,8 +604,23 @@ function mutableSummary(): MutablePipelineRunSummary {
   return { scanned: 0, attempted: 0, sent: 0, simulated: 0, rejected: 0, failed: 0, deadLetters: 0 };
 }
 
-function freezeSummary(summary: MutablePipelineRunSummary): PipelineRunSummary {
-  return { ...summary, deadLetters: summary.rejected + summary.failed };
+function freezeSummary(
+  summary: MutablePipelineRunSummary,
+  diagnostics: {
+    revenue_this_cycle: number;
+    evaluations: number;
+    sims: number;
+    opps_per_block: number;
+  },
+): PipelineRunSummary {
+  return {
+    ...summary,
+    deadLetters: summary.rejected + summary.failed,
+    revenue_this_cycle: diagnostics.revenue_this_cycle,
+    evaluations: diagnostics.evaluations,
+    sims: diagnostics.sims,
+    opps_per_block: diagnostics.opps_per_block,
+  };
 }
 
 function remainingDelayMs(startedAt: number, pollIntervalMs: number): number {

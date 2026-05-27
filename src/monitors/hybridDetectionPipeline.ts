@@ -26,6 +26,10 @@ export interface DetectionEventSource {
 export interface BorrowerSnapshotProvider {
   getBorrowersForReserve(chain: SupportedChain, reserve: Address): Promise<Address[]>;
   refreshBorrowers(chain: SupportedChain, accounts: readonly Address[]): Promise<readonly BorrowerSnapshot[]>;
+  refreshBorrowersForDiagnostics?(
+    chain: SupportedChain,
+    accounts: readonly Address[],
+  ): Promise<readonly BorrowerSnapshot[]>;
   refreshWatchlistBorrowers?(
     chain: SupportedChain,
     accounts: readonly Address[],
@@ -83,6 +87,10 @@ export class HybridDetectionPipeline {
     }
   }
 
+  public pendingWorkCount(): number {
+    return this.pendingWork.size;
+  }
+
   public async pollFallback(chain: SupportedChain): Promise<void> {
     const startedAt = Date.now();
     const resolvedAave = this.config.registry.getResolvedAave(chain);
@@ -137,7 +145,10 @@ export class HybridDetectionPipeline {
         });
         return;
       }
-      const snapshots = await this.config.provider.refreshBorrowers(event.chain, targetBorrowers);
+      const snapshots = await this.config.provider.refreshBorrowersForDiagnostics?.(
+        event.chain,
+        targetBorrowers,
+      ) ?? await this.config.provider.refreshBorrowers(event.chain, targetBorrowers);
       this.upsertSnapshots(snapshots);
       if (this.config.liquidationGate !== undefined && snapshots.length > 0) {
         await this.config.liquidationGate.auditBorrowerSnapshots(event.chain, snapshots);
@@ -179,17 +190,7 @@ export class HybridDetectionPipeline {
   }
 
   private getCachedBorrowersForReserve(chain: SupportedChain, reserve: Address): Address[] {
-    const lowerReserve = reserve.toLowerCase();
-    const unique = new Set<Address>();
-    for (const snapshot of this.cache.listSnapshots(chain)) {
-      const touchesReserve = snapshot.reserves.some(
-        (entry) => entry.assetAddress.toLowerCase() === lowerReserve,
-      );
-      if (touchesReserve) {
-        unique.add(snapshot.account);
-      }
-    }
-    return [...unique];
+    return this.cache.listAccountsForReserve(chain, reserve);
   }
 }
 

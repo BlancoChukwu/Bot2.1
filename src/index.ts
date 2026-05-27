@@ -33,7 +33,10 @@ import { LocalNonceManager } from "./executors/nonceManager";
 import { PrivateSubmissionClient, type PrivateTxMode } from "./executors/PrivateSubmissionClient";
 import { SafeTransactionExecutor } from "./executors/safeTransactionExecutor";
 import { ViemExecutionClient } from "./executors/viemExecutionClient";
-import { getDexesForChain, getMonitoredPairsForChain } from "./config/dexRegistry";
+import { ParallelBroadcastClient } from "./executors/parallelBroadcastClient";
+import type { ExecutionPreflightClient } from "./executors/safeTransactionExecutor";
+import { FlashblocksPendingLogSource } from "./monitors/flashblocksPendingLogSource";
+import { getDexesForChain, getEscapeHatchPairs, getMonitoredPairsForChain } from "./config/dexRegistry";
 import { HealthFactorMonitor } from "./monitors/healthFactorMonitor";
 import { ArbitrageOpportunityQueue } from "./monitors/arbitrageOpportunityQueue";
 import { ArbitrageScanner } from "./monitors/arbitrageScanner";
@@ -42,6 +45,9 @@ import { HybridDetectionPipeline, type BorrowerSnapshotProvider } from "./monito
 import { RescanCircuitBreaker } from "./monitors/rescanCircuitBreaker";
 import { MultiWsEventSource } from "./monitors/MultiWsEventSource";
 import { WatchlistCoordinator } from "./monitors/watchlistCoordinator";
+import { parseWatchlistReserveAllowlist } from "./config/watchlistReserveAllowlist";
+import { SimFailureCircuitBreaker } from "./executors/simFailureCircuitBreaker";
+import { resetCycleDiagnosticsCollector } from "./observability/cycleDiagnostics";
 import {
   createReserveAwareCandidates,
   ReserveAwareBorrowerCache,
@@ -76,6 +82,7 @@ import {
 } from "./monitors/borrowerWatchlistRescanner";
 import { scheduleHeapSnapshots } from "./utils/heapSnapshotHarness";
 import { startMemoryMonitor } from "./utils/memoryMonitor";
+import { registerHeapSnapshotOnSignal } from "./utils/heapSnapshotOnSignal";
 import { memoryLimitsFromNodeHeap } from "./utils/nodeHeapLimits";
 import { mergeBorrowerAddresses } from "./protocols/borrowerDiscovery";
 import {
@@ -83,10 +90,20 @@ import {
   parseBorrowerDiscoveryFromEnv,
 } from "./protocols/borrowerDiscoveryRegistry";
 import { warnIfUnstableWssProvider } from "./utils/wssProviderCheck";
+import {
+  EnvioBorrowerIndexProvider,
+  OrmiBorrowerIndexProvider,
+  SubgraphBorrowerIndexProvider,
+} from "./indexing/providers";
 import { evaluateDustFilter } from "./protocols/liquidationCandidateFilter";
 import { sendDailyPnlSummary, sendLiquidationAlert } from "./utils/telegramAlert";
 import { assertLiquidationReceiverReadiness } from "./production/liquidationReceiverReadiness";
-import { DeploymentSafetyGate, type DeploymentGateResult, type DryRunValidationReceipt } from "./production/productionReadiness";
+import {
+  DeploymentSafetyGate,
+  GracefulShutdownCoordinator,
+  type DeploymentGateResult,
+  type DryRunValidationReceipt,
+} from "./production/productionReadiness";
 import { PnlTracker } from "./production/pnlTracker";
 import type { Opportunity } from "./types/opportunity";
 
@@ -373,6 +390,44 @@ export function buildBot(config: RuntimeConfig, metrics: BotMetrics = createBotM
   });
 }
 
+function buildExecutionPreflightClient(input: {
+  readonly config: RuntimeConfig;
+  readonly privateKey: Hex;
+  readonly publicClient: ReturnType<typeof createFailoverPublicClient>;
+  readonly walletClient: ReturnType<typeof createFailoverWalletClient>;
+  readonly logger: LoggerLike;
+}): ExecutionPreflightClient {
+  const parallelEnabled = parseBoolean(process.env.PARALLEL_BROADCAST_ENABLED, true);
+  const rpcUrls = [
+    input.config.executionRpcUrlPrimary,
+    ...input.config.executionRpcFallbackUrls,
+    ...input.config.fallbackRpcUrls,
+  ].filter((url, index, self) => url.trim().length > 0 && self.indexOf(url) === index);
+
+  if (!parallelEnabled || rpcUrls.length <= 1) {
+    return new ViemExecutionClient({
+      publicClient: input.publicClient,
+      walletClient: input.walletClient,
+    });
+  }
+
+  const clients = rpcUrls.map((rpcUrl) => new ViemExecutionClient({
+    publicClient: createFailoverPublicClient({
+      chain: input.config.chain,
+      rpcUrl,
+      fallbackRpcUrls: [],
+    }),
+    walletClient: createFailoverWalletClient({
+      chain: input.config.chain,
+      rpcUrl,
+      fallbackRpcUrls: [],
+      privateKey: input.privateKey,
+    }),
+  }));
+  input.logger.info("parallel_broadcast_enabled", { endpoints: rpcUrls.length });
+  return new ParallelBroadcastClient({ clients, logger: input.logger });
+}
+
 function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner {
   const logger = createLogger(config.logLevel);
   const account = privateKeyToAccount(config.privateKey);
@@ -573,11 +628,18 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     ...(providerPrivateWalletClient === undefined ? {} : { providerPrivateWalletClient }),
     ...(sequencerWalletClient === undefined ? {} : { sequencerWalletClient }),
   });
+  const executionPreflightClient = buildExecutionPreflightClient({
+    config,
+    privateKey: config.privateKey,
+    publicClient,
+    walletClient,
+    logger,
+  });
   const executor = new SafeTransactionExecutor({
     registry,
     router,
     nonceManager: new LocalNonceManager(),
-    client: new ViemExecutionClient({ publicClient, walletClient }),
+    client: executionPreflightClient,
     logger,
     metrics,
     dryRunMode: config.simulationMode,
@@ -603,6 +665,8 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     },
   });
   const arbQueue = new ArbitrageOpportunityQueue();
+  let watchlistCoordinatorRef: WatchlistCoordinator | undefined;
+  let hybridDetectionRef: HybridDetectionPipeline | undefined;
   const memoryLimits = memoryLimitsFromNodeHeap();
   const memoryMonitor = startMemoryMonitor({
     logger,
@@ -610,6 +674,11 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     ceilBytes: memoryLimits.ceilBytes,
     rssWarnBytes: memoryLimits.rssWarnBytes,
     onRssSample: (rssBytes) => metrics.setProcessRssBytes(rssBytes),
+    componentCounters: () => ({
+      watchlistSize: watchlistCoordinatorRef?.watchlist.size() ?? 0,
+      cacheEntries: hybridDetectionRef?.cache.size(config.chain) ?? 0,
+      detectionPending: hybridDetectionRef?.pendingWorkCount() ?? 0,
+    }),
   });
   const borrowerRescanIntervalMs = parseMinNumber(
     process.env.BORROWER_FULL_RESCAN_INTERVAL_MS,
@@ -680,21 +749,10 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     }, blockRescanDebounceMs);
   const onBlockWatchlistSweep = useEventWatchlist
     ? (blockNumber: bigint) => {
-      const coordinator = watchlistBlockHooks.coordinator;
-      if (coordinator === undefined) {
-        return;
-      }
-      void coordinator.pollBorrowers(config.chain)
-        .then((snapshots) => {
-          watchlistBlockHooks.upsertSnapshots?.(snapshots);
-        })
-        .catch((error) => {
-          logger.error("watchlist_block_sweep_failed", {
-            chain: config.chain,
-            blockNumber: blockNumber.toString(),
-            error: String(error),
-          });
-        });
+      logger.info("watchlist_block_activity", {
+        chain: config.chain,
+        blockNumber: blockNumber.toString(),
+      });
     }
     : undefined;
   const onBlockHandler = onBlockWatchlistSweep ?? onBlockRescan;
@@ -704,6 +762,19 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     ...(config.wsRpcUrlSecondary === undefined ? {} : { secondary: config.wsRpcUrlSecondary }),
     ...(config.wsRpcUrlTertiary === undefined ? {} : { tertiary: config.wsRpcUrlTertiary }),
   });
+  const coldStartRpc = optionalEnv(process.env, "COLD_START_RPC_URL")
+    ?? config.executionRpcUrlPrimary
+    ?? config.rpcUrl;
+  const coldStartReadClient = createFailoverPublicClient({
+    chain: config.chain,
+    rpcUrl: coldStartRpc,
+    fallbackRpcUrls: config.executionRpcFallbackUrls.length > 0
+      ? config.executionRpcFallbackUrls
+      : config.fallbackRpcUrls,
+  }) as unknown as PublicClient;
+  const borrowAccountHook: {
+    onBorrow?: (accounts: readonly Address[]) => void | Promise<void>;
+  } = {};
   const detectionSource = config.wsRpcUrlPrimary === undefined
     ? {
       start: async (handlers: { onReserveUpdated: (event: { chain: SupportedChain; reserve: Address }) => void; onError: (chain: SupportedChain, error: Error) => void }) => {
@@ -721,7 +792,10 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       chain: config.chain,
       logger,
       metrics,
+      heartbeatTimeoutMs: parseMinNumber(process.env.WS_HEARTBEAT_TIMEOUT_MS, 30_000, 5_000, "WS_HEARTBEAT_TIMEOUT_MS"),
+      maxReconnectDelayMs: parseMinNumber(process.env.WS_RECONNECT_MAX_DELAY_MS, 30_000, 5_000, "WS_RECONNECT_MAX_DELAY_MS"),
       ...(onBlockHandler === undefined ? {} : { onBlock: onBlockHandler }),
+      onBorrowerAccounts: (accounts) => borrowAccountHook.onBorrow?.(accounts),
     });
   const rescanBreaker = new RescanCircuitBreaker({
     logger,
@@ -741,6 +815,12 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   );
   let watchlistCoordinator: WatchlistCoordinator | undefined;
   let borrowerProvider: BorrowerSnapshotProvider = aaveSnapshotProvider;
+  const coldStartIndexer = (process.env.COLD_START_INDEXER ?? "subgraph").trim().toLowerCase();
+  const borrowerIndexProvider = coldStartIndexer === "envio"
+    ? new EnvioBorrowerIndexProvider(protocol)
+    : coldStartIndexer === "ormi"
+      ? new OrmiBorrowerIndexProvider(protocol)
+      : new SubgraphBorrowerIndexProvider(protocol);
   if (useEventWatchlist) {
     watchlistCoordinator = new WatchlistCoordinator({
       chain: config.chain,
@@ -762,7 +842,41 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         1_000,
         "COLD_START_LOOKBACK_BLOCKS",
       )),
+      reorgSafeDepth: BigInt(parseMinNumber(process.env.REORG_SAFE_DEPTH, 10, 1, "REORG_SAFE_DEPTH")),
+      gapChunkBlocks: BigInt(parseMinNumber(process.env.GAP_CHUNK_BLOCKS, 2_000, 1, "GAP_CHUNK_BLOCKS")),
+      gapChunkDelayMs: parseMinNumber(process.env.GAP_REPLAY_CHUNK_DELAY_MS, 0, 0, "GAP_REPLAY_CHUNK_DELAY_MS"),
+      fullSweepIntervalMs: parseMinNumber(
+        process.env.FULL_WATCHLIST_SWEEP_INTERVAL_MS,
+        60_000,
+        10_000,
+        "FULL_WATCHLIST_SWEEP_INTERVAL_MS",
+      ),
+      onSnapshots: (snapshots) => {
+        watchlistBlockHooks.upsertSnapshots?.(snapshots);
+      },
+      borrowerIndexProvider,
+      reserveAllowlist: parseWatchlistReserveAllowlist(
+        process.env.WATCHLIST_RESERVE_ALLOWLIST,
+        config.chain,
+      ),
+      onChainColdStartLookbackBlocks: BigInt(parseMinNumber(
+        process.env.COLD_START_ON_CHAIN_LOOKBACK_BLOCKS,
+        200_000,
+        1_000,
+        "COLD_START_ON_CHAIN_LOOKBACK_BLOCKS",
+      )),
+      onChainColdStartMaxBlocks: BigInt(parseMinNumber(
+        process.env.COLD_START_ON_CHAIN_MAX_BLOCKS,
+        200_000,
+        1_000,
+        "COLD_START_ON_CHAIN_MAX_BLOCKS",
+      )),
+      coldStartReadClient,
     });
+    borrowAccountHook.onBorrow = (accounts) => {
+      watchlistCoordinator?.registerBorrowers(accounts);
+      void watchlistCoordinator?.refreshPriorityAccounts(accounts);
+    };
     borrowerProvider = watchlistCoordinator;
     watchlistBlockHooks.coordinator = watchlistCoordinator;
     logger.info("event_watchlist_enabled", { chain: config.chain, pool: activePoolAddress });
@@ -783,6 +897,28 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         hybridDetection.cache.upsert(snapshot);
       }
     };
+  }
+  watchlistCoordinatorRef = watchlistCoordinator;
+  hybridDetectionRef = hybridDetection;
+  let flashblocksPendingSource: FlashblocksPendingLogSource | undefined;
+  if (useEventWatchlist && config.flashblocksEnabled) {
+    const flashblocksRpc = optionalEnv(process.env, "FLASHBLOCKS_RPC_URL") ?? config.executionRpcUrlPrimary;
+    const flashblocksClient = createFailoverPublicClient({
+      chain: config.chain,
+      rpcUrl: flashblocksRpc,
+      fallbackRpcUrls: config.executionRpcFallbackUrls,
+    }) as unknown as PublicClient;
+    flashblocksPendingSource = new FlashblocksPendingLogSource({
+      chain: config.chain,
+      poolAddress: activePoolAddress,
+      client: flashblocksClient,
+      logger,
+      metrics,
+      onPriorityAccounts: (accounts) => {
+        watchlistCoordinator?.registerBorrowers(accounts);
+        void watchlistCoordinator?.refreshPriorityAccounts(accounts);
+      },
+    });
   }
   const detection = new PipelineDetectionAdapter({
     chain: config.chain,
@@ -811,7 +947,10 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         fallbackRpcUrls: config.fallbackRpcUrls,
       }),
     getDexesForChain,
-    getMonitoredPairsForChain,
+    getMonitoredPairsForChain: (chain) => {
+      const escape = (process.env.ESCAPE_HATCH_SINGLE_PAIR ?? "").trim();
+      return escape.length > 0 ? getEscapeHatchPairs(chain) : getMonitoredPairsForChain(chain);
+    },
     defaultFlashLoanProvider: "aaveV3",
     minProfitMarginBps: config.minProfitMarginBps,
     opportunitySink: arbQueue,
@@ -847,6 +986,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     if (watchlistCoordinator !== undefined) {
       await watchlistCoordinator.start();
     }
+    flashblocksPendingSource?.start();
     const resolvedFlashLoanFeeBps = await resolveFlashLoanFeeBps();
     router.setProviderFee(
       "aaveV3",
@@ -882,13 +1022,41 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   };
   const hazardModel = new BayesianHazardModel();
   const noRegretRanker = new NoRegretOpportunityRanker({ model: hazardModel });
+  const memoryStatsEveryCycles = parseMinNumber(
+    process.env.MEMORY_LOG_EVERY_CYCLES,
+    300,
+    1,
+    "MEMORY_LOG_EVERY_CYCLES",
+  );
+  let completedCycles = 0;
+  resetCycleDiagnosticsCollector();
+  const simFailureCircuit = new SimFailureCircuitBreaker({
+    registry,
+    chain: config.chain,
+    logger,
+    threshold: parseMinNumber(process.env.EXECUTION_SIM_FAILURE_THRESHOLD, 5, 1, "EXECUTION_SIM_FAILURE_THRESHOLD"),
+    openMs: parseMinNumber(process.env.EXECUTION_CIRCUIT_OPEN_MS, 60_000, 1_000, "EXECUTION_CIRCUIT_OPEN_MS"),
+  });
   const orchestrator = new PipelineOrchestrator({
     registry,
     detection,
     executor,
     deadLetters: new PipelineDeadLetterQueue(),
     liquidationGate,
-    ...(watchlistCoordinator === undefined ? {} : { watchlistStaleness: watchlistCoordinator.stalenessGuard }),
+    simFailureCircuit,
+    ...(watchlistCoordinator === undefined
+      ? {}
+      : {
+        watchlistStaleness: watchlistCoordinator.stalenessGuard,
+        watchlistStats: () => watchlistCoordinator.getWatchlistStats(),
+        watchlistDiagnosticSample: async () => {
+          const reads = await watchlistCoordinator.sampleDiagnosticHealthFactors(120);
+          return reads.map((row) => ({
+            account: row.address,
+            healthFactor: row.healthFactor,
+          }));
+        },
+      }),
     ...(watchlistCoordinator !== undefined && config.wsRpcUrlPrimary === undefined
       ? {
         watchlistSweep: async (chain) => {
@@ -909,6 +1077,10 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       }),
     },
     cycleObserver: async () => {
+      completedCycles += 1;
+      if (completedCycles % memoryStatsEveryCycles === 0) {
+        memoryMonitor.emitStatsNow();
+      }
       const snapshot = metrics.snapshot();
       if (pnlTracker !== undefined) {
         pnlTracker.append({
@@ -1016,12 +1188,21 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     });
   }
 
+  const shutdown = new GracefulShutdownCoordinator({
+    logger,
+    metrics,
+    timeoutMs: 15_000,
+  });
+  shutdown.addHook("watchlist_rescanner_stop", async () => watchlistRescanner?.stop());
+  shutdown.addHook("flashblocks_pending_stop", async () => flashblocksPendingSource?.stop());
+  shutdown.addHook("watchlist_coordinator_stop", async () => watchlistCoordinator?.stop());
+  shutdown.addHook("hybrid_detection_drain", async () => hybridDetection.drain());
+  shutdown.addHook("memory_monitor_stop", async () => memoryMonitor.stop());
+  shutdown.addHook("arb_queue_stop", async () => arbQueue.stop());
+  shutdown.addHook("oracle_poll_stop", async () => priceOracleCache?.stopBackgroundPoll());
+
   return new PipelineBotRunner(orchestrator, arbitrageScanner, startupGuard, async () => {
-    watchlistRescanner?.stop();
-    await watchlistCoordinator?.stop();
-    memoryMonitor.stop();
-    arbQueue.stop();
-    priceOracleCache?.stopBackgroundPoll();
+    await shutdown.shutdown("pipeline_runner");
   });
 }
 
@@ -1299,6 +1480,7 @@ async function main(): Promise<void> {
   if (parseBoolean(process.env.ENABLE_HEAP_SNAPSHOTS, false)) {
     scheduleHeapSnapshots({ logger });
   }
+  const unregisterSignalSnapshot = registerHeapSnapshotOnSignal({ logger });
   const metrics = createBotMetrics();
   const metricsServer = startMetricsServer(metrics, logger);
   const dryRunMode = process.argv.includes("--dry-run");
@@ -1348,6 +1530,7 @@ async function main(): Promise<void> {
   try {
     await bot.runPollingLoop({ pollIntervalMs: config.pollIntervalMs, signal: controller.signal });
   } finally {
+    unregisterSignalSnapshot();
     metricsServer.close();
   }
 }
@@ -1681,15 +1864,16 @@ function parseBoolean(value: string | undefined, fallback: boolean): boolean {
     return fallback;
   }
 
-  if (value === "true") {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") {
     return true;
   }
 
-  if (value === "false") {
+  if (normalized === "false" || normalized === "0") {
     return false;
   }
 
-  throw new Error("Boolean env vars must be true or false");
+  throw new Error(`Boolean env vars must be true or false (got ${JSON.stringify(value)})`);
 }
 
 function parseRuntimeEnv(env: Env): Env {
