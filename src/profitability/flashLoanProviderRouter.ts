@@ -44,6 +44,8 @@ export interface FlashLoanProviderRouterConfig {
 export class FlashLoanProviderRouter {
   private readonly engine: ProfitabilityEngine;
   private readonly providerFees: Partial<Record<FlashLoanProviderId, AssetAmount>>;
+  private readonly routeCache = new Map<string, { result: RouteSelectionResult; cachedAtMs: number }>();
+  private readonly routeCacheTtlMs = 30_000;
 
   public constructor(private readonly config: FlashLoanProviderRouterConfig) {
     this.providerFees = { ...config.providerFees };
@@ -55,6 +57,11 @@ export class FlashLoanProviderRouter {
   }
 
   public async selectBestRoute(input: RouteSelectionInput): Promise<RouteSelectionResult> {
+    const cacheKey = this.cacheKey(input);
+    const cached = this.routeCache.get(cacheKey);
+    if (cached !== undefined && Date.now() - cached.cachedAtMs < this.routeCacheTtlMs) {
+      return cached.result;
+    }
     const chain = this.config.registry.get(input.chain);
     if (chain.circuitBreakers.execution.status === "open") {
       this.config.logger.warn("flash_loan_route_rejected", {
@@ -62,7 +69,9 @@ export class FlashLoanProviderRouter {
         opportunityId: input.opportunityId,
         reason: "execution_circuit_open",
       });
-      return { status: "rejected", reason: "execution_circuit_open" };
+      const rejected = { status: "rejected", reason: "execution_circuit_open" } as const;
+      this.routeCache.set(cacheKey, { result: rejected, cachedAtMs: Date.now() });
+      return rejected;
     }
 
     const approved = [];
@@ -75,7 +84,9 @@ export class FlashLoanProviderRouter {
 
     const best = approved.sort((left, right) => compareProfitDescending(left.netProfit, right.netProfit))[0];
     if (best === undefined) {
-      return { status: "rejected", reason: "no_profitable_provider" };
+      const rejected = { status: "rejected", reason: "no_profitable_provider" } as const;
+      this.routeCache.set(cacheKey, { result: rejected, cachedAtMs: Date.now() });
+      return rejected;
     }
 
     this.config.logger.info("flash_loan_route_selected", {
@@ -84,12 +95,18 @@ export class FlashLoanProviderRouter {
       provider: best.provider,
       netProfitRaw: best.netProfit.raw.toString(),
     });
-    return {
+    const selected = {
       status: "selected",
       provider: best.provider,
       netProfit: best.netProfit,
       marginBps: best.marginBps,
-    };
+    } as const;
+    this.routeCache.set(cacheKey, { result: selected, cachedAtMs: Date.now() });
+    return selected;
+  }
+
+  public clearRouteCache(): void {
+    this.routeCache.clear();
   }
 
   private toSimulationInput(
@@ -106,6 +123,21 @@ export class FlashLoanProviderRouter {
       provider,
       flashLoanFee,
     };
+  }
+
+  private cacheKey(input: RouteSelectionInput): string {
+    return [
+      input.chain,
+      input.opportunityId,
+      input.revenue.raw.toString(),
+      input.debt.raw.toString(),
+      input.gas.raw.toString(),
+      input.swapCost.raw.toString(),
+      input.slippageBuffer.raw.toString(),
+      input.safetyBuffer.raw.toString(),
+      input.capitalAtRisk.raw.toString(),
+      input.minimumMarginBps.toString(),
+    ].join(":");
   }
 }
 

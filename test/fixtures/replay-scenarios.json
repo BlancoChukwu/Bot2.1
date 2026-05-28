@@ -1,0 +1,9 @@
+[
+  { "id": "liq-hf-099", "kind": "liquidation", "healthFactor": "0.99", "debtUsd": 5000 },
+  { "id": "liq-hf-098", "kind": "liquidation", "healthFactor": "0.98", "debtUsd": 12000 },
+  { "id": "liq-hf-095", "kind": "liquidation", "healthFactor": "0.95", "debtUsd": 800 },
+  { "id": "liq-dust-40", "kind": "liquidation", "healthFactor": "0.97", "debtUsd": 40 },
+  { "id": "arb-weth-usdc", "kind": "arbitrage", "pair": "WETH/USDC", "edgeBps": 12 },
+  { "id": "arb-usdc-usdt", "kind": "arbitrage", "pair": "USDC/USDT", "edgeBps": 8 },
+  { "id": "arb-cbbtc-weth", "kind": "arbitrage", "pair": "cbBTC/WETH", "edgeBps": 15 }
+]

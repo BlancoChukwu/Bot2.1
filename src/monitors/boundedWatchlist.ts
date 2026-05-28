@@ -44,6 +44,10 @@ export class BoundedWatchlist {
     return this.map.size;
   }
 
+  public remove(address: string): boolean {
+    return this.map.delete(address.toLowerCase());
+  }
+
   public entries(): ReadonlyMap<string, BoundedWatchlistEntry> {
     return this.map;
   }

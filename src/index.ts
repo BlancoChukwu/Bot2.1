@@ -36,7 +36,15 @@ import { ViemExecutionClient } from "./executors/viemExecutionClient";
 import { ParallelBroadcastClient } from "./executors/parallelBroadcastClient";
 import type { ExecutionPreflightClient } from "./executors/safeTransactionExecutor";
 import { FlashblocksPendingLogSource } from "./monitors/flashblocksPendingLogSource";
-import { getDexesForChain, getEscapeHatchPairs, getMonitoredPairsForChain } from "./config/dexRegistry";
+import {
+  getDexesForChain,
+  getEscapeHatchPairs,
+  getMonitoredPairsForChain,
+  resolveMirrorPoolsForChain,
+} from "./config/dexRegistry";
+import { AmmMirrorLogSource } from "./mirror/ammMirrorLogSource";
+import { QuoteEngine } from "./mirror/quoteEngine";
+import { NearLiquidationAcceleratedPoller } from "./monitors/nearLiquidationAcceleratedPoller";
 import { HealthFactorMonitor } from "./monitors/healthFactorMonitor";
 import { ArbitrageOpportunityQueue } from "./monitors/arbitrageOpportunityQueue";
 import { ArbitrageScanner } from "./monitors/arbitrageScanner";
@@ -815,12 +823,14 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   );
   let watchlistCoordinator: WatchlistCoordinator | undefined;
   let borrowerProvider: BorrowerSnapshotProvider = aaveSnapshotProvider;
-  const coldStartIndexer = (process.env.COLD_START_INDEXER ?? "subgraph").trim().toLowerCase();
+  const coldStartIndexer = (process.env.COLD_START_INDEXER ?? "onchain").trim().toLowerCase();
   const borrowerIndexProvider = coldStartIndexer === "envio"
     ? new EnvioBorrowerIndexProvider(protocol)
     : coldStartIndexer === "ormi"
       ? new OrmiBorrowerIndexProvider(protocol)
-      : new SubgraphBorrowerIndexProvider(protocol);
+      : coldStartIndexer === "onchain"
+        ? undefined
+        : new SubgraphBorrowerIndexProvider(protocol);
   if (useEventWatchlist) {
     watchlistCoordinator = new WatchlistCoordinator({
       chain: config.chain,
@@ -854,7 +864,8 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       onSnapshots: (snapshots) => {
         watchlistBlockHooks.upsertSnapshots?.(snapshots);
       },
-      borrowerIndexProvider,
+      ...(borrowerIndexProvider === undefined ? {} : { borrowerIndexProvider }),
+      coldStartIndexer,
       reserveAllowlist: parseWatchlistReserveAllowlist(
         process.env.WATCHLIST_RESERVE_ALLOWLIST,
         config.chain,
@@ -872,6 +883,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         "COLD_START_ON_CHAIN_MAX_BLOCKS",
       )),
       coldStartReadClient,
+      ...(parseBoolean(process.env.SKIP_COLD_START_FULL_SWEEP, false)
+        ? { skipColdStartFullSweep: true }
+        : {}),
     });
     borrowAccountHook.onBorrow = (accounts) => {
       watchlistCoordinator?.registerBorrowers(accounts);
@@ -901,6 +915,8 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   watchlistCoordinatorRef = watchlistCoordinator;
   hybridDetectionRef = hybridDetection;
   let flashblocksPendingSource: FlashblocksPendingLogSource | undefined;
+  let ammMirrorLogSource: AmmMirrorLogSource | undefined;
+  let nearLiqAcceleratedPoller: NearLiquidationAcceleratedPoller | undefined;
   if (useEventWatchlist && config.flashblocksEnabled) {
     const flashblocksRpc = optionalEnv(process.env, "FLASHBLOCKS_RPC_URL") ?? config.executionRpcUrlPrimary;
     const flashblocksClient = createFailoverPublicClient({
@@ -932,6 +948,13 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     metrics,
     simulator,
   });
+  const useLocalMirror = (process.env.USE_LOCAL_MIRROR ?? "false").trim().toLowerCase() === "true";
+  const quoteEngine = new QuoteEngine({
+    logger,
+    useLocalMirror,
+    logArbDebug: parseBoolean(process.env.LOG_ARB_DEBUG, false),
+    chainHead: () => publicClient.getBlockNumber(),
+  });
   const pnlTracker = config.dailyPnlCsvPath === undefined ? undefined : new PnlTracker(config.dailyPnlCsvPath);
   let lastSummaryDay = "";
   const arbitrageScanner = new ArbitrageScanner({
@@ -940,6 +963,8 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     logger,
     metrics,
     logArbDebug: parseBoolean(process.env.LOG_ARB_DEBUG, false),
+    useLocalMirror,
+    quoteEngine,
     publicClientFactory: (chain) =>
       createFailoverPublicClient({
         chain,
@@ -987,6 +1012,51 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       await watchlistCoordinator.start();
     }
     flashblocksPendingSource?.start();
+    if (useLocalMirror && config.wsRpcUrlPrimary !== undefined) {
+      const mirrorPools = resolveMirrorPoolsForChain(config.chain);
+      ammMirrorLogSource = new AmmMirrorLogSource({
+        chain: config.chain,
+        pools: mirrorPools,
+        wsClient: eventClient as unknown as PublicClient,
+        logger,
+        metrics,
+      });
+      ammMirrorLogSource.start();
+    }
+    if (watchlistCoordinator !== undefined) {
+      const nearLiqAccounts = (process.env.NEAR_LIQ_ACCELERATED_ACCOUNTS ?? "")
+        .split(",")
+        .map((part) => part.trim())
+        .filter((part) => /^0x[a-fA-F0-9]{40}$/.test(part));
+      const tracked = nearLiqAccounts.length > 0
+        ? nearLiqAccounts
+        : [
+          "0xf109945302561dcbf6bede6a33f36602ae9537c0",
+          "0xa7ac810c71781482427ebd7d98255acb0e0375d6",
+          "0x675c8697949e0cc6269e8625d805a2749fad6707",
+          "0x8b81420441ac3933c58d1190c8499c2f89eb1263",
+          "0x2E09f38C7d8B3B89b984D77F1a109F44afc79950",
+        ];
+      nearLiqAcceleratedPoller = new NearLiquidationAcceleratedPoller({
+        chain: config.chain,
+        poolAddress: activePoolAddress,
+        client: publicClient as unknown as PublicClient,
+        logger,
+        pollIntervalMs: parseMinNumber(process.env.NEAR_LIQ_POLL_MS, 200, 50, "NEAR_LIQ_POLL_MS"),
+        resolveGasCostUsd: resolveDynamicGasCostUsd,
+        onUrgentAccounts: async (accounts, meta) => {
+          logger.info("near_liq_urgent_eval_trigger", { ...meta, accounts });
+          watchlistCoordinator.registerBorrowers(accounts);
+          const snapshots = await watchlistCoordinator.refreshWatchlistBorrowers(config.chain, accounts);
+          for (const snapshot of snapshots) {
+            hybridDetection.cache.upsert(snapshot);
+          }
+          await orchestrator.runOnce();
+        },
+      });
+      nearLiqAcceleratedPoller.setAccounts(tracked as Address[]);
+      nearLiqAcceleratedPoller.start();
+    }
     const resolvedFlashLoanFeeBps = await resolveFlashLoanFeeBps();
     router.setProviderFee(
       "aaveV3",
@@ -1195,6 +1265,8 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   });
   shutdown.addHook("watchlist_rescanner_stop", async () => watchlistRescanner?.stop());
   shutdown.addHook("flashblocks_pending_stop", async () => flashblocksPendingSource?.stop());
+  shutdown.addHook("amm_mirror_log_stop", async () => ammMirrorLogSource?.stop());
+  shutdown.addHook("near_liq_accelerated_stop", async () => nearLiqAcceleratedPoller?.stop());
   shutdown.addHook("watchlist_coordinator_stop", async () => watchlistCoordinator?.stop());
   shutdown.addHook("hybrid_detection_drain", async () => hybridDetection.drain());
   shutdown.addHook("memory_monitor_stop", async () => memoryMonitor.stop());

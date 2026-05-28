@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  liquidator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      NODE_OPTIONS: --max-old-space-size=650 --expose-gc
+      RUST_HOTPATH_ENABLED: "false"
+      FLASHBLOCKS_ENABLED: "true"
+      USE_PIPELINE_ORCHESTRATOR: "true"
+      CHAIN: base
+    ports:
+      - "9090:9090"
+    mem_limit: 1100m
+    restart: unless-stopped

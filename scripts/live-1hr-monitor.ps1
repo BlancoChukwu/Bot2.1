@@ -52,7 +52,7 @@ Write-ReportLine "err=$errFile"
 Write-ReportLine "critical_watch_poll_sec=$watchPollSec"
 
 $env:SIMULATION_MODE = "false"
-$env:NODE_OPTIONS = "--max-old-space-size=768 --expose-gc"
+$env:NODE_OPTIONS = "--max-old-space-size=650 --expose-gc"
 if (-not $env:SKIP_DEPLOYMENT_SAFETY_GATE) {
   Write-ReportLine "safety_gate=enabled (set SKIP_DEPLOYMENT_SAFETY_GATE=1 to bypass dry-run receipt)"
 }

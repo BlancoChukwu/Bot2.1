@@ -35,22 +35,24 @@ for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss
 set LOGFILE=logs\%BOT_LOG_PREFIX%-%LOGSTAMP%.log
 set ERRFILE=logs\%BOT_LOG_PREFIX%-%LOGSTAMP%.err.log
 
+call "%~dp0preflight-production-env.cmd"
+call "%~dp0write-launch-session.cmd"
+if errorlevel 1 goto :failed
+
 (
   echo log=%LOGFILE%
   echo err=%ERRFILE%
   echo started=%LOGSTAMP%
   echo prefix=%BOT_LOG_PREFIX%
   echo detached=true
+  echo child_script=scripts\run-bot-detached-child.cmd
+  echo node_options=%NODE_OPTIONS%
+  echo rust_hotpath=%RUST_HOTPATH_ENABLED%
+  echo simulation_mode=%SIMULATION_MODE%
+  echo skip_deployment_gate=%SKIP_DEPLOYMENT_SAFETY_GATE%
 ) > logs\latest-session.txt
 
-if not defined NODE_OPTIONS set NODE_OPTIONS=--max-old-space-size=768 --expose-gc
-
 chcp 65001>nul
-if "%USE_START_LIVE%"=="1" (
-  set RUN_CMD=call npm run start:live
-) else (
-  set RUN_CMD=node dist\src\index.js
-)
 
 echo.
 echo Launching bot in a detached window (survives parent shell exit)...
@@ -61,15 +63,25 @@ echo Tail: Get-Content "%LOGFILE%" -Wait -Tail 20
 echo Stop: npm run bot:stop
 echo.
 
-set "DETACHED_CMD=cd /d "%CD%" && %RUN_CMD% >> "%LOGFILE%" 2>> "%ERRFILE%""
-start "%BOT_WINDOW_TITLE%" /MIN cmd /c "%DETACHED_CMD%"
+set "CHILD_LAUNCHER=%~dp0run-bot-detached-child.cmd"
+start "" /MIN cmd /c ""%CHILD_LAUNCHER%""
 
+echo Waiting for bot to start...
+call node scripts\verify-bot-launch.mjs "%LOGFILE%"
+if errorlevel 1 (
+  echo.
+  echo Launch verification failed. Open logs\latest-session.txt for paths.
+  goto :failed
+)
+
+echo.
 echo Detached bot started. This launcher window can close safely.
 goto :done
 
 :failed
 echo.
 echo Startup failed. See messages above.
+pause
 exit /b 1
 
 :done

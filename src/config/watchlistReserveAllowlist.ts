@@ -1,0 +1,34 @@
+import type { Address } from "viem";
+import { getChainConfig, type SupportedChain } from "./chains";
+
+const baseUsdt = "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2";
+const baseCbBtc = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
+
+const symbolToBaseAddress: Record<string, Address> = {
+  WETH: "0x4200000000000000000000000000000000000006",
+  USDC: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  USDT: baseUsdt,
+  CBBTC: baseCbBtc,
+  BTC: baseCbBtc,
+};
+
+export function parseWatchlistReserveAllowlist(
+  raw: string | undefined,
+  chain: SupportedChain,
+): readonly Address[] {
+  if (raw === undefined || raw.trim() === "") {
+    return defaultAllowlistForChain(chain);
+  }
+  const symbols = raw.split(",").map((part) => part.trim().toUpperCase()).filter(Boolean);
+  const addresses = symbols.map((symbol) => symbolToBaseAddress[symbol]).filter((addr): addr is Address => addr !== undefined);
+  return addresses.length > 0 ? addresses : defaultAllowlistForChain(chain);
+}
+
+function defaultAllowlistForChain(chain: SupportedChain): readonly Address[] {
+  if (chain !== "base") {
+    return [];
+  }
+  const config = getChainConfig(chain);
+  const fromPairs = config.aave.reservePairs.flatMap((pair) => [pair.collateralAsset, pair.debtAsset]);
+  return [...new Set([...fromPairs, baseUsdt, baseCbBtc])] as readonly Address[];
+}

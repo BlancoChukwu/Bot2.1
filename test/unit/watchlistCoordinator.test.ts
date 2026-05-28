@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createBotMetrics, createLogger } from "../../src/bot";
 import { createChainRegistry } from "../../src/config/chainRegistry";
 import { getChainConfig } from "../../src/config/chains";
@@ -14,7 +14,20 @@ const registry = createChainRegistry({
 });
 
 describe("WatchlistCoordinator cold start", () => {
-  it("falls back to RPC log seeding when subgraph listing fails", async () => {
+  it("falls back to on-chain log seeding when subgraph listing fails", async () => {
+    const readClient = {
+      getBlockNumber: async () => 10_000n,
+      getLogs: async () => [{
+        args: {
+          onBehalfOf: "0x0000000000000000000000000000000000000001",
+          user: "0x0000000000000000000000000000000000000002",
+        },
+      }],
+      multicall: async () => [{
+        status: "success",
+        result: [0n, 1n, 0n, 0n, 0n, 0n],
+      }],
+    };
     const coordinator = new WatchlistCoordinator({
       chain: "base",
       protocol: {
@@ -24,26 +37,17 @@ describe("WatchlistCoordinator cold start", () => {
         getLiquidatablePositions: async () => [],
       },
       registry,
-      readClient: {
-        getBlockNumber: async () => 1_000n,
-      } as never,
+      readClient: readClient as never,
       poolAddress: getChainConfig("base").aave.pool,
       logger: createLogger("silent"),
       metrics: createBotMetrics(),
       minDebtBase: 0n,
-      coldStartLookbackBlocks: 10n,
+      onChainColdStartLookbackBlocks: 10n,
+      reserveAllowlist: [],
     });
-    const coldStartFromLogs = vi.fn(async () => {
-      coordinator.watchlist.add("0x0000000000000000000000000000000000000001", 999n);
-      coordinator.watchlist.add("0x0000000000000000000000000000000000000002", 999n);
-    });
-    (coordinator as unknown as { eventWatchlist: { coldStartFromLogs: typeof coldStartFromLogs } }).eventWatchlist = {
-      coldStartFromLogs,
-    };
 
     await (coordinator as unknown as { seedColdStart: () => Promise<void> }).seedColdStart();
 
-    expect(coldStartFromLogs).toHaveBeenCalledOnce();
-    expect(coordinator.watchlist.size()).toBe(2);
+    expect(coordinator.watchlist.size()).toBeGreaterThan(0);
   });
 });

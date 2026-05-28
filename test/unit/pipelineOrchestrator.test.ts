@@ -116,7 +116,19 @@ describe("PipelineOrchestrator", () => {
 
     const summary = await orchestrator.runOnce();
 
-    expect(summary).toEqual({ scanned: 1, attempted: 1, sent: 1, simulated: 0, rejected: 0, failed: 0, deadLetters: 0 });
+    expect(summary).toEqual({
+      scanned: 1,
+      attempted: 1,
+      sent: 1,
+      simulated: 0,
+      rejected: 0,
+      failed: 0,
+      deadLetters: 0,
+      revenue_this_cycle: 0,
+      evaluations: 0,
+      sims: 0,
+      opps_per_block: 0,
+    });
     expect(executed[0]?.account).toBe(account);
   });
 

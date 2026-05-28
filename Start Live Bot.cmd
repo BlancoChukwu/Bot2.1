@@ -16,6 +16,8 @@ echo Logs: logs\latest-session.txt
 echo Stop: Stop Bot.cmd (graceful) or npm run bot:stop
 echo.
 
+call scripts\preflight-production-env.cmd
+
 set BOT_LOG_PREFIX=live-tsnode
 set BOT_WINDOW_TITLE=Aave Liquidator - Live (ts-node)
 set USE_START_LIVE=1

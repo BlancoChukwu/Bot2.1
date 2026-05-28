@@ -5,9 +5,15 @@ import { aavePoolAbi } from "../protocols/aaveV3";
 import type { BotMetrics, LoggerLike } from "../bot";
 import type { DetectionEventHandlers, DetectionEventSource } from "./hybridDetectionPipeline";
 import { BayesianHazardModel, FtrlOpportunityRanker } from "../optimization/hazardPrediction";
+import { FixedSizeDedupe } from "../utils/fixedSizeDedupe";
+import { extractBorrowerAddressesFromLog } from "./borrowerLogExtract";
 
-const trackedEvents = ["ReserveDataUpdated", "Borrow", "Supply", "Repay", "Withdraw"] as const;
+const trackedEvents = ["ReserveDataUpdated", "Borrow", "Supply", "Repay", "Withdraw", "LiquidationCall"] as const;
 type TrackedEventName = (typeof trackedEvents)[number];
+const defaultHeartbeatTimeoutMs = 30_000;
+const defaultMaxReconnectDelayMs = 30_000;
+const providerPromoteIntervalMs = 30_000;
+const dedupeCapacity = 1_000;
 
 interface ProviderState {
   readonly name: string;
@@ -26,17 +32,29 @@ export interface MultiWsEventSourceConfig {
   readonly logger: LoggerLike;
   readonly metrics: BotMetrics;
   readonly onBlock?: (blockNumber: bigint) => void;
+  readonly onBorrowerAccounts?: (accounts: readonly Address[]) => void | Promise<void>;
+  readonly heartbeatTimeoutMs?: number;
+  readonly maxReconnectDelayMs?: number;
 }
 
 export class MultiWsEventSource implements DetectionEventSource {
-  private readonly dedupe = new Set<string>();
+  private readonly dedupe = new FixedSizeDedupe(dedupeCapacity);
+  // Ancillary metadata should not retain objects beyond log handling.
+  private readonly logMeta = new WeakMap<object, { receivedAtMs: number }>();
   private readonly providerStates = new Map<string, ProviderState>();
   private readonly stopFns: Array<() => void> = [];
+  private readonly providerStopFns = new Map<string, Array<() => void>>();
   private readonly reconnectTimers: NodeJS.Timeout[] = [];
   private readonly wsClients: unknown[] = [];
   private readonly readClient;
   private readonly model = new BayesianHazardModel();
   private readonly ftrl = new FtrlOpportunityRanker({ model: this.model });
+  private readonly reconnectAttemptByProvider = new Map<string, number>();
+  private readonly heartbeatByProvider = new Map<string, number>();
+  private readonly endpointUrls: Array<{ readonly name: string; readonly wsUrl: string }> = [];
+  private promoteTimer: NodeJS.Timeout | undefined;
+  private activeHandlers: DetectionEventHandlers | undefined;
+  private primaryProviderName = "primary";
 
   public constructor(private readonly config: MultiWsEventSourceConfig) {
     const entry = config.registry.get(config.chain);
@@ -49,9 +67,11 @@ export class MultiWsEventSource implements DetectionEventSource {
 
   public async start(handlers: DetectionEventHandlers): Promise<() => void> {
     const endpoints = this.wsEndpoints();
+    this.endpointUrls.splice(0, this.endpointUrls.length, ...endpoints);
     if (endpoints.length === 0) {
       throw new Error("MultiWsEventSource requires at least one detection websocket endpoint");
     }
+    this.activeHandlers = handlers;
     for (const endpoint of endpoints) {
       this.providerStates.set(endpoint.name, {
         ...endpoint,
@@ -63,9 +83,59 @@ export class MultiWsEventSource implements DetectionEventSource {
         lastFlashblockLeadMs: 0,
       });
       this.seedProvider(endpoint.name);
-      this.subscribeProvider(endpoint.name, endpoint.wsUrl, handlers, endpoint.name === "primary");
+      this.subscribeProvider(
+        endpoint.name,
+        endpoint.wsUrl,
+        handlers,
+        endpoint.name === this.primaryProviderName,
+      );
     }
+    this.promoteTimer = setInterval(() => {
+      this.promoteBestProvider();
+    }, providerPromoteIntervalMs);
+    this.promoteTimer.unref?.();
     return () => this.stopAll();
+  }
+
+  private promoteBestProvider(): void {
+    if (this.providerStates.size <= 1 || this.activeHandlers === undefined) {
+      return;
+    }
+    const ranked = [...this.providerStates.values()]
+      .sort((left, right) => {
+        const leftLead = left.lastFlashblockLeadMs > 0 ? left.lastFlashblockLeadMs : 9_999;
+        const rightLead = right.lastFlashblockLeadMs > 0 ? right.lastFlashblockLeadMs : 9_999;
+        if (left.score !== right.score) {
+          return right.score - left.score;
+        }
+        if (leftLead !== rightLead) {
+          return leftLead - rightLead;
+        }
+        return right.eventCount - left.eventCount;
+      });
+    const best = ranked[0];
+    if (best === undefined || best.name === this.primaryProviderName) {
+      return;
+    }
+    const previous = this.primaryProviderName;
+    this.primaryProviderName = best.name;
+    this.config.logger.info("ws_provider_promoted", {
+      chain: this.config.chain,
+      previous,
+      promoted: best.name,
+      score: best.score,
+      lastFlashblockLeadMs: best.lastFlashblockLeadMs,
+      eventCount: best.eventCount,
+    });
+    for (const endpoint of this.endpointUrls) {
+      this.stopProviderSubscriptions(endpoint.name);
+      this.subscribeProvider(
+        endpoint.name,
+        endpoint.wsUrl,
+        this.activeHandlers,
+        endpoint.name === this.primaryProviderName,
+      );
+    }
   }
 
   private wsEndpoints(): Array<{ readonly name: string; readonly wsUrl: string }> {
@@ -83,6 +153,7 @@ export class MultiWsEventSource implements DetectionEventSource {
     handlers: DetectionEventHandlers,
     isPrimary = false,
   ): void {
+    this.stopProviderSubscriptions(providerName);
     const chainEntry = this.config.registry.get(this.config.chain);
     const poolAddress = this.config.registry.getResolvedAave(this.config.chain).pool;
     const flashblocks = chainEntry.detection.flashblocksEnabled ? "enabled" : "disabled";
@@ -94,6 +165,7 @@ export class MultiWsEventSource implements DetectionEventSource {
         abi: aavePoolAbi,
         eventName,
         onLogs: async (logs) => {
+          this.heartbeatByProvider.set(providerName, Date.now());
           await this.handleLogs(providerName, eventName, logs, handlers);
         },
         onError: (error) => {
@@ -115,12 +187,16 @@ export class MultiWsEventSource implements DetectionEventSource {
       });
       if (stop !== undefined) {
         this.stopFns.push(stop);
+        const scoped = this.providerStopFns.get(providerName) ?? [];
+        scoped.push(stop);
+        this.providerStopFns.set(providerName, scoped);
       }
     }
     const flashblocksEnabled = this.config.registry.get(this.config.chain).detection.flashblocksEnabled;
     if (flashblocksEnabled) {
       const stopFlash = wsClient.watchBlockNumber?.({
         onBlockNumber: async (blockNumber) => {
+          this.heartbeatByProvider.set(providerName, Date.now());
           const started = Date.now();
           const logs = await this.readClient.getLogs({
             address: poolAddress,
@@ -143,26 +219,56 @@ export class MultiWsEventSource implements DetectionEventSource {
       });
       if (stopFlash !== undefined) {
         this.stopFns.push(stopFlash);
+        const scoped = this.providerStopFns.get(providerName) ?? [];
+        scoped.push(stopFlash);
+        this.providerStopFns.set(providerName, scoped);
       }
     }
     if (isPrimary && this.config.onBlock !== undefined) {
       const stopHeads = wsClient.watchBlockNumber?.({
         onBlockNumber: (blockNumber) => {
+          this.heartbeatByProvider.set(providerName, Date.now());
           this.config.onBlock?.(blockNumber);
         },
         onError: (error) => handlers.onError(this.config.chain, error),
       });
       if (stopHeads !== undefined) {
         this.stopFns.push(stopHeads);
+        const scoped = this.providerStopFns.get(providerName) ?? [];
+        scoped.push(stopHeads);
+        this.providerStopFns.set(providerName, scoped);
       }
     }
+    const heartbeatTimer = setInterval(() => {
+      const last = this.heartbeatByProvider.get(providerName) ?? 0;
+      const elapsed = Date.now() - last;
+      const heartbeatTimeoutMs = this.config.heartbeatTimeoutMs ?? defaultHeartbeatTimeoutMs;
+      if (elapsed < heartbeatTimeoutMs) {
+        return;
+      }
+      this.config.logger.warn("ws_heartbeat_missed", {
+        chain: this.config.chain,
+        provider: providerName,
+        elapsedMs: elapsed,
+      });
+      this.scheduleReconnect(providerName, wsUrl, handlers);
+    }, this.config.heartbeatTimeoutMs ?? defaultHeartbeatTimeoutMs);
+    heartbeatTimer.unref?.();
+    this.reconnectTimers.push(heartbeatTimer);
   }
 
   private scheduleReconnect(providerName: string, wsUrl: string, handlers: DetectionEventHandlers): void {
-    const jitter = Math.floor(Math.random() * 150);
+    const attempts = (this.reconnectAttemptByProvider.get(providerName) ?? 0) + 1;
+    this.reconnectAttemptByProvider.set(providerName, attempts);
+    const maxReconnectDelayMs = this.config.maxReconnectDelayMs ?? defaultMaxReconnectDelayMs;
+    const baseDelay = Math.min(500 * (2 ** (attempts - 1)), maxReconnectDelayMs);
+    const jitter = Math.floor(Math.random() * 250);
     const timer = setTimeout(() => {
-      this.subscribeProvider(providerName, wsUrl, handlers, providerName === "primary");
-    }, 500 + jitter);
+      this.stopProviderSubscriptions(providerName);
+      const alternate = this.pickAlternateEndpoint(providerName, wsUrl);
+      this.reconnectAttemptByProvider.set(providerName, 0);
+      this.subscribeProvider(alternate.name, alternate.wsUrl, handlers, alternate.name === "primary");
+    }, baseDelay + jitter);
     this.reconnectTimers.push(timer);
   }
 
@@ -190,19 +296,19 @@ export class MultiWsEventSource implements DetectionEventSource {
         readonly args?: { readonly reserve?: Address };
       };
       const reserve = shaped.args?.reserve;
+      if (eventName === "Borrow" || eventName === "LiquidationCall" || eventName === "Repay") {
+        const borrowers = extractBorrowerAddressesFromLog(shaped as never);
+        if (borrowers.length > 0) {
+          void this.config.onBorrowerAccounts?.(borrowers);
+        }
+      }
       if (reserve === undefined) {
         continue;
       }
-      const dedupeKey = `${shaped.blockHash ?? "na"}:${shaped.transactionHash ?? "na"}:${String(shaped.logIndex ?? "na")}`;
-      if (this.dedupe.has(dedupeKey)) {
+      const dedupeKey = `${shaped.transactionHash ?? "na"}-${String(shaped.logIndex ?? "na")}`;
+      this.logMeta.set(shaped as object, { receivedAtMs: receivedAt });
+      if (!this.dedupe.add(dedupeKey)) {
         continue;
-      }
-      this.dedupe.add(dedupeKey);
-      if (this.dedupe.size > 50_000) {
-        const first = this.dedupe.values().next().value;
-        if (first !== undefined) {
-          this.dedupe.delete(first);
-        }
       }
       provider.eventCount += 1;
       provider.lastEventToDetectionMs = Math.max(1, Date.now() - receivedAt);
@@ -265,12 +371,20 @@ export class MultiWsEventSource implements DetectionEventSource {
   }
 
   private stopAll(): void {
+    if (this.promoteTimer !== undefined) {
+      clearInterval(this.promoteTimer);
+      this.promoteTimer = undefined;
+    }
     for (const stop of this.stopFns.splice(0)) {
       stop();
     }
     for (const timer of this.reconnectTimers.splice(0)) {
       clearTimeout(timer);
     }
+    this.reconnectAttemptByProvider.clear();
+    this.heartbeatByProvider.clear();
+    this.providerStopFns.clear();
+    this.dedupe.clear();
     for (const client of this.wsClients.splice(0)) {
       try {
         const typed = client as {
@@ -285,6 +399,28 @@ export class MultiWsEventSource implements DetectionEventSource {
         // best-effort teardown to avoid leaked websocket handles in tests/runs
       }
     }
+  }
+
+  private pickAlternateEndpoint(
+    failedName: string,
+    failedUrl: string,
+  ): { readonly name: string; readonly wsUrl: string } {
+    const candidates = this.endpointUrls.filter((entry) => entry.wsUrl !== failedUrl);
+    if (candidates.length === 0) {
+      return { name: failedName, wsUrl: failedUrl };
+    }
+    const failedHost = hostFromUrl(failedUrl);
+    const crossVendor = candidates.find((entry) => hostFromUrl(entry.wsUrl) !== failedHost);
+    return crossVendor ?? candidates[0]!;
+  }
+
+  private stopProviderSubscriptions(_providerName: string): void {
+    const providerStops = this.providerStopFns.get(_providerName) ?? [];
+    for (const stop of providerStops) {
+      stop();
+    }
+    this.providerStopFns.delete(_providerName);
+    this.stopFns.splice(0, this.stopFns.length, ...this.stopFns.filter((fn) => !providerStops.includes(fn)));
   }
 
   private seedProvider(providerName: string): void {
@@ -320,5 +456,13 @@ export class MultiWsEventSource implements DetectionEventSource {
     ]);
     const top = ranked[0]?.opportunityId;
     return top === providerName ? 0.3 : 0;
+  }
+}
+
+function hostFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return url.toLowerCase();
   }
 }

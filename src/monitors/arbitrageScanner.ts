@@ -21,44 +21,7 @@ import {
   type ProfitSimulationInput,
   type ProfitabilityResult,
 } from "../profitability/profitabilityEngine";
-
-const ROUTER_ABI = [
-  {
-    inputs: [
-      { name: "amountIn", type: "uint256" },
-      { name: "path", type: "address[]" },
-    ],
-    name: "getAmountsOut",
-    outputs: [{ name: "amounts", type: "uint256[]" }],
-    stateMutability: "view",
-    type: "function",
-  },
-] as const;
-
-const QUOTER_V2_ABI = [
-  {
-    name: "quoteExactInputSingle",
-    type: "function",
-    stateMutability: "view",
-    inputs: [{
-      components: [
-        { name: "tokenIn", type: "address" },
-        { name: "tokenOut", type: "address" },
-        { name: "amountIn", type: "uint256" },
-        { name: "fee", type: "uint24" },
-        { name: "sqrtPriceLimitX96", type: "uint160" },
-      ],
-      name: "params",
-      type: "tuple",
-    }],
-    outputs: [
-      { name: "amountOut", type: "uint256" },
-      { name: "sqrtPriceX96After", type: "uint160" },
-      { name: "initializedTicksCrossed", type: "uint32" },
-      { name: "gasEstimate", type: "uint256" },
-    ],
-  },
-] as const;
+import { QuoteEngine } from "../mirror/quoteEngine";
 
 export interface DexConfig {
   readonly name: string;
@@ -141,6 +104,8 @@ export interface ArbitrageScannerConfig {
   readonly nativeGasTokenDecimalsByChain?: Readonly<Record<SupportedChain, number>>;
   readonly exactUsdMinProfitRaw?: bigint;
   readonly quoteConcurrency?: number;
+  readonly quoteEngine?: QuoteEngine;
+  readonly useLocalMirror?: boolean;
 }
 
 export class ArbitrageScanner {
@@ -160,6 +125,7 @@ export class ArbitrageScanner {
     readonly nativeGasTokenDecimalsByChain: Readonly<Record<SupportedChain, number>>;
     readonly exactUsdMinProfitRaw: bigint;
     readonly quoteConcurrency: number;
+    readonly quoteEngine: QuoteEngine;
   };
   private readonly activePolls = new Map<SupportedChain, NodeJS.Timeout>();
   private readonly dedupe = new Map<string, number>();
@@ -193,6 +159,12 @@ export class ArbitrageScanner {
       exactUsdMinProfitRaw: config.exactUsdMinProfitRaw ?? 15_000_000n,
       quoteConcurrency: Math.max(1, config.quoteConcurrency ?? 4),
       ...config,
+      quoteEngine: config.quoteEngine ?? new QuoteEngine({
+        logger: config.logger,
+        useLocalMirror: config.useLocalMirror
+          ?? (process.env.USE_LOCAL_MIRROR ?? "false").trim().toLowerCase() === "true",
+        ...(config.logArbDebug === undefined ? {} : { logArbDebug: config.logArbDebug }),
+      }),
     };
   }
 
@@ -673,49 +645,7 @@ export class ArbitrageScanner {
     tokenOut: Address,
     amountIn: bigint,
   ): Promise<bigint> {
-    let amountOut: bigint;
-    let quoteSource: "quoterV2" | "getAmountsOut";
-    if (dex.quoterV2 !== undefined) {
-      const quoted = await client.readContract({
-        address: dex.quoterV2,
-        abi: QUOTER_V2_ABI,
-        functionName: "quoteExactInputSingle",
-        args: [{
-          tokenIn,
-          tokenOut,
-          amountIn,
-          fee: dex.quoterPoolFee ?? 3_000,
-          sqrtPriceLimitX96: 0n,
-        }],
-      }) as readonly [bigint, bigint, number, bigint];
-      amountOut = quoted[0];
-      quoteSource = "quoterV2";
-    } else {
-      const amounts = await client.readContract({
-        address: dex.router,
-        abi: ROUTER_ABI,
-        functionName: "getAmountsOut",
-        args: [amountIn, [tokenIn, tokenOut]],
-      }) as readonly bigint[];
-      const out = amounts[1];
-      if (out === undefined) {
-        throw new Error("Malformed getAmountsOut output");
-      }
-      amountOut = out;
-      quoteSource = "getAmountsOut";
-    }
-    if (this.config.logArbDebug) {
-      this.config.logger.info("arbitrage_quote_debug", {
-        dex: dex.name,
-        quoteSource,
-        tokenIn,
-        tokenOut,
-        amountIn: amountIn.toString(),
-        amountOut: amountOut.toString(),
-        ...(quoteSource === "quoterV2" ? { quoterPoolFee: dex.quoterPoolFee ?? 3_000 } : {}),
-      });
-    }
-    return amountOut;
+    return this.config.quoteEngine.quoteAmountOut(client, dex, tokenIn, tokenOut, amountIn);
   }
 
   private pruneDedupe(nowMs: number): void {

@@ -43,6 +43,7 @@ let dustBurstViolations = 0;
 let firstTs;
 let lastTs;
 let parseErrors = 0;
+const rssSamples = [];
 
 function recordTime(iso) {
   if (iso === undefined) return;
@@ -99,6 +100,9 @@ for (const rawLine of readLogLines(logPath)) {
       break;
     case "memory_stats":
       counts.memory_stats += 1;
+      if (typeof row.rssMb === "number" && Number.isFinite(row.rssMb) && typeof timeMs === "number") {
+        rssSamples.push({ timeMs, rssMb: row.rssMb });
+      }
       break;
     case "liquidation_dust_filtered":
       counts.liquidation_dust_filtered += 1;
@@ -184,6 +188,12 @@ const metrics = [
     detail: `${counts.memory_stats} samples, ceiling_hits=${counts.memory_ceiling_hit}, warnings=${counts.memory_warning}`,
   },
   {
+    id: 8,
+    name: "memory_rss_growth_rate",
+    pass: rssGrowthMbPerHour(rssSamples) < 10,
+    detail: `${rssGrowthMbPerHour(rssSamples).toFixed(2)} MB/hour (limit < 10 MB/hour)`,
+  },
+  {
     id: 5,
     name: "log_size_under_25mb",
     pass: logSizeBytes <= maxLogBytes,
@@ -206,3 +216,16 @@ const audit = {
 };
 
 console.log(JSON.stringify(audit, null, 2));
+
+function rssGrowthMbPerHour(samples) {
+  if (samples.length < 2) {
+    return 0;
+  }
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const elapsedHours = (last.timeMs - first.timeMs) / 3_600_000;
+  if (!Number.isFinite(elapsedHours) || elapsedHours <= 0) {
+    return 0;
+  }
+  return (last.rssMb - first.rssMb) / elapsedHours;
+}

@@ -13,6 +13,7 @@ export interface MemoryMonitorConfig {
   readonly onRssSample?: (rssBytes: number) => void;
   readonly onCeilingHit?: () => void;
   readonly exitProcess?: (code: number) => never;
+  readonly componentCounters?: () => Record<string, number>;
 }
 
 export interface MemorySampleResult {
@@ -25,6 +26,7 @@ export interface MemorySampleResult {
 export interface MemoryMonitorHandle {
   stop(): void;
   checkNow(): MemorySampleResult;
+  emitStatsNow(): MemorySampleResult;
 }
 
 export function sampleMemoryUsage(config: {
@@ -70,6 +72,7 @@ function applyMemorySample(
       heapUsedMb: sample.heapUsedMb,
       heapTotalMb: sample.heapTotalMb,
       rssMb: sample.rssMb,
+      ...(config.componentCounters === undefined ? {} : { components: config.componentCounters() }),
     });
   }
   if (rssWarnBytes !== undefined && rss > rssWarnBytes && heapUsed <= warnBytes) {
@@ -112,6 +115,9 @@ export function startMemoryMonitor(config: MemoryMonitorConfig): MemoryMonitorHa
     },
     checkNow() {
       return applyMemorySample(config, warnBytes, ceilBytes, rssWarnBytes, false);
+    },
+    emitStatsNow() {
+      return applyMemorySample(config, warnBytes, ceilBytes, rssWarnBytes, true);
     },
   };
 }

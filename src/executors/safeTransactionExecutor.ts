@@ -3,6 +3,7 @@ import type { BotMetrics, LoggerLike } from "../bot";
 import type { ChainRegistry, FlashLoanProviderId } from "../config/chainRegistry";
 import type { SupportedChain } from "../config/chains";
 import type { RouteSelectionInput, RouteSelectionResult } from "../profitability/flashLoanProviderRouter";
+import { resolveLiquidationGasLimit } from "../config/liquidationGasLimits";
 import type { LocalNonceManager, NonceReservation } from "./nonceManager";
 
 export interface TransactionEnvelope {
@@ -72,6 +73,11 @@ export interface SafeExecutionRequest {
   readonly opportunityId: string;
   readonly gasProfileKey: string;
   readonly routeInput: RouteSelectionInput;
+  readonly gasLimitHint?: {
+    readonly collateralAsset: Address;
+    readonly debtAsset: Address;
+    readonly usesFlashWrapper: boolean;
+  };
   buildTransaction(route: SelectedRoute): TransactionEnvelope;
   buildFlashLoanPreviewTransaction?(route: SelectedRoute): TransactionEnvelope;
 }
@@ -241,6 +247,33 @@ export class SafeTransactionExecutor {
       return cached.gasLimit;
     }
 
+    if (request.gasLimitHint !== undefined) {
+      const table = resolveLiquidationGasLimit({
+        collateralAsset: request.gasLimitHint.collateralAsset,
+        debtAsset: request.gasLimitHint.debtAsset,
+        provider: transaction.provider,
+        usesFlashWrapper: request.gasLimitHint.usesFlashWrapper,
+      });
+      if (table.fromTable) {
+        cache.set(request.gasProfileKey, { gasLimit: table.gasLimit, updatedAtMs: Date.now() });
+        return table.gasLimit;
+      }
+      cache.set(request.gasProfileKey, { gasLimit: table.gasLimit, updatedAtMs: Date.now() });
+      this.config.logger.info("liquidation_gas_limit_table_default", {
+        chain: request.chain,
+        opportunityId: request.opportunityId,
+        gasLimit: table.gasLimit.toString(),
+        provider: transaction.provider,
+      });
+      return table.gasLimit;
+    }
+
+    this.config.logger.warn("liquidation_gas_estimate_fallback", {
+      chain: request.chain,
+      opportunityId: request.opportunityId,
+      gasProfileKey: request.gasProfileKey,
+    });
+    this.config.metrics.recordError();
     const gasLimit = await this.config.client.estimateGas(transaction);
     cache.set(request.gasProfileKey, { gasLimit, updatedAtMs: Date.now() });
     return gasLimit;

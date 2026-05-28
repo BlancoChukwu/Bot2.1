@@ -1,5 +1,5 @@
 /** Parse `--max-old-space-size=<mb>` from NODE_OPTIONS for memory guard tuning. */
-export function parseMaxOldSpaceSizeMb(fallbackMb = 768): number {
+export function parseMaxOldSpaceSizeMb(fallbackMb = 650): number {
   const options = process.env.NODE_OPTIONS ?? "";
   const match = /--max-old-space-size=(\d+)/.exec(options);
   if (match === null) {
@@ -16,6 +16,6 @@ export function memoryLimitsFromNodeHeap(maxHeapMb = parseMaxOldSpaceSizeMb()): 
 } {
   const warnBytes = Math.floor(maxHeapMb * 0.72) * 1024 * 1024;
   const ceilBytes = Math.floor(maxHeapMb * 0.9) * 1024 * 1024;
-  const rssWarnBytes = 600 * 1024 * 1024;
+  const rssWarnBytes = 380 * 1024 * 1024;
   return { warnBytes, ceilBytes, rssWarnBytes };
 }

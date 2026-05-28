@@ -283,6 +283,26 @@ npm run benchmark:base
 
 ---
 
+## Memory limits (production)
+
+A prior Base session exited near **920 MB RSS / 725 MB heap** under unbounded dedupe growth. Production targets:
+
+| Setting | Value | Rationale |
+| --- | --- | --- |
+| `NODE_OPTIONS` | `--max-old-space-size=650 --expose-gc` | Caps V8 heap so emergency GC runs before the container OOM killer |
+| Docker `mem_limit` | `1100m` | ~450 MB headroom for non-heap RSS (libuv, WS buffers, Prometheus, native addons) |
+| In-process ceiling | ~90% of parsed heap (`nodeHeapLimits.ts`) | `memory_ceiling_hit` triggers graceful restart before hard kill |
+
+**Derivation:** 650 MB heap + ~270 MB non-heap at prior incident ≈ 920 MB; 1100 MB container leaves margin after dedupe LRU (1k keys), cache `.size()` counter (no `listSnapshots().length`), and bounded watchlist TTL.
+
+Set in: `Dockerfile`, `docker-compose.yml`, `ecosystem.config.cjs`, `scripts/launcher-run-bot*.cmd`, or `NODE_OPTIONS` in `.env`.
+
+**Post-deploy diagnostics:** send `SIGUSR2` at T+0h, T+2h, T+4h (heap snapshots under `.runtime/`). Compare retained constructors in Chrome DevTools. Record RSS slope via `node scripts/audit-session.mjs`. See [docs/VALIDATION_RUNBOOK.md](docs/VALIDATION_RUNBOOK.md).
+
+**Rust NAPI:** keep `RUST_HOTPATH_ENABLED=false` until [docs/rust-hotpath-promotion.md](docs/rust-hotpath-promotion.md) is complete.
+
+---
+
 ## Safety checklist
 
 1. **Never** use your main wallet; use a **new** hot wallet with **minimal** ETH for gas.

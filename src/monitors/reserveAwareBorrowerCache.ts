@@ -31,9 +31,31 @@ export interface BorrowerReserveSnapshot {
 
 export class ReserveAwareBorrowerCache {
   private readonly snapshots = new Map<string, BorrowerSnapshot>();
+  private readonly reserveToAccounts = new Map<string, Set<Address>>();
+  private readonly chainCounts = new Map<SupportedChain, number>();
+  private readonly maxEntries: number;
+  private readonly ttlMs: number;
+
+  public constructor(config: { readonly maxEntries?: number; readonly ttlMs?: number } = {}) {
+    this.maxEntries = config.maxEntries ?? 50_000;
+    this.ttlMs = config.ttlMs ?? 30 * 60_000;
+  }
 
   public upsert(snapshot: BorrowerSnapshot): void {
-    this.snapshots.set(cacheKey(snapshot.chain, snapshot.account), snapshot);
+    const key = cacheKey(snapshot.chain, snapshot.account);
+    const previous = this.snapshots.get(key);
+    if (previous !== undefined) {
+      this.detachReserveIndex(previous);
+    } else {
+      this.chainCounts.set(snapshot.chain, (this.chainCounts.get(snapshot.chain) ?? 0) + 1);
+    }
+    this.snapshots.set(key, snapshot);
+    this.attachReserveIndex(snapshot);
+    this.prune(Date.now());
+  }
+
+  public size(chain: SupportedChain): number {
+    return this.chainCounts.get(chain) ?? 0;
   }
 
   public get(chain: SupportedChain, account: Address): BorrowerSnapshot | undefined {
@@ -45,7 +67,68 @@ export class ReserveAwareBorrowerCache {
   }
 
   public listSnapshots(chain: SupportedChain): BorrowerSnapshot[] {
+    this.prune(Date.now());
     return [...this.snapshots.values()].filter((snapshot) => snapshot.chain === chain);
+  }
+
+  public listAccountsForReserve(chain: SupportedChain, reserve: Address): Address[] {
+    this.prune(Date.now());
+    const indexed = this.reserveToAccounts.get(reserveKey(chain, reserve));
+    return indexed === undefined ? [] : [...indexed];
+  }
+
+  private prune(nowMs: number): void {
+    const ttlEligibleFloorMs = 1_500_000_000_000;
+    for (const [key, snapshot] of this.snapshots) {
+      if (snapshot.updatedAtMs < ttlEligibleFloorMs) {
+        continue;
+      }
+      if (nowMs - snapshot.updatedAtMs <= this.ttlMs) {
+        continue;
+      }
+      this.deleteSnapshot(key, snapshot);
+    }
+    while (this.snapshots.size > this.maxEntries) {
+      const oldest = this.snapshots.entries().next().value as [string, BorrowerSnapshot] | undefined;
+      if (oldest === undefined) {
+        break;
+      }
+      this.deleteSnapshot(oldest[0], oldest[1]);
+    }
+  }
+
+  private deleteSnapshot(key: string, snapshot: BorrowerSnapshot): void {
+    this.snapshots.delete(key);
+    this.detachReserveIndex(snapshot);
+    const next = (this.chainCounts.get(snapshot.chain) ?? 1) - 1;
+    if (next <= 0) {
+      this.chainCounts.delete(snapshot.chain);
+    } else {
+      this.chainCounts.set(snapshot.chain, next);
+    }
+  }
+
+  private attachReserveIndex(snapshot: BorrowerSnapshot): void {
+    for (const reserve of snapshot.reserves) {
+      const key = reserveKey(snapshot.chain, reserve.assetAddress);
+      const accounts = this.reserveToAccounts.get(key) ?? new Set<Address>();
+      accounts.add(snapshot.account);
+      this.reserveToAccounts.set(key, accounts);
+    }
+  }
+
+  private detachReserveIndex(snapshot: BorrowerSnapshot): void {
+    for (const reserve of snapshot.reserves) {
+      const key = reserveKey(snapshot.chain, reserve.assetAddress);
+      const accounts = this.reserveToAccounts.get(key);
+      if (accounts === undefined) {
+        continue;
+      }
+      accounts.delete(snapshot.account);
+      if (accounts.size === 0) {
+        this.reserveToAccounts.delete(key);
+      }
+    }
   }
 }
 
@@ -115,4 +198,8 @@ function toDecimalNumber(amount: AssetAmount): number {
 
 function cacheKey(chain: SupportedChain, account: Address): string {
   return `${chain}:${account.toLowerCase()}`;
+}
+
+function reserveKey(chain: SupportedChain, reserve: Address): string {
+  return `${chain}:${reserve.toLowerCase()}`;
 }

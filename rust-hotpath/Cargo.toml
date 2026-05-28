@@ -1,0 +1,15 @@
+[package]
+name = "liquidator_hotpath"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "liquidator_hotpath"
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = "3"
+napi-derive = "3"
+
+[build-dependencies]
+napi-build = "2"

@@ -5,6 +5,7 @@ import { encodeLiquidationRoute } from "../protocols/liquidationFlashLoanReceive
 import type { SafeExecutionRequest } from "./safeTransactionExecutor";
 import { createAssetAmount, type Asset } from "../utils/typedAssetMath";
 import { getChainConfig } from "../config/chains";
+import { defaultCloseFactorBps, resolveAavePoolVersion } from "../config/aavePoolVersion";
 import { AAVE_V3_BASE_FLASH_FEE_BPS, calculateFlashWrappedLiquidationEv } from "../utils/evCalculator";
 import type { RouteSelectionResult } from "../profitability/flashLoanProviderRouter";
 
@@ -81,7 +82,12 @@ export function buildLiquidationExecutionRequest(
     chain,
     account: config.account,
     opportunityId: `${chain}:${candidate.account}:${candidate.debtAsset}`,
-    gasProfileKey: "aaveV3:flashLiquidation",
+    gasProfileKey: `liq:${candidate.collateralAsset.toLowerCase()}:${candidate.debtAsset.toLowerCase()}`,
+    gasLimitHint: {
+      collateralAsset: candidate.collateralAsset,
+      debtAsset: candidate.debtAsset,
+      usesFlashWrapper: config.flashLoanReceiverAddress !== undefined,
+    },
     routeInput: {
       chain,
       opportunityId: `${chain}:${candidate.account}:${candidate.debtAsset}`,
@@ -210,8 +216,9 @@ function toFlashWrappedEnvelope(
 }
 
 export function estimateMinimumCollateralOut(candidate: LiquidationCandidate, slippageBps: number): bigint {
+  const poolVersion = resolveAavePoolVersion();
   const effectiveCloseFactorBps = candidate.closeFactorBps
-    ?? (candidate.healthFactor < 950_000_000_000_000_000n ? 10_000 : 5_000);
+    ?? defaultCloseFactorBps(poolVersion, candidate.healthFactor);
   const bonusBps = candidate.effectiveLiquidationBonusBps ?? candidate.liquidationBonusBps;
   const debtCovered = (candidate.debtToCover * BigInt(effectiveCloseFactorBps)) / 10_000n;
   const grossCollateral = debtCovered + (debtCovered * BigInt(bonusBps)) / 10_000n;

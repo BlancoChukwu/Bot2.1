@@ -2,6 +2,7 @@ import type { Address, Log, PublicClient } from "viem";
 import type { BotMetrics, LoggerLike } from "../bot";
 import type { SupportedChain } from "../config/chains";
 import { aavePoolAbi } from "../protocols/aaveV3";
+import { extractBorrowerFromLog } from "./borrowerLogExtract";
 import type { BlockCursor } from "../utils/blockCursor";
 import type { BoundedWatchlist } from "./boundedWatchlist";
 
@@ -32,6 +33,7 @@ export interface EventDrivenWatchlistConfig {
   readonly logger: LoggerLike;
   readonly metrics?: BotMetrics;
   readonly onActivity?: () => void;
+  readonly onAccountsActivity?: (accounts: readonly Address[]) => void;
   readonly reorgSafeDepth?: bigint;
   readonly gapChunkBlocks?: bigint;
   readonly gapChunkDelayMs?: number;
@@ -165,12 +167,14 @@ export class EventDrivenWatchlist {
     const head = await this.config.readClient.getBlockNumber();
     const safeHead = head > reorgDepth ? head - reorgDepth : 0n;
     let maxBlock = 0n;
+    const touched = new Set<Address>();
 
     for (const log of logs) {
       const user = extractBorrowerFromLog(log);
       const blockNumber = log.blockNumber ?? 0n;
       if (user !== undefined && blockNumber > 0n) {
         this.config.watchlist.add(user, blockNumber);
+        touched.add(user);
       }
       if (blockNumber > maxBlock) {
         maxBlock = blockNumber;
@@ -181,21 +185,10 @@ export class EventDrivenWatchlist {
       await this.config.cursor.save(maxBlock);
     }
     this.config.onActivity?.();
+    if (touched.size > 0) {
+      this.config.onAccountsActivity?.([...touched]);
+    }
   }
-}
-
-function extractBorrowerFromLog(log: Log): Address | undefined {
-  const args = (log as Log & {
-    readonly args?: {
-      readonly user?: Address;
-      readonly onBehalfOf?: Address;
-    };
-  }).args;
-  const candidate = args?.user ?? args?.onBehalfOf;
-  if (candidate === undefined) {
-    return undefined;
-  }
-  return candidate;
 }
 
 function sleep(ms: number): Promise<void> {

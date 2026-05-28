@@ -51,6 +51,10 @@ export interface WatchlistCoordinatorConfig {
   readonly onChainColdStartMaxBlocks?: bigint;
   /** Archive-capable HTTP RPC for log backfill (not Flashblocks pending-only). */
   readonly coldStartReadClient?: PublicClient;
+  /** `onchain` skips subgraph seed (avoids broken `positions` schema / quota errors). */
+  readonly coldStartIndexer?: string;
+  /** When true, do not block `start()` on the initial HF sweep (runs in background). */
+  readonly skipColdStartFullSweep?: boolean;
 }
 
 export class WatchlistCoordinator implements BorrowerSnapshotProvider {
@@ -105,7 +109,20 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
       ...(this.config.gapChunkDelayMs === undefined ? {} : { gapChunkDelayMs: this.config.gapChunkDelayMs }),
     });
     await this.seedColdStart();
-    await this.runColdStartFullSweep(this.config.chain);
+    if (this.config.skipColdStartFullSweep === true) {
+      this.config.logger.info("cold_start_full_sweep_deferred", {
+        chain: this.config.chain,
+        watchlistSize: this.watchlist.size(),
+      });
+      void this.runColdStartFullSweep(this.config.chain).catch((error) => {
+        this.config.logger.error("cold_start_full_sweep_failed", {
+          chain: this.config.chain,
+          error: String(error),
+        });
+      });
+    } else {
+      await this.runColdStartFullSweep(this.config.chain);
+    }
     await this.eventWatchlist.start();
     this.stalenessGuard.record();
     this.publishWatchlistMetrics();
@@ -378,13 +395,20 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
   }
 
   private async seedColdStart(): Promise<void> {
-    try {
-      const seeded = this.config.borrowerIndexProvider === undefined
-        ? {
-          source: "subgraph" as const,
-          accounts: await this.config.protocol.listBorrowerAddresses?.() ?? [],
-        }
-        : await this.config.borrowerIndexProvider.seed(this.config.chain);
+    const indexer = (this.config.coldStartIndexer ?? "onchain").trim().toLowerCase();
+    if (indexer === "onchain") {
+      this.config.logger.info("watchlist_cold_start_on_chain_only", {
+        chain: this.config.chain,
+        indexer,
+      });
+    } else if (indexer !== "onchain") {
+      try {
+        const seeded = this.config.borrowerIndexProvider === undefined
+          ? {
+            source: "subgraph" as const,
+            accounts: await this.config.protocol.listBorrowerAddresses?.() ?? [],
+          }
+          : await this.config.borrowerIndexProvider.seed(this.config.chain);
       const addresses = seeded.accounts;
       if (addresses !== undefined && addresses.length > 0) {
         const blockNumber = await this.config.readClient.getBlockNumber();
@@ -401,11 +425,12 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
       this.config.logger.warn("watchlist_cold_start_subgraph_empty", {
         chain: this.config.chain,
       });
-    } catch (error) {
-      this.config.logger.warn("watchlist_cold_start_subgraph_failed", {
-        chain: this.config.chain,
-        error: String(error),
-      });
+      } catch (error) {
+        this.config.logger.warn("watchlist_cold_start_subgraph_failed", {
+          chain: this.config.chain,
+          error: String(error),
+        });
+      }
     }
 
     const lookback = this.config.onChainColdStartLookbackBlocks
@@ -440,17 +465,6 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
       }
       this.borrowersDiscovered = this.watchlist.size();
       const beforePrune = withDebt;
-      await this.pruneWatchlistByReserveAllowlist();
-      if (this.watchlist.size() < 100 && beforePrune.length >= 100) {
-        for (const account of beforePrune) {
-          this.watchlist.add(account, blockNumber);
-        }
-        this.config.logger.warn("watchlist_reserve_allowlist_prune_reverted", {
-          chain: this.config.chain,
-          restored: beforePrune.length,
-          watchlistSize: this.watchlist.size(),
-        });
-      }
       this.config.logger.info("watchlist_cold_start_on_chain", {
         chain: this.config.chain,
         lookbackBlocks: lookback.toString(),
@@ -462,6 +476,33 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
         elapsedMs: discovery.elapsedMs,
         blocksScanned: discovery.blocksScanned.toString(),
       });
+      const runReservePrune = async (): Promise<void> => {
+        await this.pruneWatchlistByReserveAllowlist();
+        if (this.watchlist.size() < 100 && beforePrune.length >= 100) {
+          for (const account of beforePrune) {
+            this.watchlist.add(account, blockNumber);
+          }
+          this.config.logger.warn("watchlist_reserve_allowlist_prune_reverted", {
+            chain: this.config.chain,
+            restored: beforePrune.length,
+            watchlistSize: this.watchlist.size(),
+          });
+        }
+      };
+      if (this.config.skipColdStartFullSweep === true) {
+        this.config.logger.info("watchlist_reserve_allowlist_prune_deferred", {
+          chain: this.config.chain,
+          watchlistSize: this.watchlist.size(),
+        });
+        void runReservePrune().catch((error) => {
+          this.config.logger.error("watchlist_reserve_allowlist_prune_failed", {
+            chain: this.config.chain,
+            error: String(error),
+          });
+        });
+      } else {
+        await runReservePrune();
+      }
     } catch (error) {
       this.config.logger.error("watchlist_cold_start_critical", {
         chain: this.config.chain,

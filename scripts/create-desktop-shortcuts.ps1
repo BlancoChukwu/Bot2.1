@@ -11,7 +11,7 @@ $launchers = @(
     Name = "Aave Liquidator (Production).lnk"
     Cmd  = "Start Production Bot.cmd"
     Icon = 137
-    Desc = "Live: dist build, SIMULATION_MODE=false, safety gate ON, detached + logs"
+    Desc = "Live: build + dry-run gate + detached child launcher (logs\latest-session.txt)"
   },
   @{
     Name = "Aave Liquidator (Production No Gate).lnk"
@@ -23,7 +23,13 @@ $launchers = @(
     Name = "Aave Liquidator (Simulation).lnk"
     Cmd  = "Start Simulation Bot.cmd"
     Icon = 138
-    Desc = "Soak: dist build, SIMULATION_MODE=true, event watchlist, detached 2h+ logs"
+    Desc = "Soak: npm run build, SIMULATION_MODE=true, 650MB heap, event watchlist"
+  },
+  @{
+    Name = "Aave Liquidator (Dry Run Receipt).lnk"
+    Cmd  = "Setup Dry Run Receipt.cmd"
+    Icon = 165
+    Desc = "Start local Redis + refresh DRY_RUN_* in .env (15 min TTL)"
   },
   @{
     Name = "Aave Liquidator (Stop).lnk"

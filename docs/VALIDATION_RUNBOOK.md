@@ -187,6 +187,42 @@ Pass criteria:
 Before Phase 2 arb diagnostics:
 
 1. Debug sweep + soak logs show candidate with `HF < 1.0` and debt above threshold, or documented calm market
+
+## Phase 0 — 24h memory gate (blocking)
+
+Run detached simulation with event watchlist and memory snapshots:
+
+```powershell
+cd "e:\Mini PC\optimism-aave-v3-liquidator-ts"
+$env:SIMULATION_MODE="true"
+$env:USE_EVENT_WATCHLIST="true"
+$env:ENABLE_HEAP_SNAPSHOTS="true"
+$env:MEMORY_LOG_EVERY_CYCLES="300"
+scripts\launcher-run-bot-detached.cmd
+```
+
+Gate checks after 24h:
+
+```powershell
+node scripts/audit-session.mjs "logs\<session>.log"
+```
+
+### Post-deploy memory diagnostic (first 4 hours)
+
+Run **before** tuning profitability or execution:
+
+1. Confirm `NODE_OPTIONS` includes `--max-old-space-size=650` and Docker `mem_limit: 1100m` (see README).
+2. Send **SIGUSR2** to the bot PID at **T+0h, T+2h, T+4h** — snapshots land in `.runtime/heap-signal-*.heapsnapshot`.
+3. In Chrome DevTools → Memory, compare retained object counts by constructor across the three files.
+4. If RSS growth **> 30 MB/hour** after dedupe LRU fix, inspect `memory_stats` component counters (`watchlistSize`, `cacheEntries`, `detectionPending`) and Prometheus label cardinality (per-address labels).
+5. Append RSS slope from `audit-session.mjs` to `logs/latest-session.txt` for the run record.
+
+Pass criteria:
+
+- `memory_ceiling_hit = 0`
+- RSS growth `< 10 MB/hour` (`memory_rss_growth_rate` metric in audit output); investigate if **> 30 MB/hour**
+- No self-exit loop (`launcher_session_exit` should not appear unexpectedly)
+- RSS remains below 400 MB steady state for the session window
 2. `buildLiquidationExecutionRequest` succeeds in sim
 3. Dry-run preview passes deployment safety gate
 4. Live: one tx with `liquidation_path_validated` log, or signed dry-run receipt

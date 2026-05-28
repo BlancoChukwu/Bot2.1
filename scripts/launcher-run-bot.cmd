@@ -51,7 +51,7 @@ echo Tail in another terminal: Get-Content "%LOGFILE%" -Wait -Tail 20
 echo Audit when done: node scripts\audit-session.mjs "%LOGFILE%"
 echo.
 
-if not defined NODE_OPTIONS set NODE_OPTIONS=--max-old-space-size=768 --expose-gc
+call "%~dp0preflight-production-env.cmd"
 
 chcp 65001>nul
 if "%USE_START_LIVE%"=="1" (
