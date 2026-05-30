@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createPublicClient, createWalletClient, formatEther, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -12,8 +12,8 @@ interface ReceiverArtifact {
   readonly bytecode: `0x${string}`;
 }
 
-function loadArtifact(): ReceiverArtifact {
-  const path = join(__dirname, "..", "contracts", "build", "LiquidationFlashReceiver.json");
+function loadArtifact(name: "LiquidationFlashReceiver" | "MultiProtocolFlashReceiver"): ReceiverArtifact {
+  const path = join(__dirname, "..", "contracts", "build", `${name}.json`);
   const raw = readFileSync(path, "utf8");
   const parsed = JSON.parse(raw) as { abi: readonly unknown[]; bytecode: string };
   if (!parsed.bytecode.startsWith("0x") || parsed.bytecode.length < 4) {
@@ -58,7 +58,8 @@ async function main(): Promise<void> {
   if (pkRaw === undefined || pkRaw === "") {
     throw new Error("PRIVATE_KEY is required");
   }
-  const artifact = loadArtifact();
+  const artifact = loadArtifact("LiquidationFlashReceiver");
+  const v2Artifact = loadArtifact("MultiProtocolFlashReceiver");
   const account = privateKeyToAccount(parsePrivateKey(pkRaw));
   const transport = http(rpcUrl);
   const publicClient = createPublicClient({ chain: base, transport });
@@ -111,6 +112,32 @@ async function main(): Promise<void> {
   }
   console.log("Deployed at:", deployed);
   console.log(`Set LIQUIDATION_RECEIVER_ADDRESS=${deployed}`);
+
+  const v2Hash = await walletClient.deployContract({
+    abi: v2Artifact.abi,
+    bytecode: v2Artifact.bytecode,
+    args: [pool, uniswap.router, swapFee],
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+  });
+  const v2Receipt = await publicClient.waitForTransactionReceipt({ hash: v2Hash });
+  const v2Deployed = v2Receipt.contractAddress;
+  if (v2Deployed === null || v2Deployed === undefined) {
+    throw new Error("V2 deployment receipt missing contractAddress");
+  }
+  console.log("MultiProtocolFlashReceiver deployed at:", v2Deployed);
+  console.log(`Set MULTI_PROTOCOL_RECEIVER_ADDRESS=${v2Deployed}`);
+
+  const runtimeDir = join(process.cwd(), ".runtime");
+  mkdirSync(runtimeDir, { recursive: true });
+  const addressOut = join(runtimeDir, "receiver-addresses.json");
+  writeFileSync(addressOut, JSON.stringify({
+    chain: "base",
+    liquidationFlashReceiverV1: deployed,
+    multiProtocolFlashReceiverV2: v2Deployed,
+    deployedAt: new Date().toISOString(),
+  }, null, 2));
+  console.log(`Wrote ${addressOut}`);
 }
 
 main().catch((err) => {

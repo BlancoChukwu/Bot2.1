@@ -13,6 +13,7 @@ const liquidationHealthFactor = 1_000_000_000_000_000_000n;
 export interface BorrowerSnapshot {
   readonly chain: SupportedChain;
   readonly account: Address;
+  readonly protocol?: "aave" | "moonwell" | "morpho";
   readonly healthFactor: bigint;
   readonly reserves: readonly BorrowerReserveSnapshot[];
   readonly updatedAtMs: number;

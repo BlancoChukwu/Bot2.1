@@ -4,6 +4,7 @@ import type { ChainRegistry, FlashLoanProviderId } from "../config/chainRegistry
 import type { SupportedChain } from "../config/chains";
 import type { RouteSelectionInput, RouteSelectionResult } from "../profitability/flashLoanProviderRouter";
 import { resolveLiquidationGasLimit } from "../config/liquidationGasLimits";
+import { logOpportunityTrace } from "../observability/opportunityTrace";
 import type { LocalNonceManager, NonceReservation } from "./nonceManager";
 
 export interface TransactionEnvelope {
@@ -78,6 +79,8 @@ export interface SafeExecutionRequest {
     readonly debtAsset: Address;
     readonly usesFlashWrapper: boolean;
   };
+  readonly flashblockIndex?: number;
+  readonly detectionTsMs?: number;
   buildTransaction(route: SelectedRoute): TransactionEnvelope;
   buildFlashLoanPreviewTransaction?(route: SelectedRoute): TransactionEnvelope;
 }
@@ -107,6 +110,9 @@ export interface SafeTransactionExecutorConfig {
   readonly privateFirstChains?: readonly SupportedChain[];
   readonly dryRunMode?: boolean;
   readonly rejectBeforePreview?: (request: SafeExecutionRequest) => Promise<string | undefined>;
+  readonly quoteExecutionGasCap?: (input: { readonly expectedProfitUsd: number; readonly gasLimit: bigint }) => Promise<{
+    readonly maxFeePerGas: bigint;
+  }>;
 }
 
 interface PreflightResult {
@@ -150,9 +156,17 @@ export class SafeTransactionExecutor {
       }
       const gas = await this.getGasLimit(request, transaction);
 
+      const gasCapQuote = this.config.quoteExecutionGasCap === undefined
+        ? undefined
+        : await this.config.quoteExecutionGasCap({
+          expectedProfitUsd: Number(preflight.route.netProfit.raw) / 1e8,
+          gasLimit: gas,
+        });
       const overrides = {
         gas,
-        gasPrice: preflight.gasPrice,
+        gasPrice: gasCapQuote === undefined
+          ? preflight.gasPrice
+          : (preflight.gasPrice < gasCapQuote.maxFeePerGas ? preflight.gasPrice : gasCapQuote.maxFeePerGas),
         nonce: preflight.nonce,
       };
       if (request.buildFlashLoanPreviewTransaction !== undefined) {
@@ -183,7 +197,14 @@ export class SafeTransactionExecutor {
         }
       }
 
+      const simulationTsMs = Date.now();
       const dryRun = await this.config.client.simulateContract(transaction, overrides);
+      this.recordPipelineLatency(
+        "detection_to_simulation_ms",
+        request,
+        transaction.provider,
+        Date.now() - startedAt,
+      );
       if (!dryRun.success) {
         this.releaseNonce(request, preflight.nonce);
         this.config.logger.warn("final_simulation_rejected", {
@@ -194,6 +215,22 @@ export class SafeTransactionExecutor {
         return { status: "rejected", reason: "final_simulation_failed" };
       }
       if (this.config.dryRunMode === true) {
+        const wouldSubmitTsMs = Date.now();
+        this.recordPipelineLatency(
+          "simulation_to_would_submit_ms",
+          request,
+          transaction.provider,
+          wouldSubmitTsMs - simulationTsMs,
+        );
+        logOpportunityTrace(this.config.logger, {
+          opportunityId: request.opportunityId,
+          chain: request.chain,
+          ...(request.flashblockIndex === undefined ? {} : { flashblockIndex: request.flashblockIndex }),
+          detectionTsMs: request.detectionTsMs ?? startedAt,
+          simulationTsMs,
+          wouldSubmitTsMs,
+          estProfitAfterFeeGasUsd: Number(preflight.route.netProfit.raw) / 1e8,
+        });
         this.releaseNonce(request, preflight.nonce);
         this.config.logger.info("safe_execution_dry_run_complete", {
           chain: request.chain,
@@ -488,7 +525,12 @@ export class SafeTransactionExecutor {
   }
 
   private recordPipelineLatency(
-    stage: "detection_to_submit_ms" | "submit_to_inclusion_ms",
+    stage:
+      | "flashblock_to_detection_ms"
+      | "detection_to_simulation_ms"
+      | "simulation_to_would_submit_ms"
+      | "detection_to_submit_ms"
+      | "submit_to_inclusion_ms",
     request: SafeExecutionRequest,
     provider: FlashLoanProviderId,
     durationMs: number,

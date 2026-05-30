@@ -124,6 +124,27 @@ Proceed with full **2h** detached soak on this build.
 - Phase 1 complete on Base Aave V3
 - Next: ship Phase 1b metrics/alerts → 72h live run
 
+## Phase 3 go-live gates
+
+Run these checks before enabling first live Moonwell/Morpho target liquidation:
+
+```bash
+npm test && npm run typecheck
+npm run benchmark:rpc
+npm run test:flashblocks
+npm run audit:morpho-preliquidation-base
+npm run report:competitive-gap
+npm run review:daily-pipeline
+```
+
+Required outcomes:
+
+- `flashblock_to_detection_ms` p99 < 50ms (48h shadow window)
+- `detection_to_simulation_ms` p99 < 100ms
+- `simulation_to_would_submit_ms` p99 < 30ms
+- Competitive gap report exits 0 with same-block ratio >= 0.70
+- Daily review reports `unhandledReverts` <= configured threshold
+
 ## Phase 1b — Watchlist metrics + alerts
 
 Prometheus scrape target: `http://127.0.0.1:9090/metrics` (started with bot).

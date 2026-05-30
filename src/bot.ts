@@ -12,6 +12,9 @@ import { calculateLiquidationEV } from "./utils/evCalculator";
 
 export type BotLatencyStage = "scan" | "execution" | "poll_cycle";
 export type PipelineLatencyStage =
+  | "flashblock_to_detection_ms"
+  | "detection_to_simulation_ms"
+  | "simulation_to_would_submit_ms"
   | "event_to_detection_ms"
   | "detection_to_submit_ms"
   | "submit_to_inclusion_ms"
@@ -84,6 +87,9 @@ export interface BotMetrics {
   recordNetProfitUsd(amountUsd: number): void;
   recordBundleSubmission(route: "public_rpc" | "private_bundle"): void;
   recordOracleFreshnessMs(chain: string, token: string, freshnessMs: number, source: string): void;
+  setOracleDeltaPct(chain: string, token: string, deltaPct: number): void;
+  setIndexerBlockLag(chain: string, source: string, blocksBehind: number): void;
+  recordOnChainLiquidatedByOther(chain: string, protocol: string, asset: string): void;
   recordDustFiltered(count?: number): void;
   recordCooldownBlock(count?: number): void;
   recordSubgraphLag?(blocksBehind: number): void;
@@ -329,6 +335,24 @@ export function createBotMetrics(): BotMetrics {
     buckets: [1_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000],
     registers: [registry],
   });
+  const oracleDeltaPct = new client.Gauge({
+    name: "oracle_delta_pct",
+    help: "Absolute oracle price delta percentage observed by hot path",
+    labelNames: ["chain", "token"],
+    registers: [registry],
+  });
+  const indexerBlockLag = new client.Gauge({
+    name: "indexer_block_lag",
+    help: "Indexer lag in blocks against chain head",
+    labelNames: ["chain", "source"],
+    registers: [registry],
+  });
+  const onChainLiquidatedByOtherTotal = new client.Counter({
+    name: "on_chain_liquidated_by_other_total",
+    help: "Detected profitable opportunities that another liquidator took on-chain",
+    labelNames: ["chain", "protocol", "asset"],
+    registers: [registry],
+  });
   const dustFilteredTotal = new client.Counter({
     name: "dust_filtered_total",
     help: "Liquidation candidates rejected as dust before enqueue or preview",
@@ -432,6 +456,15 @@ export function createBotMetrics(): BotMetrics {
     },
     recordOracleFreshnessMs(chain, token, freshnessMs, source) {
       oracleFreshnessMs.observe({ chain, token, source }, Math.max(0, freshnessMs));
+    },
+    setOracleDeltaPct(chain, token, deltaPct) {
+      oracleDeltaPct.set({ chain, token }, Math.max(0, deltaPct));
+    },
+    setIndexerBlockLag(chain, source, blocksBehind) {
+      indexerBlockLag.set({ chain, source }, Math.max(0, blocksBehind));
+    },
+    recordOnChainLiquidatedByOther(chain, protocol, asset) {
+      onChainLiquidatedByOtherTotal.inc({ chain, protocol, asset });
     },
     recordDustFiltered(count = 1) {
       dustFilteredTotal.inc(count);

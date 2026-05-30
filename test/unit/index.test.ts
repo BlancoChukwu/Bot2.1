@@ -199,6 +199,36 @@ describe("parseRuntimeConfig", () => {
     expect(config.aaveSubgraphByChain.get("base")).toBe(baseUrl);
   });
 
+  it("defaults flash-loan providers to aaveV3 only when balancer fallback is disabled", () => {
+    const config = parseRuntimeConfig({
+      CHAIN: "base",
+      RPC_URL: "https://base.example",
+      BASE_AAVE_SUBGRAPH_URL:
+        "https://gateway.thegraph.com/api/0809d0adbd54399dd534c899c2c7ca91/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF",
+      PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+      FLASH_LOAN_PROVIDERS: "aaveV3,balancer",
+      BALANCER_FLASH_FALLBACK: "false",
+    });
+
+    expect(config.balancerFlashFallback).toBe(false);
+    expect(config.flashLoanProviders).toEqual(["aaveV3"]);
+  });
+
+  it("allows balancer only when balancer fallback is explicitly enabled", () => {
+    const config = parseRuntimeConfig({
+      CHAIN: "base",
+      RPC_URL: "https://base.example",
+      BASE_AAVE_SUBGRAPH_URL:
+        "https://gateway.thegraph.com/api/0809d0adbd54399dd534c899c2c7ca91/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF",
+      PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+      FLASH_LOAN_PROVIDERS: "aaveV3,balancer",
+      BALANCER_FLASH_FALLBACK: "true",
+    });
+
+    expect(config.balancerFlashFallback).toBe(true);
+    expect(config.flashLoanProviders).toEqual(["aaveV3", "balancer"]);
+  });
+
   it("resolves Base and Optimism subgraph URLs independently for multi-chain", () => {
     const baseUrl =
       "https://gateway.thegraph.com/api/0809d0adbd54399dd534c899c2c7ca91/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF";

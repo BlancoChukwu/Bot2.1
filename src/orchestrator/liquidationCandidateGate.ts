@@ -34,6 +34,12 @@ export interface LiquidationCandidateGateConfig {
   readonly metrics?: BotMetrics;
   readonly resolveDebtDecimals?: (asset: Address) => number;
   readonly dustLogCooldown?: DustLogCooldown;
+  readonly oracleSanityCheck?: (input: {
+    readonly chain: SupportedChain;
+    readonly account: Address;
+    readonly debtAsset: Address;
+    readonly collateralAsset: Address;
+  }) => Promise<{ readonly pass: boolean; readonly deviationPct: number }>;
 }
 
 export class LiquidationCandidateGate {
@@ -86,13 +92,33 @@ export class LiquidationCandidateGate {
         hardFloorUsd: this.config.minDebtUsd,
       });
       const gatePass = resolved.trusted && profitability.pass;
+      let sanityPass = true;
+      if (this.config.oracleSanityCheck !== undefined) {
+        const sanity = await this.config.oracleSanityCheck({
+          chain,
+          account: candidate.account,
+          debtAsset: candidate.debtAsset,
+          collateralAsset: candidate.collateralAsset,
+        });
+        sanityPass = sanity.pass;
+        if (!sanity.pass) {
+          this.config.logger.warn("oracle_sanity_gate_blocked", {
+            chain,
+            account: candidate.account,
+            debtAsset: candidate.debtAsset,
+            collateralAsset: candidate.collateralAsset,
+            deviationPct: sanity.deviationPct,
+          });
+        }
+      }
+      const finalPass = gatePass && sanityPass;
       this.config.logger.info("liquidation_evaluated", {
         chain,
         account: candidate.account,
         stage,
         debtUsd: resolved.debtUsd,
         ...profitability,
-        pass: gatePass,
+        pass: finalPass,
       });
       const diagnosticRow = {
         kind: "liquidation" as const,
@@ -104,12 +130,14 @@ export class LiquidationCandidateGate {
         failureMarginBps: profitability.effectiveFloor > 0
           ? Math.round((profitability.netProfitUsd / profitability.effectiveFloor) * 10_000)
           : 0,
-        passed: gatePass,
+        passed: finalPass,
       };
-      if (!gatePass) {
+      if (!finalPass) {
         getCycleDiagnosticsCollector().record({
           ...diagnosticRow,
-          skipReason: `below_effective_floor_${profitability.effectiveFloor.toFixed(2)}`,
+          skipReason: !sanityPass
+            ? "oracle_sanity_deviation"
+            : `below_effective_floor_${profitability.effectiveFloor.toFixed(2)}`,
         });
       } else {
         getCycleDiagnosticsCollector().record(diagnosticRow);
@@ -127,7 +155,7 @@ export class LiquidationCandidateGate {
         effectiveFloorUsd: profitability.effectiveFloor,
         dustLogCooldown: this.dustLogCooldown,
       });
-      if (decision.isDust) {
+      if (decision.isDust || !sanityPass) {
         this.config.metrics?.recordDustFiltered();
         continue;
       }

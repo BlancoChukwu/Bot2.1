@@ -106,6 +106,7 @@ function toSnapshot(chain: SupportedChain, candidate: LiquidationCandidate): Bor
   return {
     chain,
     account: candidate.account,
+    protocol: "aave",
     healthFactor: candidate.healthFactor,
     updatedAtMs: Date.now(),
     reserves: [

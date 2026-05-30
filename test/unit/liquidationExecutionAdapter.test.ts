@@ -41,14 +41,17 @@ describe("buildLiquidationExecutionRequest", () => {
     expect(decoded.functionName).toBe("flashLoanSimple");
     const encodedRoute = decoded.args[3] as `0x${string}`;
     const decodedRoute = decodeAbiParameters(
-      parseAbiParameters("address collateralAsset,address debtAsset,address user,uint256 debtToCover,uint256 minCollateralOut,bool receiveAToken"),
+      parseAbiParameters(
+        "uint8 routeType,address collateralAsset,address debtAsset,address user,uint256 debtToCover,uint256 minCollateralOut,bool receiveAToken",
+      ),
       encodedRoute,
     );
-    expect(decodedRoute[0]).toBe(candidate.collateralAsset);
-    expect(decodedRoute[1]).toBe(candidate.debtAsset);
-    expect(decodedRoute[2]).toBe(candidate.account);
-    expect(decodedRoute[3]).toBe(candidate.debtToCover);
-    expect(decodedRoute[4]).toBeGreaterThan(0n);
+    expect(decodedRoute[0]).toBe(0);
+    expect(decodedRoute[1]).toBe(candidate.collateralAsset);
+    expect(decodedRoute[2]).toBe(candidate.debtAsset);
+    expect(decodedRoute[3]).toBe(candidate.account);
+    expect(decodedRoute[4]).toBe(candidate.debtToCover);
+    expect(decodedRoute[5]).toBeGreaterThan(0n);
   });
 
   it("builds Balancer Vault flashLoan transaction when balancer route selected", () => {

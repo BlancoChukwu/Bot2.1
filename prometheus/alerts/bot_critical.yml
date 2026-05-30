@@ -18,3 +18,30 @@ groups:
         annotations:
           summary: "RSS exceeding 600 MB — check for memory leak"
           description: "process_rss_bytes={{ $value }} (> 629145600)"
+
+      - alert: FlashblockToDetectionP99High
+        expr: histogram_quantile(0.99, sum by (le) (rate(pipeline_latency_ms_bucket{stage="flashblock_to_detection_ms"}[10m]))) > 50
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Flashblock->detection p99 above 50ms"
+          description: "p99 flashblock_to_detection_ms is {{ $value }} ms"
+
+      - alert: DetectionToSimulationP99High
+        expr: histogram_quantile(0.99, sum by (le) (rate(pipeline_latency_ms_bucket{stage="detection_to_simulation_ms"}[10m]))) > 100
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Detection->simulation p99 above 100ms"
+          description: "p99 detection_to_simulation_ms is {{ $value }} ms"
+
+      - alert: SimulationToWouldSubmitP99High
+        expr: histogram_quantile(0.99, sum by (le) (rate(pipeline_latency_ms_bucket{stage="simulation_to_would_submit_ms"}[10m]))) > 30
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Simulation->would-submit p99 above 30ms"
+          description: "p99 simulation_to_would_submit_ms is {{ $value }} ms"

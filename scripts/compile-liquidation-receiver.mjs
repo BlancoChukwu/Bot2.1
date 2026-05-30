@@ -5,14 +5,20 @@ import solc from "solc";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, "..");
-const sourcePath = path.join(root, "contracts", "LiquidationFlashReceiver.sol");
 const outDir = path.join(root, "contracts", "build");
-const outPath = path.join(outDir, "LiquidationFlashReceiver.json");
-
-const source = fs.readFileSync(sourcePath, "utf8");
+const contractsToCompile = [
+  "LiquidationFlashReceiver.sol",
+  "MultiProtocolFlashReceiver.sol",
+];
+const sources = Object.fromEntries(
+  contractsToCompile.map((name) => [
+    name,
+    { content: fs.readFileSync(path.join(root, "contracts", name), "utf8") },
+  ]),
+);
 const input = {
   language: "Solidity",
-  sources: { "LiquidationFlashReceiver.sol": { content: source } },
+  sources,
   settings: {
     viaIR: true,
     optimizer: { enabled: true, runs: 200 },
@@ -33,30 +39,31 @@ if (output.errors) {
   }
 }
 
-const compiled = output.contracts["LiquidationFlashReceiver.sol"]?.LiquidationFlashReceiver;
-if (compiled === undefined) {
-  console.error("Compiler did not produce LiquidationFlashReceiver");
-  process.exit(1);
-}
-
-const bytecode = compiled.evm?.bytecode?.object;
-if (bytecode === undefined || bytecode.length === 0) {
-  console.error("Missing bytecode object");
-  process.exit(1);
-}
-
 fs.mkdirSync(outDir, { recursive: true });
-fs.writeFileSync(
-  outPath,
-  JSON.stringify(
-    {
-      contractName: "LiquidationFlashReceiver",
-      abi: compiled.abi,
-      bytecode: bytecode.startsWith("0x") ? bytecode : `0x${bytecode}`,
-    },
-    null,
-    2,
-  ),
-);
-
-console.log(`Wrote ${path.relative(root, outPath)}`);
+for (const contractFile of contractsToCompile) {
+  const contractName = contractFile.replace(".sol", "");
+  const compiled = output.contracts[contractFile]?.[contractName];
+  if (compiled === undefined) {
+    console.error(`Compiler did not produce ${contractName}`);
+    process.exit(1);
+  }
+  const bytecode = compiled.evm?.bytecode?.object;
+  if (bytecode === undefined || bytecode.length === 0) {
+    console.error(`Missing bytecode object for ${contractName}`);
+    process.exit(1);
+  }
+  const outPath = path.join(outDir, `${contractName}.json`);
+  fs.writeFileSync(
+    outPath,
+    JSON.stringify(
+      {
+        contractName,
+        abi: compiled.abi,
+        bytecode: bytecode.startsWith("0x") ? bytecode : `0x${bytecode}`,
+      },
+      null,
+      2,
+    ),
+  );
+  console.log(`Wrote ${path.relative(root, outPath)}`);
+}

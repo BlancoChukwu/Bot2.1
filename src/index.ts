@@ -34,8 +34,10 @@ import { PrivateSubmissionClient, type PrivateTxMode } from "./executors/Private
 import { SafeTransactionExecutor } from "./executors/safeTransactionExecutor";
 import { ViemExecutionClient } from "./executors/viemExecutionClient";
 import { ParallelBroadcastClient } from "./executors/parallelBroadcastClient";
+import { quoteBaseExecutionGas } from "./executors/baseGasModel";
 import type { ExecutionPreflightClient } from "./executors/safeTransactionExecutor";
 import { FlashblocksPendingLogSource } from "./monitors/flashblocksPendingLogSource";
+import { FlashblockPrimaryLoop } from "./monitors/flashblockPrimaryLoop";
 import {
   getDexesForChain,
   getEscapeHatchPairs,
@@ -56,6 +58,8 @@ import { WatchlistCoordinator } from "./monitors/watchlistCoordinator";
 import { parseWatchlistReserveAllowlist } from "./config/watchlistReserveAllowlist";
 import { SimFailureCircuitBreaker } from "./executors/simFailureCircuitBreaker";
 import { resetCycleDiagnosticsCollector } from "./observability/cycleDiagnostics";
+import { CompetitiveGapAnalyzer } from "./observability/competitiveGapAnalyzer";
+import { evaluateOracleSanity, logOracleSanityFailure } from "./oracles/oracleSanityGate";
 import {
   createReserveAwareCandidates,
   ReserveAwareBorrowerCache,
@@ -92,6 +96,7 @@ import { scheduleHeapSnapshots } from "./utils/heapSnapshotHarness";
 import { startMemoryMonitor } from "./utils/memoryMonitor";
 import { registerHeapSnapshotOnSignal } from "./utils/heapSnapshotOnSignal";
 import { memoryLimitsFromNodeHeap } from "./utils/nodeHeapLimits";
+import { RpcHealthMonitor } from "./utils/rpcHealthMonitor";
 import { mergeBorrowerAddresses } from "./protocols/borrowerDiscovery";
 import {
   createBorrowerDiscoveryAdapters,
@@ -134,7 +139,9 @@ export interface RuntimeConfig {
   readonly sequencerUptimeFeed: Address | undefined;
   readonly sequencerDirectRpc: string | undefined;
   readonly flashblocksEnabled: boolean;
+  readonly flashblocksPrimaryLoop: boolean;
   readonly flashLoanProviders: readonly FlashLoanProviderId[];
+  readonly balancerFlashFallback: boolean;
   readonly privateTxMode: PrivateTxMode;
   /** Resolved subgraph URL for `chain` (first entry in `chains`). */
   readonly aaveSubgraphUrl: string;
@@ -183,7 +190,7 @@ const minimumProfitMarginBpsLive = 50;
 /** Simulation: lower floor so quotes / approvals are easier to observe (raise before live). */
 const minimumProfitMarginBpsSimulation = 40;
 const defaultProfitMarginBps = 50;
-const defaultFlashLoanFeeBps = 9;
+const defaultFlashLoanFeeBps = 5;
 const defaultFlashLoanSlippageFloorBps = 500;
 const placeholderPrivateKey = "0x0000000000000000000000000000000000000000000000000000000000000000";
 const canonicalBaseUsdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
@@ -231,7 +238,12 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     sequencerUptimeFeed: parseAddress(optionalEnv(parsedEnv, "SEQUENCER_UPTIME_FEED")),
     sequencerDirectRpc: optionalEnv(parsedEnv, "SEQUENCER_DIRECT_RPC"),
     flashblocksEnabled: parseBoolean(parsedEnv.FLASHBLOCKS_ENABLED, false),
-    flashLoanProviders: parseFlashLoanProviders(parsedEnv.FLASH_LOAN_PROVIDERS),
+    flashblocksPrimaryLoop: parseBoolean(parsedEnv.FLASHBLOCKS_PRIMARY_LOOP, false),
+    balancerFlashFallback: parseBoolean(parsedEnv.BALANCER_FLASH_FALLBACK, false),
+    flashLoanProviders: applyFlashLoanProviderPolicy(
+      parseFlashLoanProviders(parsedEnv.FLASH_LOAN_PROVIDERS),
+      parseBoolean(parsedEnv.BALANCER_FLASH_FALLBACK, false),
+    ),
     privateTxMode: parsePrivateTxMode(optionalEnv(parsedEnv, "PRIVATE_TX_MODE")),
     pollIntervalMs: parseMinNumber(parsedEnv.POLL_INTERVAL_MS, 400, 100, "POLL_INTERVAL_MS"),
     candidateCooldownMs: parseMinNumber(parsedEnv.CANDIDATE_COOLDOWN_MS, 30_000, 0, "CANDIDATE_COOLDOWN_MS"),
@@ -522,6 +534,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       resolvedFlashLoanFeeBpsPromise = readFlashLoanPremiumBps({
         publicClient,
         pool: chainConfig.aave.pool,
+        expectedBps: 5,
         fallbackBps: config.flashLoanFeeBps,
         logger,
       });
@@ -549,6 +562,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     const gasCostUsdRaw = (gasCostWei * nativePriceRaw) / 1_000_000_000_000_000_000n;
     return Number(gasCostUsdRaw) / 1e8;
   };
+  const maxGasPctOfProfit = parseMinNumber(process.env.MAX_GAS_PCT_OF_PROFIT, 30, 1, "MAX_GAS_PCT_OF_PROFIT");
   const resolveDynamicSlippageBps = async (): Promise<number> => {
     const gasPrice = await gasPriceOracle.getGasPrice();
     const gasGwei = Number(gasPrice) / 1e9;
@@ -571,6 +585,35 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     resolveGasCostUsd: resolveDynamicGasCostUsd,
     resolveFlashFeeBps: resolveFlashLoanFeeBps,
     ...(priceOracleCache === undefined ? {} : { priceOracle: priceOracleCache }),
+    oracleSanityCheck: async ({ chain, account, debtAsset, collateralAsset }) => {
+      if (priceOracleCache === undefined) {
+        return { pass: true, deviationPct: 0 };
+      }
+      const chainlink = await priceOracleCache.forceRefreshUsdPrices([debtAsset]);
+      // Slipstream TWAP integration point: replace with pool TWAP read when wired.
+      const twap = await priceOracleCache.forceRefreshUsdPrices([debtAsset]);
+      const result = evaluateOracleSanity({
+        chain,
+        account,
+        debtAsset,
+        collateralAsset,
+        chainlinkPriceRaw: chainlink[debtAsset] ?? 0n,
+        twapPriceRaw: twap[debtAsset] ?? 0n,
+        thresholdPct: 2,
+      });
+      if (!result.pass) {
+        logOracleSanityFailure(logger, {
+          chain,
+          account,
+          debtAsset,
+          collateralAsset,
+          chainlinkPriceRaw: chainlink[debtAsset] ?? 0n,
+          twapPriceRaw: twap[debtAsset] ?? 0n,
+          thresholdPct: 2,
+        }, result);
+      }
+      return result;
+    },
     borrowerCooldown,
     logger,
     metrics,
@@ -651,6 +694,12 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     logger,
     metrics,
     dryRunMode: config.simulationMode,
+    quoteExecutionGasCap: async ({ expectedProfitUsd, gasLimit }) => quoteBaseExecutionGas({
+      client: publicClient as never,
+      expectedProfitUsd,
+      gasLimit,
+      maxGasPctOfProfit,
+    }),
     privateBundleRiskThresholdBps: 7_000,
     allowPublicFallbackAfterBundleFailure: true,
     bundleRouter: privateSubmissionClient,
@@ -915,6 +964,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   watchlistCoordinatorRef = watchlistCoordinator;
   hybridDetectionRef = hybridDetection;
   let flashblocksPendingSource: FlashblocksPendingLogSource | undefined;
+  let flashblockPrimaryLoop: FlashblockPrimaryLoop | undefined;
+  const rpcHealthMonitor = new RpcHealthMonitor(200, 30_000);
+  let rpcHealthTimer: NodeJS.Timeout | undefined;
   let ammMirrorLogSource: AmmMirrorLogSource | undefined;
   let nearLiqAcceleratedPoller: NearLiquidationAcceleratedPoller | undefined;
   if (useEventWatchlist && config.flashblocksEnabled) {
@@ -934,6 +986,32 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         watchlistCoordinator?.registerBorrowers(accounts);
         void watchlistCoordinator?.refreshPriorityAccounts(accounts);
       },
+    });
+  }
+  if (useEventWatchlist && config.flashblocksEnabled && config.flashblocksPrimaryLoop) {
+    flashblockPrimaryLoop = new FlashblockPrimaryLoop({
+      chain: config.chain,
+      logger,
+      metrics,
+      intervalMs: 200,
+      runCycle: async () => {
+        if (watchlistCoordinator !== undefined) {
+          await watchlistCoordinator.sweepAndRefresh(config.chain);
+        }
+        await orchestrator.runOnce();
+      },
+      ...(priceOracleCache === undefined
+        ? {}
+        : {
+          getOraclePricesUsdRaw: async () => {
+            const prices = await priceOracleCache.batchGetUsdPrices([
+              canonicalBaseWeth,
+              canonicalBaseUsdc,
+              canonicalBaseCbBtc,
+            ]);
+            return prices;
+          },
+        }),
     });
   }
   const detection = new PipelineDetectionAdapter({
@@ -1008,10 +1086,22 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         provider: activeChainConfig.aave.poolAddressesProvider,
       });
     }
+    const resolvedFlashLoanFeeBps = await resolveFlashLoanFeeBps();
+    router.setProviderFee(
+      "aaveV3",
+      createAssetAmount(usd, BigInt(Math.trunc(resolvedFlashLoanFeeBps * 1_000_000))),
+    );
+    if (config.balancerFlashFallback) {
+      router.setProviderFee(
+        "balancer",
+        createAssetAmount(usd, BigInt(Math.trunc(config.flashLoanFeeBps * 1_000_000))),
+      );
+    }
     if (watchlistCoordinator !== undefined) {
       await watchlistCoordinator.start();
     }
     flashblocksPendingSource?.start();
+    flashblockPrimaryLoop?.start();
     if (useLocalMirror && config.wsRpcUrlPrimary !== undefined) {
       const mirrorPools = resolveMirrorPoolsForChain(config.chain);
       ammMirrorLogSource = new AmmMirrorLogSource({
@@ -1057,15 +1147,6 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       nearLiqAcceleratedPoller.setAccounts(tracked as Address[]);
       nearLiqAcceleratedPoller.start();
     }
-    const resolvedFlashLoanFeeBps = await resolveFlashLoanFeeBps();
-    router.setProviderFee(
-      "aaveV3",
-      createAssetAmount(usd, BigInt(Math.trunc(resolvedFlashLoanFeeBps * 1_000_000))),
-    );
-    router.setProviderFee(
-      "balancer",
-      createAssetAmount(usd, BigInt(Math.trunc(config.flashLoanFeeBps * 1_000_000))),
-    );
     if (validateLiquidationReceiverRpc) {
       const registryUniswap = getDexesForChain(config.chain).find((dex) => dex.name === "UniswapV3");
       const expectedSwapRouter = liquidationReceiverExpectedSwapRouter ?? registryUniswap?.router;
@@ -1089,9 +1170,41 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     if (priceOracleCache !== undefined) {
       await assertArbitrageOracleReadiness(config, priceOracleCache);
     }
+    if (rpcHealthTimer === undefined) {
+      rpcHealthTimer = setInterval(() => {
+        const startedAt = Date.now();
+        void publicClient.getBlockNumber()
+          .then(() => {
+            const rttMs = Date.now() - startedAt;
+            rpcHealthMonitor.observe(rttMs);
+            if (!rpcHealthMonitor.isSustainedHigh()) {
+              return;
+            }
+            registry.setCircuitBreakerState(config.chain, "rpc", {
+              status: "open",
+              failures: registry.get(config.chain).circuitBreakers.rpc.failures + 1,
+              openedAtMs: Date.now(),
+            });
+            logger.warn("rpc_rtt_sustained_high_failover", {
+              chain: config.chain,
+              rttMs,
+              thresholdMs: 200,
+              windowMs: 30_000,
+            });
+          })
+          .catch((error) => {
+            logger.warn("rpc_health_probe_failed", {
+              chain: config.chain,
+              error: String(error),
+            });
+          });
+      }, 1_000);
+      rpcHealthTimer.unref?.();
+    }
   };
   const hazardModel = new BayesianHazardModel();
   const noRegretRanker = new NoRegretOpportunityRanker({ model: hazardModel });
+  const competitiveGapAnalyzer = new CompetitiveGapAnalyzer();
   const memoryStatsEveryCycles = parseMinNumber(
     process.env.MEMORY_LOG_EVERY_CYCLES,
     300,
@@ -1104,7 +1217,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     registry,
     chain: config.chain,
     logger,
-    threshold: parseMinNumber(process.env.EXECUTION_SIM_FAILURE_THRESHOLD, 5, 1, "EXECUTION_SIM_FAILURE_THRESHOLD"),
+    threshold: parseMinNumber(process.env.EXECUTION_SIM_FAILURE_THRESHOLD, 3, 1, "EXECUTION_SIM_FAILURE_THRESHOLD"),
     openMs: parseMinNumber(process.env.EXECUTION_CIRCUIT_OPEN_MS, 60_000, 1_000, "EXECUTION_CIRCUIT_OPEN_MS"),
   });
   const orchestrator = new PipelineOrchestrator({
@@ -1187,10 +1300,21 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     outcomeObserver: {
       recordOutcome: async (outcome) => {
         noRegretRanker.recordOutcome(outcome);
+        competitiveGapAnalyzer.record({
+          opportunityId: outcome.opportunityId,
+          chain: outcome.chain,
+          outcome: outcome.outcome,
+          recordedAtMs: Date.now(),
+        });
+        if (outcome.outcome === "lost_to_competitor") {
+          const assetFeature = outcome.features.find((feature) => feature.startsWith("debt:")) ?? "debt:unknown";
+          metrics.recordOnChainLiquidatedByOther(outcome.chain, "liquidation", assetFeature.slice("debt:".length));
+        }
         logger.info("no_regret_outcome_recorded", {
           opportunityId: outcome.opportunityId,
           outcome: outcome.outcome,
           cumulativeRegret: noRegretRanker.cumulativeRegret(),
+          competitiveGap: competitiveGapAnalyzer.summary(),
         });
       },
     },
@@ -1265,11 +1389,18 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   });
   shutdown.addHook("watchlist_rescanner_stop", async () => watchlistRescanner?.stop());
   shutdown.addHook("flashblocks_pending_stop", async () => flashblocksPendingSource?.stop());
+  shutdown.addHook("flashblocks_primary_loop_stop", async () => flashblockPrimaryLoop?.stop());
   shutdown.addHook("amm_mirror_log_stop", async () => ammMirrorLogSource?.stop());
   shutdown.addHook("near_liq_accelerated_stop", async () => nearLiqAcceleratedPoller?.stop());
   shutdown.addHook("watchlist_coordinator_stop", async () => watchlistCoordinator?.stop());
   shutdown.addHook("hybrid_detection_drain", async () => hybridDetection.drain());
   shutdown.addHook("memory_monitor_stop", async () => memoryMonitor.stop());
+  shutdown.addHook("rpc_health_monitor_stop", async () => {
+    if (rpcHealthTimer !== undefined) {
+      clearInterval(rpcHealthTimer);
+      rpcHealthTimer = undefined;
+    }
+  });
   shutdown.addHook("arb_queue_stop", async () => arbQueue.stop());
   shutdown.addHook("oracle_poll_stop", async () => priceOracleCache?.stopBackgroundPoll());
 
@@ -1500,6 +1631,7 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
   const resolvedFlashLoanFeeBps = await readFlashLoanPremiumBps({
     publicClient,
     pool: chainConfig.aave.pool,
+    expectedBps: 5,
     fallbackBps: config.flashLoanFeeBps,
     logger,
   });
@@ -1515,6 +1647,12 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
     logger,
     metrics,
     dryRunMode: true,
+    quoteExecutionGasCap: async ({ expectedProfitUsd, gasLimit }) => quoteBaseExecutionGas({
+      client: publicClient as never,
+      expectedProfitUsd,
+      gasLimit,
+      maxGasPctOfProfit: parseMinNumber(process.env.MAX_GAS_PCT_OF_PROFIT, 30, 1, "MAX_GAS_PCT_OF_PROFIT"),
+    }),
   });
   const gasCostUsd = replayGasCostUsd;
   let simulated = 0;
@@ -2091,6 +2229,7 @@ async function readFlashLoanPremiumBps(input: {
     readContract(args: Record<string, unknown>): Promise<unknown>;
   };
   readonly pool: Address;
+  readonly expectedBps: number;
   readonly fallbackBps: number;
   readonly logger: LoggerLike;
 }): Promise<number> {
@@ -2111,7 +2250,18 @@ async function readFlashLoanPremiumBps(input: {
     if (!Number.isFinite(parsed) || parsed < 0) {
       throw new Error(`Invalid flash-loan premium value: ${String(raw)}`);
     }
-    input.logger.info("flash_loan_premium_loaded", { pool: input.pool, premiumBps: parsed });
+    if (parsed !== input.expectedBps) {
+      input.logger.warn("flash_loan_premium_governance_drift", {
+        pool: input.pool,
+        expectedBps: input.expectedBps,
+        onChainBps: parsed,
+      });
+    } else {
+      input.logger.info("flash_loan_premium_verified", {
+        pool: input.pool,
+        premiumBps: parsed,
+      });
+    }
     return parsed;
   } catch (error) {
     input.logger.warn("flash_loan_premium_fallback", {
@@ -2121,6 +2271,16 @@ async function readFlashLoanPremiumBps(input: {
     });
     return input.fallbackBps;
   }
+}
+
+function applyFlashLoanProviderPolicy(
+  providers: readonly FlashLoanProviderId[],
+  balancerFlashFallback: boolean,
+): FlashLoanProviderId[] {
+  if (balancerFlashFallback) {
+    return [...providers];
+  }
+  return providers.filter((provider) => provider !== "balancer");
 }
 
 type ResolvedAaveAddresses = {

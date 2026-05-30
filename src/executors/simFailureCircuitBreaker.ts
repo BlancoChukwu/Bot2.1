@@ -2,7 +2,7 @@ import type { ChainRegistry } from "../config/chainRegistry";
 import type { SupportedChain } from "../config/chains";
 import type { LoggerLike } from "../bot";
 
-const defaultThreshold = 5;
+const defaultThreshold = 3;
 const defaultOpenMs = 60_000;
 
 export class SimFailureCircuitBreaker {

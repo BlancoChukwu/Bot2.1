@@ -16,6 +16,7 @@
     "test:coverage": "vitest run --coverage --pool=forks --no-file-parallelism",
     "test:watch": "vitest",
     "benchmark:base": "ts-node test/integration/benchmark.replay.ts",
+    "benchmark:rpc": "node scripts/rpc-benchmark.mjs",
     "replay:historical": "ts-node scripts/replay-historical.ts",
     "replay:liquidation-block": "ts-node scripts/replay-liquidation-block.ts",
     "probe:multicall-base": "ts-node scripts/multicall-batch-probe-base.ts",
@@ -28,7 +29,9 @@
     "dry-run:receipt": "node scripts/ensure-redis.mjs && npm run build && node scripts/emit-dry-run-receipt.mjs --live && node scripts/apply-dry-run-receipt-to-env.mjs",
     "audit:watchlist-base": "node scripts/audit-watchlist-base.mjs",
     "audit:dex-surface-base": "node scripts/audit-dex-surface-base.mjs",
+    "audit:morpho-preliquidation-base": "node scripts/audit-morpho-preliquidation-base.mjs",
     "test:flashblocks": "node scripts/flashblocks-connection-test.mjs",
+    "report:competitive-gap": "node scripts/competitive-gap-report.mjs --hours 48",
     "review:daily-pipeline": "node scripts/daily-pipeline-review.mjs",
     "pairs:top-base": "node scripts/select-top-base-pairs.mjs"
   },

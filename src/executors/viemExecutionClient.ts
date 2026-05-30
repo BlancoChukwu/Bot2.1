@@ -9,7 +9,12 @@ export interface ViemExecutionClientConfig {
     getTransactionCount(args: Record<string, unknown>): Promise<number>;
     call(args: Record<string, unknown>): Promise<unknown>;
     simulateContract?(args: Record<string, unknown>): Promise<unknown>;
-    waitForTransactionReceipt(args: Record<string, unknown>): Promise<{ status: "success" | "reverted" }>;
+    waitForTransactionReceipt(args: Record<string, unknown>): Promise<{
+      status: "success" | "reverted";
+      blockNumber?: bigint;
+      blockHash?: `0x${string}`;
+    }>;
+    getBlock?(args: Record<string, unknown>): Promise<{ hash: `0x${string}` }>;
   };
   readonly walletClient: {
     account?: { address: `0x${string}` };
@@ -81,8 +86,19 @@ export class ViemExecutionClient implements ExecutionPreflightClient {
     });
   }
 
-  public async waitForReceipt(hash: `0x${string}`): Promise<{ readonly status: "included" | "reverted" }> {
+  public async waitForReceipt(hash: `0x${string}`): Promise<{ readonly status: "included" | "reorged" | "reverted" }> {
     const receipt = await this.config.publicClient.waitForTransactionReceipt({ hash });
+    if (
+      receipt.status === "success"
+      && receipt.blockNumber !== undefined
+      && receipt.blockHash !== undefined
+      && this.config.publicClient.getBlock !== undefined
+    ) {
+      const canonical = await this.config.publicClient.getBlock({ blockNumber: receipt.blockNumber });
+      if (canonical.hash !== receipt.blockHash) {
+        return { status: "reorged" };
+      }
+    }
     return receipt.status === "success" ? { status: "included" } : { status: "reverted" };
   }
 
