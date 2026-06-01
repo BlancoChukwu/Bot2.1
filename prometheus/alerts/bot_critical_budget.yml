@@ -1,0 +1,49 @@
+# Relaxed thresholds when RPC_BUDGET_MODE=true (GATE_SCALE_FACTOR=2).
+# Load instead of bot_critical.yml on quota-constrained hosts.
+groups:
+  - name: bot_critical_budget
+    rules:
+      - alert: WatchlistStale
+        expr: max(watchlist_last_update_age_seconds) > 120
+        for: 20s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Watchlist stale — pipeline may be paused (budget profile)"
+          description: "watchlist_last_update_age_seconds exceeded 120s for {{ $labels.chain }}"
+
+      - alert: MemoryHighRSS
+        expr: process_rss_bytes > 838860800
+        for: 60s
+        labels:
+          severity: warning
+        annotations:
+          summary: "RSS exceeding 800 MB — check for memory leak (budget profile)"
+          description: "process_rss_bytes={{ $value }} (> 838860800)"
+
+      - alert: FlashblockToDetectionP99High
+        expr: histogram_quantile(0.99, sum by (le) (rate(pipeline_latency_ms_bucket{stage="flashblock_to_detection_ms"}[10m]))) > 100
+        for: 4m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Flashblock->detection p99 above 100ms (budget profile)"
+          description: "p99 flashblock_to_detection_ms is {{ $value }} ms"
+
+      - alert: DetectionToSimulationP99High
+        expr: histogram_quantile(0.99, sum by (le) (rate(pipeline_latency_ms_bucket{stage="detection_to_simulation_ms"}[10m]))) > 200
+        for: 4m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Detection->simulation p99 above 200ms (budget profile)"
+          description: "p99 detection_to_simulation_ms is {{ $value }} ms"
+
+      - alert: SimulationToWouldSubmitP99High
+        expr: histogram_quantile(0.99, sum by (le) (rate(pipeline_latency_ms_bucket{stage="simulation_to_would_submit_ms"}[10m]))) > 60
+        for: 4m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Simulation->would-submit p99 above 60ms (budget profile)"
+          description: "p99 simulation_to_would_submit_ms is {{ $value }} ms"

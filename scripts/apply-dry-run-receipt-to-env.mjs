@@ -1,10 +1,17 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { resolveDotenvPath } from "./env-profile-path.mjs";
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const receiptPath = resolve(root, ".runtime/dry-run-receipt.json");
-const envPath = resolve(root, ".env");
+const productionPath = resolve(root, ".env.production");
+const envPath = process.env.BOT_ENV_FILE?.trim() || process.env.DOTENV_CONFIG_PATH?.trim()
+  ? resolveDotenvPath(root)
+  : existsSync(productionPath)
+    ? productionPath
+    : resolveDotenvPath(root);
 
 const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
 const configHash = receipt.configHash;
@@ -33,5 +40,6 @@ writeFileSync(envPath, env, "utf8");
 console.log("dry_run_receipt_applied", {
   validatedAtMs,
   receiptPath,
+  envPath,
   ttlMinutes: 15,
 });

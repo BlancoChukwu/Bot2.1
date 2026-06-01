@@ -2,10 +2,29 @@
  * Parse JSON-line bot logs and emit a 24h shadow-validation audit report.
  * Usage: node scripts/audit-session.mjs [logPath]
  */
+import { config } from "dotenv";
 import { readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+
+config({ path: join(process.cwd(), ".env") });
 
 const logPath = resolve(process.argv[2] ?? "logs/live-24h.log");
+
+function gateScaleFactor() {
+  const budget = (process.env.RPC_BUDGET_MODE ?? "").trim().toLowerCase();
+  if (budget === "1" || budget === "true" || budget === "yes" || budget === "on") {
+    const raw = process.env.GATE_SCALE_FACTOR?.trim();
+    const parsed = raw ? Number(raw) : 2;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 2;
+  }
+  const raw = process.env.GATE_SCALE_FACTOR?.trim();
+  const parsed = raw ? Number(raw) : 1;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function scaledGate(base) {
+  return base * gateScaleFactor();
+}
 
 function readLogLines(path) {
   const buffer = readFileSync(path);
@@ -146,12 +165,14 @@ const dynamicFloorMedian = dynamicFloors.length
   ? dynamicFloors.slice().sort((a, b) => a - b)[Math.floor(dynamicFloors.length / 2)]
   : null;
 
+const minLiquidationEvaluated = scaledGate(50);
+const maxRssGrowthMbPerHour = scaledGate(10);
 const metrics = [
   {
     id: 1,
     name: "liquidation_evaluated",
-    pass: counts.liquidation_evaluated >= 50,
-    detail: `${counts.liquidation_evaluated} events (need >=50 for dynamicFloor sanity)`,
+    pass: counts.liquidation_evaluated >= minLiquidationEvaluated,
+    detail: `${counts.liquidation_evaluated} events (need >=${minLiquidationEvaluated} for dynamicFloor sanity)`,
     dynamicFloorMin,
     dynamicFloorMedian,
     dynamicFloorMax,
@@ -190,8 +211,8 @@ const metrics = [
   {
     id: 8,
     name: "memory_rss_growth_rate",
-    pass: rssGrowthMbPerHour(rssSamples) < 10,
-    detail: `${rssGrowthMbPerHour(rssSamples).toFixed(2)} MB/hour (limit < 10 MB/hour)`,
+    pass: rssGrowthMbPerHour(rssSamples) < maxRssGrowthMbPerHour,
+    detail: `${rssGrowthMbPerHour(rssSamples).toFixed(2)} MB/hour (limit < ${maxRssGrowthMbPerHour} MB/hour)`,
   },
   {
     id: 5,
@@ -203,6 +224,7 @@ const metrics = [
 
 const audit = {
   logPath,
+  gateScaleFactor: gateScaleFactor(),
   window: { firstTs, lastTs },
   logSizeBytes,
   parseErrors,

@@ -5,17 +5,16 @@ echo ========================================
 echo  PRODUCTION - SAFETY GATE DISABLED
 echo ========================================
 echo.
+echo Env file: .env.production
 echo WARNING: SKIP_DEPLOYMENT_SAFETY_GATE=true
-echo Dry-run receipt checks are NOT enforced.
-echo Real transactions may be sent when SIMULATION_MODE=false.
 echo.
 pause
 
+call scripts\launcher-set-dotenv.cmd .env.production
+if errorlevel 1 exit /b 1
+
 echo Pre-flight: stop bots and clear stale lock...
 call npm run bot:stop
-echo.
-
-echo Stop: Stop Bot.cmd (graceful) or npm run bot:stop
 echo.
 
 call scripts\build-dist.cmd

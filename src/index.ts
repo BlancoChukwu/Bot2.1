@@ -1,4 +1,7 @@
 import "dotenv/config";
+import { applyRpcBudgetEnvDefaults } from "./config/rpcBudgetProfile";
+
+applyRpcBudgetEnvDefaults();
 import { createWalletClient, http, parseAbiItem, parseEther, type Address, type Hex, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -935,6 +938,18 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       ...(parseBoolean(process.env.SKIP_COLD_START_FULL_SWEEP, false)
         ? { skipColdStartFullSweep: true }
         : {}),
+      lowTierEveryBlocks: BigInt(parseMinNumber(
+        process.env.LOW_TIER_EVERY_BLOCKS,
+        100,
+        1,
+        "LOW_TIER_EVERY_BLOCKS",
+      )),
+      maxStaleMs: parseMinNumber(
+        process.env.WATCHLIST_MAX_STALE_MS,
+        60_000,
+        5_000,
+        "WATCHLIST_MAX_STALE_MS",
+      ),
     });
     borrowAccountHook.onBorrow = (accounts) => {
       watchlistCoordinator?.registerBorrowers(accounts);
@@ -993,7 +1008,12 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       chain: config.chain,
       logger,
       metrics,
-      intervalMs: 200,
+      intervalMs: parseMinNumber(
+        process.env.FLASHBLOCKS_PRIMARY_LOOP_MS,
+        200,
+        50,
+        "FLASHBLOCKS_PRIMARY_LOOP_MS",
+      ),
       runCycle: async () => {
         if (watchlistCoordinator !== undefined) {
           await watchlistCoordinator.sweepAndRefresh(config.chain);

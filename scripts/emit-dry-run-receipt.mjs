@@ -4,8 +4,10 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { resolveDotenvPath } from "./env-profile-path.mjs";
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-config({ path: resolve(root, ".env") });
+config({ path: resolveDotenvPath(root) });
 
 const require = createRequire(import.meta.url);
 const { parseRuntimeConfig } = require(resolve(root, "dist/src/index.js"));

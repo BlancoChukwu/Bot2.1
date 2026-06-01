@@ -124,6 +124,10 @@ Proceed with full **2h** detached soak on this build.
 - Phase 1 complete on Base Aave V3
 - Next: ship Phase 1b metrics/alerts → 72h live run
 
+## RPC budget profile (Oracle Ubuntu)
+
+When provider WS/RPC quotas are near limit, enable `RPC_BUDGET_MODE=true` on the VM. See [RPC_BUDGET_PROFILE.md](./RPC_BUDGET_PROFILE.md) for halved duty cycle and 2× relaxed validation thresholds.
+
 ## Phase 3 go-live gates
 
 Run these checks before enabling first live Moonwell/Morpho target liquidation:
@@ -137,12 +141,12 @@ npm run report:competitive-gap
 npm run review:daily-pipeline
 ```
 
-Required outcomes:
+Required outcomes (standard; with `RPC_BUDGET_MODE=true` thresholds are 2× — see RPC_BUDGET_PROFILE.md):
 
-- `flashblock_to_detection_ms` p99 < 50ms (48h shadow window)
-- `detection_to_simulation_ms` p99 < 100ms
-- `simulation_to_would_submit_ms` p99 < 30ms
-- Competitive gap report exits 0 with same-block ratio >= 0.70
+- `flashblock_to_detection_ms` p99 < 50ms (48h shadow window; **100ms** budget)
+- `detection_to_simulation_ms` p99 < 100ms (**200ms** budget)
+- `simulation_to_would_submit_ms` p99 < 30ms (**60ms** budget)
+- Competitive gap report exits 0 with same-block ratio >= 0.70 (**0.35** budget)
 - Daily review reports `unhandledReverts` <= configured threshold
 
 ## Phase 1b — Watchlist metrics + alerts
@@ -165,7 +169,7 @@ rule_files:
   - prometheus/alerts/bot_critical.yml
 ```
 
-Pass before 72h live: `watchlist_circuit_breaker_open == 0`, `max(watchlist_last_update_age_seconds) < 60`, RSS stable, `watchlist_gap_replay_total` increments on restart.
+Pass before 72h live: `watchlist_circuit_breaker_open == 0`, `max(watchlist_last_update_age_seconds) < 60` (**120** with RPC budget), RSS stable, `watchlist_gap_replay_total` increments on restart.
 
 ## Multicall batch probe (before soak)
 
@@ -241,9 +245,9 @@ Run **before** tuning profitability or execution:
 Pass criteria:
 
 - `memory_ceiling_hit = 0`
-- RSS growth `< 10 MB/hour` (`memory_rss_growth_rate` metric in audit output); investigate if **> 30 MB/hour**
+- RSS growth `< 10 MB/hour` (`memory_rss_growth_rate` metric in audit output; **20 MB/hour** with RPC budget); investigate if **> 30 MB/hour** (**60** budget)
 - No self-exit loop (`launcher_session_exit` should not appear unexpectedly)
-- RSS remains below 400 MB steady state for the session window
+- RSS remains below 400 MB steady state for the session window (**800 MB** Prometheus alert in budget profile)
 2. `buildLiquidationExecutionRequest` succeeds in sim
 3. Dry-run preview passes deployment safety gate
 4. Live: one tx with `liquidation_path_validated` log, or signed dry-run receipt

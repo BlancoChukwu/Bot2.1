@@ -1,6 +1,9 @@
 #!/usr/bin/env node
+import { config } from "dotenv";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+
+config({ path: join(process.cwd(), ".env") });
 
 const hours = Number(process.argv.includes("--hours")
   ? process.argv[process.argv.indexOf("--hours") + 1]
@@ -55,6 +58,7 @@ for (const file of files) {
   }
 }
 
+const minRatio = Number(process.env.COMPETITIVE_GAP_MIN_RATIO ?? "0.7");
 const sameBlockRatio = detected > 0 ? won / detected : 0;
 const result = {
   hours,
@@ -62,7 +66,8 @@ const result = {
   won,
   lostToCompetitor,
   sameBlockRatio,
-  targetMet: sameBlockRatio >= 0.7,
+  minRatio,
+  targetMet: sameBlockRatio >= minRatio,
 };
 
 console.log(JSON.stringify(result, null, 2));

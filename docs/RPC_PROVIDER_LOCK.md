@@ -29,9 +29,18 @@ The script writes `.runtime/rpc-benchmark.json` with per-provider measurements:
 
 ## Acceptance targets
 
-- `newHeadsWsLatency.p95_ms < 50` on the locked primary/secondary path
+- `newHeadsWsLatency.p95_ms < 50` on the locked primary/secondary path (standard)
 - Flashblock cadence around the configured tick interval
 - No persistent RPC call failures in `ethCallRtt`
+
+Verify with:
+
+```bash
+npm run benchmark:rpc
+npm run check:rpc-gates
+```
+
+**Quota-limited hosts:** set `RPC_BUDGET_MODE=true` in `.env` (see [RPC_BUDGET_PROFILE.md](./RPC_BUDGET_PROFILE.md)). Gates scale 2× (e.g. WS p95 &lt; **100** ms) and the bot applies ~50% lower steady-state RPC duty cycle.
 
 If a provider fails targets, rotate it out before the 48h shadow window.
 

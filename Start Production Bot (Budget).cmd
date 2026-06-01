@@ -2,13 +2,12 @@
 cd /d "%~dp0"
 
 echo ========================================
-echo  Aave V3 Liquidator - PRODUCTION
+echo  Aave V3 Liquidator - PRODUCTION (BUDGET)
 echo ========================================
 echo.
-echo Env file: .env.production (standard RPC profile)
-echo For budget mode use: Start Production Bot (Budget).cmd
+echo Env file: .env.production.budget (RPC_BUDGET_MODE=true)
 echo.
-call scripts\launcher-set-dotenv.cmd .env.production
+call scripts\launcher-set-dotenv.cmd .env.production.budget
 if errorlevel 1 (
   pause
   exit /b 1
@@ -25,13 +24,6 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Build: npm run build
-echo Mode: LIVE (SIMULATION_MODE=false)
-echo Memory: NODE_OPTIONS=650MB heap
-echo Safety: deployment gate ON
-echo If gate blocks: run "Setup Dry Run Receipt.cmd" then relaunch within 15 min
-echo Logs: logs\latest-session.txt
-echo.
 
 call scripts\build-dist.cmd
 if errorlevel 1 (
@@ -40,8 +32,8 @@ if errorlevel 1 (
 )
 
 call scripts\preflight-production-env.cmd
-set BOT_LOG_PREFIX=production
-set BOT_WINDOW_TITLE=Aave Liquidator - Production
+set BOT_LOG_PREFIX=production-budget
+set BOT_WINDOW_TITLE=Aave Liquidator - Production (Budget)
 set USE_START_LIVE=
 set SIMULATION_MODE=false
 set SKIP_DEPLOYMENT_SAFETY_GATE=false

@@ -10,8 +10,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import Redis from "ioredis";
 
+import { resolveDotenvPath } from "./env-profile-path.mjs";
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-config({ path: join(root, ".env") });
+config({ path: resolveDotenvPath(root) });
 
 const redisUrl = process.env.REDIS_URL?.trim();
 if (redisUrl === undefined || redisUrl === "") {

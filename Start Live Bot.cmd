@@ -6,12 +6,14 @@ echo ========================================
 echo  Aave V3 Liquidator - LIVE (ts-node)
 echo ========================================
 echo.
+call scripts\launcher-set-dotenv.cmd .env.production
+if errorlevel 1 exit /b 1
+echo.
 echo Pre-flight: stop bots and clear stale lock...
 call npm run bot:stop
 echo.
 echo Mode: npm run start:live (ts-node src\index.ts), SIMULATION_MODE=false
-echo Safety gate: ON (dry-run receipt required — see .env.example)
-echo Launch: detached (no build step — uses src directly)
+echo Env: .env.production
 echo Logs: logs\latest-session.txt
 echo Stop: Stop Bot.cmd (graceful) or npm run bot:stop
 echo.

@@ -50,6 +50,8 @@ if errorlevel 1 goto :failed
   echo rust_hotpath=%RUST_HOTPATH_ENABLED%
   echo simulation_mode=%SIMULATION_MODE%
   echo skip_deployment_gate=%SKIP_DEPLOYMENT_SAFETY_GATE%
+  echo env_file=%BOT_ENV_FILE%
+  echo dotenv=%DOTENV_CONFIG_PATH%
 ) > logs\latest-session.txt
 
 chcp 65001>nul

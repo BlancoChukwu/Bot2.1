@@ -38,6 +38,7 @@ export interface WatchlistCoordinatorConfig {
   readonly minDebtBase: bigint;
   readonly multicallBatchSize?: number;
   readonly lowTierEveryBlocks?: bigint;
+  readonly maxStaleMs?: number;
   readonly redisUrl?: string;
   readonly coldStartLookbackBlocks?: bigint;
   readonly fullSweepIntervalMs?: number;
@@ -58,7 +59,7 @@ export interface WatchlistCoordinatorConfig {
 }
 
 export class WatchlistCoordinator implements BorrowerSnapshotProvider {
-  public readonly stalenessGuard = new StalenessGuard();
+  public readonly stalenessGuard: StalenessGuard;
   public readonly watchlist = new BoundedWatchlist();
   private borrowersDiscovered = 0;
   private diagnosticSampleCursor = 0;
@@ -70,6 +71,7 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
   private fullSweepTimer: NodeJS.Timeout | undefined;
 
   public constructor(private readonly config: WatchlistCoordinatorConfig) {
+    this.stalenessGuard = new StalenessGuard(config.maxStaleMs);
     this.snapshotProvider = new AaveSnapshotProvider(
       config.chain,
       config.protocol,

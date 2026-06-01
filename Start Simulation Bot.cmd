@@ -5,6 +5,14 @@ echo ========================================
 echo  Aave V3 Liquidator - SIMULATION SOAK
 echo ========================================
 echo.
+echo Env file: .env.simulation (RPC_BUDGET_MODE=true, SIMULATION_MODE=true)
+echo.
+call scripts\launcher-set-dotenv.cmd .env.simulation
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
+
 call npm run bot:stop
 echo.
 call node scripts\ensure-redis.mjs
