@@ -47,6 +47,7 @@ export interface HybridDetectionPipelineConfig {
   readonly liquidationGate?: LiquidationCandidateGate;
   readonly onDetectionFailure?: () => void;
   readonly rescanBreaker?: RescanCircuitBreaker;
+  readonly reserveEventRefreshEnabled?: boolean;
 }
 
 export class HybridDetectionPipeline {
@@ -67,6 +68,9 @@ export class HybridDetectionPipeline {
 
   public async start(): Promise<void> {
     if (this.stopEvents !== undefined) {
+      return;
+    }
+    if (this.config.reserveEventRefreshEnabled === false) {
       return;
     }
 
@@ -131,6 +135,10 @@ export class HybridDetectionPipeline {
   }
 
   private async handleReserveUpdated(event: DetectionReserveEvent): Promise<void> {
+    if (this.config.reserveEventRefreshEnabled === false) {
+      return;
+    }
+
     const startedAt = Date.now();
     const resolvedAave = this.config.registry.getResolvedAave(event.chain);
     try {

@@ -134,6 +134,38 @@ describe("HybridDetectionPipeline", () => {
     expect(pipeline.getCircuitBreakerState("optimism", "rpc").status).toBe("open");
   });
 
+  it("skips reserve event subscription when reserveEventRefreshEnabled is false", async () => {
+    const startSpy = vi.fn(() => () => undefined);
+    const refreshSpy = vi.fn(async () => []);
+    const pipeline = new HybridDetectionPipeline({
+      registry,
+      eventSource: { start: startSpy },
+      provider: {
+        getBorrowersForReserve: async () => [account],
+        refreshBorrowers: refreshSpy,
+        pollBorrowers: async () => [],
+      },
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      reserveEventRefreshEnabled: false,
+    });
+
+    await pipeline.start();
+
+    expect(startSpy).not.toHaveBeenCalled();
+
+    await (
+      pipeline as unknown as {
+        handleReserveUpdated(event: { readonly chain: "optimism"; readonly reserve: `0x${string}` }): Promise<void>;
+      }
+    ).handleReserveUpdated({
+      chain: "optimism",
+      reserve: "0x0000000000000000000000000000000000000002",
+    });
+
+    expect(refreshSpy).not.toHaveBeenCalled();
+  });
+
   it("invokes onDetectionFailure when the event source reports an error", async () => {
     const onDetectionFailure = vi.fn();
     const pipeline = new HybridDetectionPipeline({

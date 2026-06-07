@@ -9,6 +9,7 @@ import type { ExecutionResult, LiquidationExecutor } from "./executors/liquidati
 import type { HealthFactorMonitor } from "./monitors/healthFactorMonitor";
 import type { LiquidationCandidate } from "./protocols/aaveV3";
 import { calculateLiquidationEV } from "./utils/evCalculator";
+import { attachRpcMetricsToRegistry, setRpcMetricsRecorder } from "./utils/rpcCallMetrics";
 
 export type BotLatencyStage = "scan" | "execution" | "poll_cycle";
 export type PipelineLatencyStage =
@@ -239,6 +240,7 @@ export class LiquidationBot {
 
 export function createBotMetrics(): BotMetrics {
   const registry = createMetricsRegistry();
+  setRpcMetricsRecorder(attachRpcMetricsToRegistry(registry));
   const snapshot: {
     positionsScanned: number;
     liquidationsAttempted: number;

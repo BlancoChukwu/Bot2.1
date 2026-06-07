@@ -143,6 +143,7 @@ export interface RuntimeConfig {
   readonly sequencerDirectRpc: string | undefined;
   readonly flashblocksEnabled: boolean;
   readonly flashblocksPrimaryLoop: boolean;
+  readonly hybridDetectionEnabled: boolean;
   readonly flashLoanProviders: readonly FlashLoanProviderId[];
   readonly balancerFlashFallback: boolean;
   readonly privateTxMode: PrivateTxMode;
@@ -242,6 +243,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     sequencerDirectRpc: optionalEnv(parsedEnv, "SEQUENCER_DIRECT_RPC"),
     flashblocksEnabled: parseBoolean(parsedEnv.FLASHBLOCKS_ENABLED, false),
     flashblocksPrimaryLoop: parseBoolean(parsedEnv.FLASHBLOCKS_PRIMARY_LOOP, false),
+    hybridDetectionEnabled: parseBoolean(parsedEnv.HYBRID_DETECTION_ENABLED, false),
     balancerFlashFallback: parseBoolean(parsedEnv.BALANCER_FLASH_FALLBACK, false),
     flashLoanProviders: applyFlashLoanProviderPolicy(
       parseFlashLoanProviders(parsedEnv.FLASH_LOAN_PROVIDERS),
@@ -959,6 +961,12 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     watchlistBlockHooks.coordinator = watchlistCoordinator;
     logger.info("event_watchlist_enabled", { chain: config.chain, pool: activePoolAddress });
   }
+  if (!config.hybridDetectionEnabled) {
+    logger.info("hybrid_detection_disabled", {
+      chain: config.chain,
+      reason: "HYBRID_DETECTION_ENABLED=false",
+    });
+  }
   const hybridDetection = new HybridDetectionPipeline({
     registry,
     eventSource: detectionSource,
@@ -968,6 +976,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     liquidationGate,
     rescanBreaker,
     onDetectionFailure: () => memoryMonitor.checkNow(),
+    reserveEventRefreshEnabled: config.hybridDetectionEnabled,
   });
   if (useEventWatchlist) {
     watchlistBlockHooks.upsertSnapshots = (snapshots) => {
