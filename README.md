@@ -106,11 +106,15 @@ npm run build
 
 | File | Purpose |
 |------|---------|
-| `Start Production Bot.cmd` | **Recommended live:** build if needed, `SIMULATION_MODE=false`, `node dist/src/index.js` |
-| `Start Production Bot (No Gate).cmd` | Same as production but `SKIP_DEPLOYMENT_SAFETY_GATE=true` (no dry-run receipt gate) |
-| `Start Simulation Bot.cmd` | Safe default: `SIMULATION_MODE=true`, compiled entry |
+| `Start Event-Purity Soak.cmd` | **Recommended 48h soak:** `.env.event-purity-soak`, Flashblocks WS, shadow only |
+| `Start Event-Purity Production.cmd` | **Recommended live:** `.env.event-purity-production`, `ENABLE_LIVE_TX=true`, safety gate ON |
+| `Start Production Bot.cmd` | Legacy live: standard orchestrator profile |
+| `Start Production Bot (No Gate).cmd` | Legacy live with `SKIP_DEPLOYMENT_SAFETY_GATE=true` |
+| `Start Simulation Bot.cmd` | Legacy soak: `SIMULATION_MODE=true` |
 | `Stop Bot.cmd` | Stops bot via `scripts/ensure-single-bot.mjs` |
 | `Start Live Bot.cmd` | Legacy: `npm run start:live` (ts-node, not `dist/`) |
+
+Ubuntu VM: `./start-event-purity-soak.sh` and `./start-event-purity-production.sh` (see [docs/ENV_PROFILES.md](docs/ENV_PROFILES.md)).
 
 All start launchers call [`scripts/launcher-run-bot.cmd`](scripts/launcher-run-bot.cmd), which writes UTF-8 logs to:
 
@@ -278,7 +282,8 @@ npm run benchmark:base
 - **Logging** — Structured **JSON logs** via **Pino** (`createLogger` in `src/bot.ts`). Set `LOG_LEVEL` to control verbosity.
 - **Metrics** — HTTP server (default port **9090**):
   - `http://localhost:9090/metrics` — Prometheus scrape endpoint (includes default Node metrics via `prom-client`).
-  - `http://localhost:9090/healthz` — JSON `{"status":"ok"}` for load balancers or quick checks.
+  - `http://localhost:9090/healthz` — JSON health check; includes `bootstrapSource` / `usersSeeded` when bootstrap completes.
+  - `http://localhost:9090/status` — Live dashboard / MCP poll target with `bootstrapSource`, `usersSeeded`, `positionCacheSize`, `bootstrapCacheHit`.
 - **Grafana / alerts** — Helper definitions live in `src/production/productionReadiness.ts` (`createGrafanaDashboardDefinition`, PagerDuty-oriented alert shapes) for you to export into your monitoring stack.
 
 ---

@@ -111,6 +111,7 @@ describe("parseRuntimeConfig", () => {
         USE_PIPELINE_ORCHESTRATOR: "true",
         SIMULATION_MODE: "false",
         LIQUIDATION_RECEIVER_ADDRESS: "0x00000000000000000000000000000000000000A1",
+        ENABLE_ARBITRAGE: "true",
         PRICE_FEED_REGISTRY_JSON: JSON.stringify({
           base: {
             "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913": {

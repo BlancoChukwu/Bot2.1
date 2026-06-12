@@ -56,6 +56,8 @@ export interface WatchlistCoordinatorConfig {
   readonly coldStartIndexer?: string;
   /** When true, do not block `start()` on the initial HF sweep (runs in background). */
   readonly skipColdStartFullSweep?: boolean;
+  /** When true, EventPurityStack owns WS ingestion; skip duplicate EventDrivenWatchlist. */
+  readonly deferToEventPurityStack?: boolean;
 }
 
 export class WatchlistCoordinator implements BorrowerSnapshotProvider {
@@ -125,22 +127,31 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
     } else {
       await this.runColdStartFullSweep(this.config.chain);
     }
-    await this.eventWatchlist.start();
+    if (this.config.deferToEventPurityStack !== true) {
+      await this.eventWatchlist.start();
+    } else {
+      this.config.logger.info("event_driven_watchlist_deferred", {
+        chain: this.config.chain,
+        reason: "event_purity_stack",
+      });
+    }
     this.stalenessGuard.record();
     this.publishWatchlistMetrics();
     this.started = true;
     const fullSweepIntervalMs = this.config.fullSweepIntervalMs ?? 60_000;
-    this.fullSweepTimer = setInterval(() => {
-      Promise.resolve()
-        .then(() => this.pollBorrowers(this.config.chain))
-        .catch((error) => {
-          this.config.logger.error("watchlist_full_safety_sweep_failed", {
-            chain: this.config.chain,
-            error: String(error),
+    if (fullSweepIntervalMs > 0) {
+      this.fullSweepTimer = setInterval(() => {
+        Promise.resolve()
+          .then(() => this.pollBorrowers(this.config.chain))
+          .catch((error) => {
+            this.config.logger.error("watchlist_full_safety_sweep_failed", {
+              chain: this.config.chain,
+              error: String(error),
+            });
           });
-        });
-    }, fullSweepIntervalMs);
-    this.fullSweepTimer.unref?.();
+      }, fullSweepIntervalMs);
+      this.fullSweepTimer.unref?.();
+    }
     this.config.logger.info("watchlist_coordinator_started", {
       chain: this.config.chain,
       watchlistSize: this.watchlist.size(),

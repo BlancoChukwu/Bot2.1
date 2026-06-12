@@ -19,6 +19,7 @@ export interface PipelineDetectionAdapterConfig {
   readonly monitor?: HealthFactorMonitor;
   readonly hybridDetection?: HybridDetectionPipeline;
   readonly arbitrageQueue: ArbitrageOpportunityQueue;
+  readonly enableArbitrage?: boolean;
 }
 
 export class PipelineDetectionAdapter {
@@ -57,6 +58,9 @@ export class PipelineDetectionAdapter {
   }
 
   public async collectExtraOpportunities(chain: SupportedChain): Promise<readonly Opportunity[]> {
+    if (this.config.enableArbitrage === false) {
+      return [];
+    }
     return this.config.arbitrageQueue.drain(chain).map((candidate) => fromArbitrageOpportunity(candidate));
   }
 

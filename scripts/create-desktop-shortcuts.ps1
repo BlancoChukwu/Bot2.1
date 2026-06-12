@@ -42,6 +42,18 @@ $launchers = @(
     Cmd  = "Start Live Bot.cmd"
     Icon = 137
     Desc = "Live dev: npm run start:live (ts-node), safety gate ON, detached + logs"
+  },
+  @{
+    Name = "Aave Liquidator (Event-Purity Soak).lnk"
+    Cmd  = "Start Event-Purity Soak.cmd"
+    Icon = 138
+    Desc = "48h shadow soak: Flashblocks WS, bootstrap cache, ENABLE_LIVE_TX=false"
+  },
+  @{
+    Name = "Aave Liquidator (Event-Purity Production).lnk"
+    Cmd  = "Start Event-Purity Production.cmd"
+    Icon = 137
+    Desc = "Live event-purity: Flashblocks WS, ENABLE_LIVE_TX=true, dry-run gate ON"
   }
 )
 

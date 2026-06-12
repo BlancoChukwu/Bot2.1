@@ -62,6 +62,13 @@ export interface LiquidationAlertEvent {
   readonly txHash?: `0x${string}`;
 }
 
+export interface BotRuntimeStatus {
+  readonly bootstrapSource?: string;
+  readonly usersSeeded?: number;
+  readonly positionCacheSize?: number;
+  readonly bootstrapCacheHit?: boolean;
+}
+
 export interface BotMetricsSnapshot {
   readonly positionsScanned: number;
   readonly liquidationsAttempted: number;
@@ -74,6 +81,9 @@ export interface BotMetricsSnapshot {
   readonly netProfitUsd: number;
   readonly publicRpcSubmissions: number;
   readonly privateBundleSubmissions: number;
+  readonly bootstrapSource?: string;
+  readonly usersSeeded?: number;
+  readonly positionCacheSize?: number;
 }
 
 export interface BotMetrics {
@@ -115,6 +125,12 @@ export interface BotMetrics {
     labels: { readonly chain: string; readonly batchSize: number; readonly addresses: number },
   ): void;
   setProcessRssBytes(bytes: number): void;
+  setBootstrapStatus(
+    chain: string,
+    bootstrapSource: string,
+    usersSeeded: number,
+    positionCacheSize: number,
+  ): void;
   snapshot(): BotMetricsSnapshot;
 }
 
@@ -253,6 +269,9 @@ export function createBotMetrics(): BotMetrics {
     netProfitUsd: number;
     publicRpcSubmissions: number;
     privateBundleSubmissions: number;
+    bootstrapSource?: string;
+    usersSeeded?: number;
+    positionCacheSize?: number;
   } = {
     positionsScanned: 0,
     liquidationsAttempted: 0,
@@ -412,6 +431,24 @@ export function createBotMetrics(): BotMetrics {
     buckets: [0.05, 0.1, 0.2, 0.4, 0.75, 1, 2, 5],
     registers: [registry],
   });
+  const bootstrapUsersSeeded = new client.Gauge({
+    name: "bootstrap_users_seeded",
+    help: "Users seeded into the local position model at startup",
+    labelNames: ["chain", "bootstrap_source"],
+    registers: [registry],
+  });
+  const eventPurityPositionCacheSize = new client.Gauge({
+    name: "event_purity_position_cache_size",
+    help: "Local position model size after bootstrap",
+    labelNames: ["chain"],
+    registers: [registry],
+  });
+  const bootstrapSourceInfo = new client.Gauge({
+    name: "bootstrap_source_info",
+    help: "Bootstrap discovery source (1=active for labeled source)",
+    labelNames: ["chain", "bootstrap_source"],
+    registers: [registry],
+  });
 
   return {
     registry,
@@ -516,6 +553,19 @@ export function createBotMetrics(): BotMetrics {
         Math.max(0, durationSeconds),
       );
     },
+    setBootstrapStatus(chain, bootstrapSource, usersSeeded, positionCacheSize) {
+      snapshot.bootstrapSource = bootstrapSource;
+      snapshot.usersSeeded = usersSeeded;
+      snapshot.positionCacheSize = positionCacheSize;
+      bootstrapUsersSeeded.set({ chain, bootstrap_source: bootstrapSource }, usersSeeded);
+      eventPurityPositionCacheSize.set({ chain }, positionCacheSize);
+      for (const source of ["logs", "subgraph", "cache"] as const) {
+        bootstrapSourceInfo.set(
+          { chain, bootstrap_source: source },
+          source === bootstrapSource ? 1 : 0,
+        );
+      }
+    },
     snapshot() {
       return { ...snapshot };
     },
@@ -529,15 +579,38 @@ const defaultPrometheusAlertsPath = resolve(
   "bot_critical.yml",
 );
 
+export interface MetricsServerOptions {
+  readonly alertsPath?: string;
+  readonly getRuntimeStatus?: () => BotRuntimeStatus;
+}
+
 export function startMetricsServer(
   metrics: BotMetrics,
   logger: LoggerLike,
   port = 9090,
-  alertsPath = process.env.PROMETHEUS_ALERTS_PATH ?? defaultPrometheusAlertsPath,
+  options: MetricsServerOptions = {},
 ): Server {
+  const alertsPath = options.alertsPath ?? process.env.PROMETHEUS_ALERTS_PATH ?? defaultPrometheusAlertsPath;
   const app = express();
   app.get("/healthz", (_request: Request, response: Response) => {
-    response.json({ status: "ok" });
+    const runtime = options.getRuntimeStatus?.() ?? {};
+    response.json({
+      status: "ok",
+      ...(runtime.bootstrapSource === undefined ? {} : { bootstrapSource: runtime.bootstrapSource }),
+      ...(runtime.usersSeeded === undefined ? {} : { usersSeeded: runtime.usersSeeded }),
+      ...(runtime.positionCacheSize === undefined ? {} : { positionCacheSize: runtime.positionCacheSize }),
+    });
+  });
+  app.get("/status", (_request: Request, response: Response) => {
+    const runtime = options.getRuntimeStatus?.() ?? {};
+    const metricSnapshot = metrics.snapshot();
+    response.json({
+      status: "ok",
+      bootstrapSource: runtime.bootstrapSource ?? metricSnapshot.bootstrapSource,
+      usersSeeded: runtime.usersSeeded ?? metricSnapshot.usersSeeded,
+      positionCacheSize: runtime.positionCacheSize ?? metricSnapshot.positionCacheSize,
+      bootstrapCacheHit: runtime.bootstrapCacheHit,
+    });
   });
   app.get("/metrics", async (_request: Request, response: Response) => {
     response.setHeader("content-type", metrics.registry.contentType);

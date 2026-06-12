@@ -64,8 +64,61 @@ for (const key of [
 }
 writeFileSync(resolve(root, ".env.simulation"), simulation, "utf8");
 
+function applyEventPurityStack(content) {
+  let next = content;
+  const keys = {
+    USE_EVENT_WATCHLIST: "true",
+    USE_PIPELINE_ORCHESTRATOR: "true",
+    FLASHBLOCKS_ENABLED: "true",
+    FLASHBLOCKS_PRIMARY_LOOP: "false",
+    ENABLE_ARBITRAGE: "false",
+    ENABLE_WATCH_TIER_CONFIRM: "false",
+    BOOTSTRAP_ENABLED: "true",
+    BOOTSTRAP_CACHE_ENABLED: "true",
+    BOOTSTRAP_LOOKBACK_DAYS: "14",
+    SKIP_COLD_START_FULL_SWEEP: "true",
+    HYBRID_DETECTION_ENABLED: "false",
+    FULL_WATCHLIST_SWEEP_INTERVAL_MS: "0",
+  };
+  for (const [key, value] of Object.entries(keys)) {
+    next = upsert(next, key, value);
+  }
+  for (const key of [
+    "POLL_INTERVAL_MS",
+    "MULTICALL_BATCH_SIZE",
+    "LOW_TIER_EVERY_BLOCKS",
+    "FLASHBLOCKS_PRIMARY_LOOP_MS",
+  ]) {
+    next = removeKey(next, key);
+  }
+  return next;
+}
+
+let eventPuritySoak = applyEventPurityStack(simulation);
+eventPuritySoak = upsert(eventPuritySoak, "BOT_ENV_PROFILE", "event-purity-soak");
+eventPuritySoak = upsert(eventPuritySoak, "SIMULATION_MODE", "true");
+eventPuritySoak = upsert(eventPuritySoak, "RPC_BUDGET_MODE", "true");
+eventPuritySoak = upsert(eventPuritySoak, "ENABLE_LIVE_TX", "false");
+eventPuritySoak = upsert(eventPuritySoak, "SKIP_DEPLOYMENT_SAFETY_GATE", "true");
+eventPuritySoak = upsert(eventPuritySoak, "ENABLE_HEAP_SNAPSHOTS", "true");
+writeFileSync(resolve(root, ".env.event-purity-soak"), eventPuritySoak, "utf8");
+
+let eventPurityProduction = applyEventPurityStack(production);
+eventPurityProduction = upsert(eventPurityProduction, "BOT_ENV_PROFILE", "event-purity-production");
+eventPurityProduction = upsert(eventPurityProduction, "SIMULATION_MODE", "false");
+eventPurityProduction = upsert(eventPurityProduction, "RPC_BUDGET_MODE", "false");
+eventPurityProduction = upsert(eventPurityProduction, "ENABLE_LIVE_TX", "true");
+eventPurityProduction = upsert(eventPurityProduction, "SKIP_DEPLOYMENT_SAFETY_GATE", "false");
+writeFileSync(resolve(root, ".env.event-purity-production"), eventPurityProduction, "utf8");
+
 console.log(JSON.stringify({
   msg: "bootstrap_env_profiles_complete",
   source: sourcePath,
-  wrote: [".env.production", ".env.production.budget", ".env.simulation"],
+  wrote: [
+    ".env.production",
+    ".env.production.budget",
+    ".env.simulation",
+    ".env.event-purity-soak",
+    ".env.event-purity-production",
+  ],
 }, null, 2));

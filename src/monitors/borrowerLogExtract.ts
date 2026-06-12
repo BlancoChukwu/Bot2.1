@@ -39,3 +39,30 @@ export function extractBorrowerFromLog(log: Log): Address | undefined {
   const addresses = extractBorrowerAddressesFromLog(log);
   return addresses[0];
 }
+
+/** Extracts user/onBehalfOf/repayer addresses from any Aave pool position event log. */
+export function extractUserAddressesFromAavePoolLog(log: Log): readonly Address[] {
+  const args = (log as Log & {
+    readonly args?: {
+      readonly user?: Address;
+      readonly onBehalfOf?: Address;
+      readonly repayer?: Address;
+      readonly to?: Address;
+    };
+  }).args;
+  if (args === undefined) {
+    return [];
+  }
+  const out: Address[] = [];
+  const candidates = [args.onBehalfOf, args.user, args.repayer, args.to];
+  for (const address of candidates) {
+    if (address === undefined) {
+      continue;
+    }
+    const key = address.toLowerCase();
+    if (!out.some((existing) => existing.toLowerCase() === key)) {
+      out.push(address);
+    }
+  }
+  return out;
+}

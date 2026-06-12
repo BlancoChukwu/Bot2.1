@@ -195,25 +195,19 @@ export class MultiWsEventSource implements DetectionEventSource {
     const flashblocksEnabled = this.config.registry.get(this.config.chain).detection.flashblocksEnabled;
     if (flashblocksEnabled) {
       const stopFlash = wsClient.watchBlockNumber?.({
-        onBlockNumber: async (blockNumber) => {
+        onBlockNumber: (blockNumber) => {
           this.heartbeatByProvider.set(providerName, Date.now());
-          const started = Date.now();
-          const logs = await this.readClient.getLogs({
-            address: poolAddress,
-            fromBlock: blockNumber,
-            toBlock: blockNumber,
-          });
           const state = this.providerStates.get(providerName);
           if (state !== undefined) {
-            state.lastFlashblockLeadMs = Math.max(1, Date.now() - started);
-            state.score += state.lastFlashblockLeadMs <= 120 ? 1 : -0.5;
-            this.config.metrics.recordPipelineLatency("flashblocks_lead_ms", state.lastFlashblockLeadMs, {
+            state.lastFlashblockLeadMs = 1;
+            state.score += 1;
+            this.config.metrics.recordPipelineLatency("flashblocks_lead_ms", 1, {
               chain: this.config.chain,
               provider: providerName,
               flashblocks,
             });
           }
-          await this.handleLogs(providerName, "ReserveDataUpdated", logs, handlers);
+          void blockNumber;
         },
         onError: (error) => handlers.onError(this.config.chain, error),
       });

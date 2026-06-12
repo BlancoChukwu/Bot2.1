@@ -14,6 +14,7 @@ import {
   LiquidationBot,
   type PollingLoopOptions,
   startMetricsServer,
+  type BotRuntimeStatus,
   type BotMetrics,
   type LoggerLike,
 } from "./bot";
@@ -39,8 +40,11 @@ import { ViemExecutionClient } from "./executors/viemExecutionClient";
 import { ParallelBroadcastClient } from "./executors/parallelBroadcastClient";
 import { quoteBaseExecutionGas } from "./executors/baseGasModel";
 import type { ExecutionPreflightClient } from "./executors/safeTransactionExecutor";
-import { FlashblocksPendingLogSource } from "./monitors/flashblocksPendingLogSource";
 import { FlashblockPrimaryLoop } from "./monitors/flashblockPrimaryLoop";
+import { EventPurityStack } from "./monitors/eventPurityStack";
+import { dedupeRpcUrls } from "./monitors/bootstrapRpcClients";
+import { getBootstrapRuntimeStatus } from "./runtime/bootstrapRuntimeStatus";
+import { parseEventPurityConfig, type EventPurityConfig } from "./config/eventPurityConfig";
 import {
   getDexesForChain,
   getEscapeHatchPairs,
@@ -180,6 +184,7 @@ export interface RuntimeConfig {
   readonly oraclePollIntervalMs: number;
   readonly singleInstanceLockPath: string;
   readonly disableSingleInstanceLock: boolean;
+  readonly eventPurity: EventPurityConfig;
 }
 
 export interface BotRunner {
@@ -303,9 +308,12 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     oraclePollIntervalMs: parseMinNumber(parsedEnv.ORACLE_POLL_INTERVAL_MS, 60_000, 1_000, "ORACLE_POLL_INTERVAL_MS"),
     singleInstanceLockPath: optionalEnv(parsedEnv, "SINGLE_INSTANCE_LOCK_PATH") ?? ".runtime/bot.lock",
     disableSingleInstanceLock: parseBoolean(parsedEnv.DISABLE_SINGLE_INSTANCE_LOCK, false),
+    eventPurity: parseEventPurityConfig(parsedEnv),
   };
   assertPipelineFlashLiquidationReadiness(config);
-  assertArbitragePriceFeedCoverage(config);
+  if (config.eventPurity.enableArbitrage) {
+    assertArbitragePriceFeedCoverage(config);
+  }
   if (config.chains.includes("base")) {
     assertBaseFeedRegistry(config.priceFeedRegistry);
   }
@@ -527,7 +535,11 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         );
       },
     });
-  if (priceOracleCache !== undefined && config.chain === "base") {
+  if (
+    priceOracleCache !== undefined
+    && config.chain === "base"
+    && !(parseBoolean(process.env.USE_EVENT_WATCHLIST, false) && config.flashblocksEnabled)
+  ) {
     priceOracleCache.startBackgroundPoll(
       [canonicalBaseWeth, canonicalBaseUsdc, canonicalBaseCbBtc],
       config.oraclePollIntervalMs,
@@ -698,7 +710,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     client: executionPreflightClient,
     logger,
     metrics,
-    dryRunMode: config.simulationMode,
+    dryRunMode: config.simulationMode || !config.eventPurity.enableLiveTx,
     quoteExecutionGasCap: async ({ expectedProfitUsd, gasLimit }) => quoteBaseExecutionGas({
       client: publicClient as never,
       expectedProfitUsd,
@@ -885,6 +897,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       : coldStartIndexer === "onchain"
         ? undefined
         : new SubgraphBorrowerIndexProvider(protocol);
+  const nativeEventPurity = useEventWatchlist
+    && config.flashblocksEnabled
+    && (config.wsRpcUrlPrimary ?? config.wsRpcUrl) !== undefined;
   if (useEventWatchlist) {
     watchlistCoordinator = new WatchlistCoordinator({
       chain: config.chain,
@@ -909,12 +924,14 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       reorgSafeDepth: BigInt(parseMinNumber(process.env.REORG_SAFE_DEPTH, 10, 1, "REORG_SAFE_DEPTH")),
       gapChunkBlocks: BigInt(parseMinNumber(process.env.GAP_CHUNK_BLOCKS, 2_000, 1, "GAP_CHUNK_BLOCKS")),
       gapChunkDelayMs: parseMinNumber(process.env.GAP_REPLAY_CHUNK_DELAY_MS, 0, 0, "GAP_REPLAY_CHUNK_DELAY_MS"),
-      fullSweepIntervalMs: parseMinNumber(
-        process.env.FULL_WATCHLIST_SWEEP_INTERVAL_MS,
-        60_000,
-        10_000,
-        "FULL_WATCHLIST_SWEEP_INTERVAL_MS",
-      ),
+      fullSweepIntervalMs: nativeEventPurity
+        ? 0
+        : parseMinNumber(
+          process.env.FULL_WATCHLIST_SWEEP_INTERVAL_MS,
+          60_000,
+          10_000,
+          "FULL_WATCHLIST_SWEEP_INTERVAL_MS",
+        ),
       onSnapshots: (snapshots) => {
         watchlistBlockHooks.upsertSnapshots?.(snapshots);
       },
@@ -937,9 +954,10 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         "COLD_START_ON_CHAIN_MAX_BLOCKS",
       )),
       coldStartReadClient,
-      ...(parseBoolean(process.env.SKIP_COLD_START_FULL_SWEEP, false)
+      ...(parseBoolean(process.env.SKIP_COLD_START_FULL_SWEEP, false) || nativeEventPurity
         ? { skipColdStartFullSweep: true }
         : {}),
+      ...(nativeEventPurity ? { deferToEventPurityStack: true } : {}),
       lowTierEveryBlocks: BigInt(parseMinNumber(
         process.env.LOW_TIER_EVERY_BLOCKS,
         100,
@@ -987,32 +1005,47 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   }
   watchlistCoordinatorRef = watchlistCoordinator;
   hybridDetectionRef = hybridDetection;
-  let flashblocksPendingSource: FlashblocksPendingLogSource | undefined;
+  let eventPurityStack: EventPurityStack | undefined;
   let flashblockPrimaryLoop: FlashblockPrimaryLoop | undefined;
   const rpcHealthMonitor = new RpcHealthMonitor(200, 30_000);
   let rpcHealthTimer: NodeJS.Timeout | undefined;
   let ammMirrorLogSource: AmmMirrorLogSource | undefined;
   let nearLiqAcceleratedPoller: NearLiquidationAcceleratedPoller | undefined;
+  const eventPurityWsUrl = config.wsRpcUrlPrimary ?? config.wsRpcUrl;
   if (useEventWatchlist && config.flashblocksEnabled) {
-    const flashblocksRpc = optionalEnv(process.env, "FLASHBLOCKS_RPC_URL") ?? config.executionRpcUrlPrimary;
-    const flashblocksClient = createFailoverPublicClient({
-      chain: config.chain,
-      rpcUrl: flashblocksRpc,
-      fallbackRpcUrls: config.executionRpcFallbackUrls,
-    }) as unknown as PublicClient;
-    flashblocksPendingSource = new FlashblocksPendingLogSource({
+    if (eventPurityWsUrl === undefined || eventPurityWsUrl.trim() === "") {
+      throw new Error(
+        "FLASHBLOCKS_ENABLED requires WS_RPC_URL_PRIMARY (Alchemy/QuickNode Flashblocks WSS) — HTTP pending getLogs polling is removed",
+      );
+    }
+    eventPurityStack = new EventPurityStack({
       chain: config.chain,
       poolAddress: activePoolAddress,
-      client: flashblocksClient,
+      ingestionWsUrl: eventPurityWsUrl,
+      executionClient: publicClient as unknown as PublicClient,
+      feedRegistry: config.priceFeedRegistry ?? defaultPriceFeedRegistry(),
+      purity: config.eventPurity,
+      bootstrapSubgraphUrl: config.aaveSubgraphUrl,
+      bootstrapLogRpcUrls: dedupeRpcUrls([
+        config.executionRpcUrlPrimary,
+        ...config.executionRpcFallbackUrls,
+        config.rpcUrl,
+        ...config.fallbackRpcUrls,
+      ]),
+      ...(optionalEnv(process.env, "REDIS_URL") === undefined
+        ? {}
+        : { redisUrl: optionalEnv(process.env, "REDIS_URL")! }),
       logger,
       metrics,
-      onPriorityAccounts: (accounts) => {
-        watchlistCoordinator?.registerBorrowers(accounts);
-        void watchlistCoordinator?.refreshPriorityAccounts(accounts);
+      onLiquidatableCandidate: async () => {
+        if (!config.eventPurity.enableLiveTx) {
+          return;
+        }
+        await orchestrator.runOnce();
       },
     });
   }
-  if (useEventWatchlist && config.flashblocksEnabled && config.flashblocksPrimaryLoop) {
+  if (useEventWatchlist && config.flashblocksEnabled && config.flashblocksPrimaryLoop && eventPurityStack === undefined) {
     flashblockPrimaryLoop = new FlashblockPrimaryLoop({
       chain: config.chain,
       logger,
@@ -1048,6 +1081,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     monitor,
     hybridDetection,
     arbitrageQueue: arbQueue,
+    enableArbitrage: config.eventPurity.enableArbitrage,
   });
   const arbScannerEngine = new ProfitabilityEngine({
     registry,
@@ -1129,8 +1163,16 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     if (watchlistCoordinator !== undefined) {
       await watchlistCoordinator.start();
     }
-    flashblocksPendingSource?.start();
-    flashblockPrimaryLoop?.start();
+    if (eventPurityStack !== undefined) {
+      await eventPurityStack.start();
+    }
+    if (!config.eventPurity.enableArbitrage && config.flashblocksPrimaryLoop) {
+      logger.info("flashblocks_primary_loop_skipped", {
+        reason: "event_purity_mode_uses_newFlashblocks_clock",
+      });
+    } else {
+      flashblockPrimaryLoop?.start();
+    }
     if (useLocalMirror && config.wsRpcUrlPrimary !== undefined) {
       const mirrorPools = resolveMirrorPoolsForChain(config.chain);
       ammMirrorLogSource = new AmmMirrorLogSource({
@@ -1142,7 +1184,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       });
       ammMirrorLogSource.start();
     }
-    if (watchlistCoordinator !== undefined) {
+    if (watchlistCoordinator !== undefined && eventPurityStack === undefined) {
       const nearLiqAccounts = (process.env.NEAR_LIQ_ACCELERATED_ACCOUNTS ?? "")
         .split(",")
         .map((part) => part.trim())
@@ -1196,7 +1238,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         swapRouterSource: liquidationReceiverExpectedSwapRouter !== undefined ? "env" : "dex_registry",
       });
     }
-    if (priceOracleCache !== undefined) {
+    if (priceOracleCache !== undefined && config.eventPurity.enableArbitrage) {
       await assertArbitrageOracleReadiness(config, priceOracleCache);
     }
     if (rpcHealthTimer === undefined) {
@@ -1417,7 +1459,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     timeoutMs: 15_000,
   });
   shutdown.addHook("watchlist_rescanner_stop", async () => watchlistRescanner?.stop());
-  shutdown.addHook("flashblocks_pending_stop", async () => flashblocksPendingSource?.stop());
+  shutdown.addHook("event_purity_stack_stop", async () => eventPurityStack?.stop());
   shutdown.addHook("flashblocks_primary_loop_stop", async () => flashblockPrimaryLoop?.stop());
   shutdown.addHook("amm_mirror_log_stop", async () => ammMirrorLogSource?.stop());
   shutdown.addHook("near_liq_accelerated_stop", async () => nearLiqAcceleratedPoller?.stop());
@@ -1433,9 +1475,16 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   shutdown.addHook("arb_queue_stop", async () => arbQueue.stop());
   shutdown.addHook("oracle_poll_stop", async () => priceOracleCache?.stopBackgroundPoll());
 
-  return new PipelineBotRunner(orchestrator, arbitrageScanner, startupGuard, async () => {
-    await shutdown.shutdown("pipeline_runner");
-  });
+  return new PipelineBotRunner(
+    orchestrator,
+    arbitrageScanner,
+    startupGuard,
+    async () => {
+      await shutdown.shutdown("pipeline_runner");
+    },
+    config.eventPurity.enableArbitrage,
+    eventPurityStack !== undefined,
+  );
 }
 
 class PipelineBotRunner implements BotRunner {
@@ -1444,20 +1493,39 @@ class PipelineBotRunner implements BotRunner {
     private readonly arbitrageScanner: ArbitrageScanner,
     private readonly startupGuard?: () => Promise<void>,
     private readonly onShutdown?: () => void | Promise<void>,
+    private readonly enableArbitrage = false,
+    private readonly eventPurityMode = false,
   ) {}
 
   public async runPollingLoop(options: PollingLoopOptions): Promise<void> {
     if (this.startupGuard !== undefined) {
       await this.startupGuard();
     }
-    this.arbitrageScanner.start();
+    if (this.enableArbitrage) {
+      this.arbitrageScanner.start();
+    }
     try {
+      if (this.eventPurityMode) {
+        await waitForAbort(options.signal);
+        return;
+      }
       await this.orchestrator.runLoop(options);
     } finally {
-      this.arbitrageScanner.stop();
+      if (this.enableArbitrage) {
+        this.arbitrageScanner.stop();
+      }
       await this.onShutdown?.();
     }
   }
+}
+
+function waitForAbort(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
 }
 
 function parseDryRunTargetBorrowers(env: Env): Address[] | undefined {
@@ -1721,7 +1789,9 @@ async function main(): Promise<void> {
   }
   const unregisterSignalSnapshot = registerHeapSnapshotOnSignal({ logger });
   const metrics = createBotMetrics();
-  const metricsServer = startMetricsServer(metrics, logger);
+  const metricsServer = startMetricsServer(metrics, logger, 9090, {
+    getRuntimeStatus: (): BotRuntimeStatus => getBootstrapRuntimeStatus(),
+  });
   const dryRunMode = process.argv.includes("--dry-run");
   if (!config.disableSingleInstanceLock && !dryRunMode) {
     const lock = acquireSingleInstanceLock({

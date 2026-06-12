@@ -142,7 +142,7 @@ describe("MultiWsEventSource", () => {
     expect(onReserveUpdated).toHaveBeenCalledTimes(1);
   });
 
-  it("ingests flashblock pre-confirmation blocks when enabled", async () => {
+  it("records flashblock heartbeat without per-block getLogs when enabled", async () => {
     const onReserveUpdated = vi.fn();
     const registry = createChainRegistry({
       chains: [{
@@ -178,7 +178,7 @@ describe("MultiWsEventSource", () => {
     }];
     await blockCallbacks.get("wss://primary.example")?.(100n);
 
-    expect(onReserveUpdated).toHaveBeenCalledTimes(1);
+    expect(onReserveUpdated).not.toHaveBeenCalled();
   });
 
   it("throws when no detection websocket endpoints are configured", async () => {
