@@ -4,5 +4,7 @@ dist/
 .env.simulation
 .env.production
 .env.production.budget
+.env.event-purity-soak
+.env.event-purity-production
 *.log
 coverage/
