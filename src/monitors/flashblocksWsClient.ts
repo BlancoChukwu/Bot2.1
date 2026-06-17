@@ -234,7 +234,7 @@ export class FlashblocksWsClient {
     const kind = subscriptionId === undefined ? undefined : this.subscriptions.get(subscriptionId);
     const result = params?.result;
     if (kind === "newFlashblocks" || kind === "newHeads") {
-      const blockNumber = extractBlockNumber(result);
+        const blockNumber = extractSubscriptionBlockNumber(result);
       if (blockNumber !== undefined) {
         const payload: { readonly blockNumber: bigint; readonly flashblockIndex?: number } = {
           blockNumber,
@@ -258,14 +258,18 @@ export class FlashblocksWsClient {
   }
 }
 
-function extractBlockNumber(result: unknown): bigint | undefined {
+export function extractSubscriptionBlockNumber(result: unknown): bigint | undefined {
   if (typeof result === "string") {
     return BigInt(result);
   }
   if (result !== null && typeof result === "object") {
-    const blockNumber = (result as Record<string, unknown>).blockNumber;
-    if (typeof blockNumber === "string") {
-      return BigInt(blockNumber);
+    const record = result as Record<string, unknown>;
+    const raw = record.blockNumber ?? record.number;
+    if (typeof raw === "string") {
+      return BigInt(raw);
+    }
+    if (typeof raw === "number" && Number.isInteger(raw)) {
+      return BigInt(raw);
     }
   }
   return undefined;
