@@ -106,6 +106,10 @@ export class EventPurityStack {
       });
     }
 
+    const head = await this.config.executionClient.getBlockNumber();
+    const lookbackBlocks = BigInt(this.config.purity.bootstrapLookbackDays) * 43_200n;
+    const bootstrapFromBlock = head > lookbackBlocks ? head - lookbackBlocks : 0n;
+
     this.wsLayer = new WsEventLayer({
       chain: this.config.chain,
       poolAddress: this.config.poolAddress,
@@ -115,7 +119,7 @@ export class EventPurityStack {
       checkpoint: this.checkpoint,
       logger: this.config.logger,
       ...(this.config.metrics === undefined ? {} : { metrics: this.config.metrics }),
-      ...(this.config.bootstrapFromBlock === undefined ? {} : { bootstrapFromBlock: this.config.bootstrapFromBlock }),
+      bootstrapFromBlock: this.config.bootstrapFromBlock ?? bootstrapFromBlock,
       onEvent: (event) => this.handleEvent(event),
       onFlashblockTick: (blockNumber) => this.handleFlashblockTick(blockNumber),
     });

@@ -5,10 +5,13 @@ import type { SupportedChain } from "../config/chains";
 import type { LoggerLike } from "../bot";
 import type { BotMetrics } from "../bot";
 import {
-  aavePoolPendingLogsFilter,
-  chainlinkLogsFilter,
   FlashblocksWsClient,
 } from "./flashblocksWsClient";
+import {
+  assertWsIngestionReady,
+  buildWsIngestionSubscriptions,
+  isResilientWsIngestionEnabled,
+} from "./wsIngestionSubscriptions";
 import {
   ingestionDedupKey,
   parseAavePoolLog,
@@ -51,28 +54,20 @@ export class WsEventLayer {
     }
     this.started = true;
     await this.runBootstrapOrGapFill();
+    const resilient = isResilientWsIngestionEnabled();
     const feeds = this.config.feedRegistry[this.config.chain] ?? {};
-    const subscriptions: {
-      readonly kind: "pendingLogs" | "logs" | "newFlashblocks";
-      readonly params?: Record<string, unknown>;
-    }[] = [
-      { kind: "pendingLogs", params: aavePoolPendingLogsFilter(this.config.poolAddress) },
-      { kind: "newFlashblocks" },
-    ];
-    for (const [asset, feedConfig] of Object.entries(feeds)) {
-      if (feedConfig?.feed === undefined) {
-        continue;
-      }
-      subscriptions.push({
-        kind: "logs",
-        params: chainlinkLogsFilter(feedConfig.feed),
-      });
-      void asset;
-    }
+    const subscriptions = buildWsIngestionSubscriptions({
+      chain: this.config.chain,
+      poolAddress: this.config.poolAddress,
+      feedRegistry: this.config.feedRegistry,
+      resilient,
+    });
 
     this.wsClient = new FlashblocksWsClient({
       wsUrl: this.config.ingestionWsUrl,
       logger: this.config.logger,
+      gracefulSubscribe: resilient,
+      subscribeTimeoutMs: 15_000,
       onPendingLog: (raw) => {
         void this.handleRawLog(raw, "pending");
       },
@@ -90,11 +85,15 @@ export class WsEventLayer {
         void this.runBootstrapOrGapFill();
       },
     });
-    await this.wsClient.start(subscriptions);
+    const startResult = await this.wsClient.start(subscriptions);
+    assertWsIngestionReady(startResult.activeRoles);
     this.config.logger.info("ws_event_layer_started", {
       chain: this.config.chain,
       ingestionWsUrl: redactUrl(this.config.ingestionWsUrl),
       chainlinkFeeds: Object.keys(feeds).length,
+      resilientIngestion: resilient,
+      activeSubscriptions: startResult.active,
+      skippedSubscriptions: startResult.skipped,
     });
   }
 

@@ -16,7 +16,7 @@ function createWsClient(url: string): WsClient {
   return new Ctor(url);
 }
 
-export type FlashblocksSubscriptionKind = "pendingLogs" | "logs" | "newFlashblocks";
+export type FlashblocksSubscriptionKind = "pendingLogs" | "logs" | "newFlashblocks" | "newHeads";
 
 export interface FlashblocksWsClientConfig {
   readonly wsUrl: string;
@@ -27,6 +27,19 @@ export interface FlashblocksWsClientConfig {
   readonly onDisconnect?: () => void;
   readonly onConnect?: () => void;
   readonly maxReconnectDelayMs?: number;
+  /** When true, failed/timed-out eth_subscribe calls are skipped instead of aborting startup. */
+  readonly gracefulSubscribe?: boolean;
+  readonly subscribeTimeoutMs?: number;
+}
+
+export interface FlashblocksWsStartResult {
+  readonly active: readonly FlashblocksSubscriptionKind[];
+  readonly activeRoles: readonly string[];
+  readonly skipped: readonly {
+    readonly kind: FlashblocksSubscriptionKind;
+    readonly role?: string;
+    readonly reason: string;
+  }[];
 }
 
 interface PendingRequest {
@@ -49,9 +62,10 @@ export class FlashblocksWsClient {
   public async start(subscriptions: readonly {
     readonly kind: FlashblocksSubscriptionKind;
     readonly params?: Record<string, unknown>;
-  }[]): Promise<void> {
+    readonly role?: string;
+  }[]): Promise<FlashblocksWsStartResult> {
     this.stopped = false;
-    await this.connect(subscriptions);
+    return await this.connect(subscriptions);
   }
 
   public stop(): void {
@@ -68,12 +82,13 @@ export class FlashblocksWsClient {
     subscriptions: readonly {
       readonly kind: FlashblocksSubscriptionKind;
       readonly params?: Record<string, unknown>;
+      readonly role?: string;
     }[],
-  ): Promise<void> {
+  ): Promise<FlashblocksWsStartResult> {
     if (this.stopped) {
-      return;
+      return { active: [], activeRoles: [], skipped: [] };
     }
-    await new Promise<void>((resolve, reject) => {
+    return await new Promise<FlashblocksWsStartResult>((resolve, reject) => {
       const ws = createWsClient(this.config.wsUrl);
       this.ws = ws;
       ws.addEventListener("open", () => {
@@ -99,6 +114,7 @@ export class FlashblocksWsClient {
     subscriptions: readonly {
       readonly kind: FlashblocksSubscriptionKind;
       readonly params?: Record<string, unknown>;
+      readonly role?: string;
     }[],
   ): void {
     if (this.stopped || this.reconnectTimer !== undefined) {
@@ -120,18 +136,63 @@ export class FlashblocksWsClient {
     subscriptions: readonly {
       readonly kind: FlashblocksSubscriptionKind;
       readonly params?: Record<string, unknown>;
+      readonly role?: string;
     }[],
-  ): Promise<void> {
+  ): Promise<FlashblocksWsStartResult> {
+    const active: FlashblocksSubscriptionKind[] = [];
+    const activeRoles: string[] = [];
+    const skipped: { kind: FlashblocksSubscriptionKind; role?: string; reason: string }[] = [];
     for (const sub of subscriptions) {
-      await this.subscribe(sub.kind, sub.params);
+      try {
+        await this.subscribe(sub.kind, sub.params);
+        active.push(sub.kind);
+        if (sub.role !== undefined) {
+          activeRoles.push(sub.role);
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (this.config.gracefulSubscribe !== true) {
+          throw error;
+        }
+        skipped.push({
+          kind: sub.kind,
+          reason,
+          ...(sub.role === undefined ? {} : { role: sub.role }),
+        });
+        this.config.logger.warn("flashblocks_ws_subscribe_skipped", {
+          kind: sub.kind,
+          role: sub.role,
+          reason,
+        });
+      }
     }
+    return { active, activeRoles, skipped };
   }
 
   private subscribe(kind: FlashblocksSubscriptionKind, params?: Record<string, unknown>): Promise<string> {
+    const timeoutMs = this.config.subscribeTimeoutMs ?? 15_000;
     return new Promise((resolve, reject) => {
       const id = this.requestId;
       this.requestId += 1;
-      this.pendingRequests.set(id, { kind, resolve, reject });
+      const timeout = setTimeout(() => {
+        if (!this.pendingRequests.has(id)) {
+          return;
+        }
+        this.pendingRequests.delete(id);
+        reject(new Error(`eth_subscribe timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+      timeout.unref?.();
+      this.pendingRequests.set(id, {
+        kind,
+        resolve: (subscriptionId) => {
+          clearTimeout(timeout);
+          resolve(subscriptionId);
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        },
+      });
       const payload = {
         jsonrpc: "2.0",
         id,
@@ -172,13 +233,13 @@ export class FlashblocksWsClient {
     const subscriptionId = params?.subscription;
     const kind = subscriptionId === undefined ? undefined : this.subscriptions.get(subscriptionId);
     const result = params?.result;
-    if (kind === "newFlashblocks") {
+    if (kind === "newFlashblocks" || kind === "newHeads") {
       const blockNumber = extractBlockNumber(result);
       if (blockNumber !== undefined) {
         const payload: { readonly blockNumber: bigint; readonly flashblockIndex?: number } = {
           blockNumber,
         };
-        const flashblockIndex = extractFlashblockIndex(result);
+        const flashblockIndex = kind === "newFlashblocks" ? extractFlashblockIndex(result) : undefined;
         if (flashblockIndex !== undefined) {
           this.config.onNewFlashblock?.({ blockNumber, flashblockIndex });
           return;
@@ -237,5 +298,9 @@ export function chainlinkLogsFilter(feed: Address): Record<string, unknown> {
 }
 
 export function aavePoolPendingLogsFilter(poolAddress: Address): Record<string, unknown> {
+  return { address: poolAddress };
+}
+
+export function aavePoolConfirmedLogsFilter(poolAddress: Address): Record<string, unknown> {
   return { address: poolAddress };
 }
