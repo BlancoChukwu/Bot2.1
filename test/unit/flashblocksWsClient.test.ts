@@ -3,12 +3,13 @@ import { extractSubscriptionBlockNumber } from "../../src/monitors/flashblocksWs
 
 describe("extractSubscriptionBlockNumber", () => {
   it("parses newHeads header number field", () => {
+    const number = "0x2d3d65c";
     expect(
       extractSubscriptionBlockNumber({
-        number: "0x2d42d5c",
+        number,
         hash: "0xabc",
       }),
-    ).toBe(47455788n);
+    ).toBe(BigInt(number));
   });
 
   it("parses newFlashblocks blockNumber field", () => {
@@ -20,7 +21,8 @@ describe("extractSubscriptionBlockNumber", () => {
   });
 
   it("parses bare hex string payloads", () => {
-    expect(extractSubscriptionBlockNumber("0x2d42d5c")).toBe(47455788n);
+    const number = "0x2d3d65c";
+    expect(extractSubscriptionBlockNumber(number)).toBe(BigInt(number));
   });
 
   it("returns undefined for unrecognized shapes", () => {
