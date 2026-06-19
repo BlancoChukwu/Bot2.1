@@ -5,18 +5,21 @@ const staged = execSync("git diff --cached --name-only --diff-filter=ACM", { enc
   .split(/\r?\n/)
   .filter(Boolean);
 
-const blockedFiles = new Set([".env"]);
+const blockedPathPattern =
+  /^(?:\.env(?:\.|$)|\.runtime\/|logs\/|\.cache\/|\.cursor\/|.*\.heapsnapshot$|.*\.(?:pem|key)$)/i;
 const skipContentScan = /\.(example|md)$/i;
-const secretAssignment = /(?:PRIVATE_KEY|SECRET|MNEMONIC|API_KEY)\s*=\s*['"]?(0x[a-fA-F0-9]{64}|[^\s'"]+)/i;
+const secretAssignment =
+  /(?:PRIVATE_KEY|SECRET|MNEMONIC|(?:THE_GRAPH_|TELEGRAM_|PAGERDUTY_)?API_KEY)\s*=\s*['"]?(0x[a-fA-F0-9]{64}|[^\s#'"]+)/i;
 
 let failed = false;
 for (const file of staged) {
-  if (blockedFiles.has(file) || file.endsWith(".pem") || file.endsWith(".key")) {
-    console.error(`secret-scan: blocked staged secret file: ${file}`);
+  const normalized = file.replace(/\\/g, "/");
+  if (blockedPathPattern.test(normalized)) {
+    console.error(`secret-scan: blocked staged secret or local-runtime file: ${file}`);
     failed = true;
     continue;
   }
-  if (skipContentScan.test(file)) {
+  if (skipContentScan.test(normalized)) {
     continue;
   }
   let content;
@@ -33,7 +36,7 @@ for (const file of staged) {
   if (/^0x0{64}$/i.test(value)) {
     continue;
   }
-  if (file.includes("test/") && value.startsWith("0x")) {
+  if (normalized.includes("test/") && value.startsWith("0x")) {
     continue;
   }
   console.error(`secret-scan: secret assignment matched in ${file}`);

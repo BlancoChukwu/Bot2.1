@@ -1,10 +1,27 @@
+# Dependencies & build
 node_modules/
 dist/
-.env
-.env.simulation
-.env.production
-.env.production.budget
-.env.event-purity-soak
-.env.event-purity-production
-*.log
 coverage/
+
+# Environment & secrets (never commit real keys — .env.example is the template)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local runtime (RPC benchmarks, dry-run receipts, locks, redis, foundry, heap dumps)
+.runtime/
+
+# Session logs & audit output
+logs/
+*.log
+
+# Bootstrap / FTRL / bot caches (may embed RPC or wallet metadata)
+.cache/
+
+# Editor / agent local state
+.cursor/
+
+# Heap snapshots (manual or ENABLE_HEAP_SNAPSHOTS)
+*.heapsnapshot

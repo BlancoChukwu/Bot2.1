@@ -39,11 +39,19 @@ Copies RPC keys, wallet, receiver, FTRL, and dry-run receipt fields into `.env.p
 
 ## Dry-run receipt
 
-Applies to `.env.production` by default:
+Legacy live (`.env.production`):
 
 ```bash
 npm run dry-run:receipt
 ```
+
+Event-purity live (`.env.event-purity-production` — use this before `./start-event-purity-production.sh`):
+
+```bash
+npm run dry-run:receipt:event-purity-production
+```
+
+Start the bot within **15 minutes** of generating the receipt (safety gate TTL).
 
 ## Ubuntu VM
 
