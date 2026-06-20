@@ -85,7 +85,7 @@ export function parseEventPurityConfig(env: Record<string, string | undefined>):
       DEFAULT_EVICTION_INACTIVE_BLOCKS,
       "POSITION_EVICTION_INACTIVE_BLOCKS",
     ),
-    positionCacheHardCap: parsePositiveNumber(env.POSITION_CACHE_HARD_CAP, 50_000, "POSITION_CACHE_HARD_CAP"),
+    positionCacheHardCap: parsePositiveNumber(env.POSITION_CACHE_HARD_CAP, 8_000, "POSITION_CACHE_HARD_CAP"),
     shadowSampleRate: parsePositiveNumber(env.SHADOW_SAMPLE_RATE, 100, "SHADOW_SAMPLE_RATE"),
     shadowDriftToleranceBps: parseNonNegativeNumber(env.SHADOW_DRIFT_TOLERANCE_BPS, 50, "SHADOW_DRIFT_TOLERANCE_BPS"),
     shadowFnRateTargetPct: parseNonNegativeNumber(env.SHADOW_FN_RATE_TARGET_PCT, 1.0, "SHADOW_FN_RATE_TARGET_PCT"),

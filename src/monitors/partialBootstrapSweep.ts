@@ -1,5 +1,6 @@
 import type { Address, AbiEvent, Log, PublicClient } from "viem";
 import { getChainConfig, type SupportedChain } from "../config/chains";
+import { reservesTouchAllowlist } from "../config/watchlistReserveFilter";
 import { aavePoolAbi } from "../protocols/aaveV3";
 import { uiPoolDataProviderAbi } from "../protocols/uiPoolDataProvider";
 import type { LoggerLike } from "../bot";
@@ -15,6 +16,15 @@ import type { BootstrapRpcEndpoint } from "./bootstrapRpcClients";
 import { isRetryableRpcError } from "./bootstrapRpcClients";
 import type { BootstrapDiscoverySource } from "./bootstrapTypes";
 import { BootstrapSnapshotStore, buildSnapshotFromModel } from "./bootstrapSnapshotStore";
+import {
+  addressesFromDiscoveryCache,
+  BootstrapDiscoveryCacheStore,
+  DISCOVERY_CACHE_VERSION,
+  shouldForceBootstrapDiscoveryRefresh,
+} from "./bootstrapDiscoveryCache";
+import {
+  seedModelFromAccountSnapshot,
+} from "./positionOnChainReconcile";
 
 export type { BootstrapDiscoverySource } from "./bootstrapTypes";
 
@@ -39,6 +49,7 @@ export interface PartialBootstrapConfig {
   readonly logDiscoveryClients?: readonly BootstrapRpcEndpoint[];
   readonly cacheEnabled?: boolean;
   readonly cacheTtlHours?: number;
+  readonly reserveAllowlist?: readonly Address[];
 }
 
 export interface PartialBootstrapCoverage {
@@ -48,12 +59,14 @@ export interface PartialBootstrapCoverage {
   readonly usersWithDebt: number;
   readonly usersSeeded: number;
   readonly seedErrors: number;
+  readonly accountsAllowlistMatched: number;
   readonly blocksScanned: bigint;
   readonly lookbackDays: number;
   readonly elapsedMs: number;
   readonly positionCacheSize: number;
   readonly estimatedDebtorCoveragePct: number;
   readonly cacheHit: boolean;
+  readonly discoveryCacheHit: boolean;
 }
 
 interface LogDiscoveryResult {
@@ -93,10 +106,12 @@ export async function runPartialBootstrapSweep(
         withDebtCount: usersSeeded,
         usersSeeded,
         seedErrors: 0,
+        accountsAllowlistMatched: usersSeeded,
         lookbackDays: config.lookbackDays,
         startedAt,
         model: config.model,
         cacheHit: true,
+        discoveryCacheHit: false,
       });
       logCoverage(config, coverage, poolAddress, from, head, 0);
       return coverage;
@@ -105,11 +120,123 @@ export async function runPartialBootstrapSweep(
 
   let discovery: LogDiscoveryResult;
   let discoverySource: BootstrapDiscoverySource = config.forcedDiscoverySource ?? "logs";
+  let withDebt: readonly Address[];
+  let discoveryCacheHit = false;
+
+  const discoveryCacheStore = new BootstrapDiscoveryCacheStore({
+    chain: config.chain,
+    ttlHours: config.cacheTtlHours ?? 24,
+    logger: config.logger,
+  });
+  const forceRefresh = shouldForceBootstrapDiscoveryRefresh();
+
+  if (!forceRefresh) {
+    const cachedDiscovery = await discoveryCacheStore.loadIfFresh(head);
+    if (cachedDiscovery !== undefined) {
+      discoveryCacheHit = true;
+      discoverySource = cachedDiscovery.discoverySource;
+      const loaded = addressesFromDiscoveryCache(cachedDiscovery);
+      discovery = {
+        accounts: loaded.accounts,
+        borrowAccounts: [],
+        blocksScanned: head - from,
+        totalLogs: 0,
+      };
+      withDebt = loaded.withDebt;
+      config.logger.info("discovery_cache_hit", {
+        chain: config.chain,
+        accountsDiscovered: discovery.accounts.length,
+        accountsWithDebt: withDebt.length,
+      });
+    } else {
+      config.logger.info("discovery_cache_miss", { chain: config.chain });
+      ({ discovery, discoverySource, withDebt } = await discoverAccountsWithDebt(config, {
+        poolAddress,
+        from,
+        head,
+      }));
+      await discoveryCacheStore.save({
+        version: DISCOVERY_CACHE_VERSION,
+        chain: config.chain,
+        savedAtMs: Date.now(),
+        blockNumber: head.toString(),
+        discoverySource,
+        accounts: discovery.accounts.map((row) => row.toLowerCase()),
+        withDebt: withDebt.map((row) => row.toLowerCase()),
+      });
+    }
+  } else {
+    config.logger.info("discovery_cache_force_refresh", { chain: config.chain });
+    ({ discovery, discoverySource, withDebt } = await discoverAccountsWithDebt(config, {
+      poolAddress,
+      from,
+      head,
+    }));
+    await discoveryCacheStore.save({
+      version: DISCOVERY_CACHE_VERSION,
+      chain: config.chain,
+      savedAtMs: Date.now(),
+      blockNumber: head.toString(),
+      discoverySource,
+      accounts: discovery.accounts.map((row) => row.toLowerCase()),
+      withDebt: withDebt.map((row) => row.toLowerCase()),
+    });
+  }
+
+  const seedResult = await seedModelFromOnChain({
+    client: config.client,
+    model: config.model,
+    poolAddress,
+    poolAddressesProvider: chainConfig.aave.poolAddressesProvider,
+    uiPoolDataProvider: chainConfig.aave.uiPoolDataProvider,
+    accounts: withDebt,
+    blockNumber: head,
+    batchSize: config.reserveDataBatchSize ?? 50,
+    logger: config.logger,
+    ...(config.reserveAllowlist === undefined ? {} : { reserveAllowlist: config.reserveAllowlist }),
+  });
+
+  const coverage = buildCoverage({
+    discoverySource,
+    discovery,
+    withDebtCount: withDebt.length,
+    usersSeeded: seedResult.seeded,
+    seedErrors: seedResult.errors,
+    accountsAllowlistMatched: seedResult.allowlistMatched,
+    lookbackDays: config.lookbackDays,
+    startedAt,
+    model: config.model,
+    cacheHit: false,
+    discoveryCacheHit,
+  });
+
+  if (config.cacheEnabled !== false && seedResult.seeded > 0) {
+    await snapshotStore.save(buildSnapshotFromModel(config.model, {
+      chain: config.chain,
+      discoverySource,
+      blockNumber: head,
+    }));
+  }
+
+  logCoverage(config, coverage, poolAddress, from, head, discovery.totalLogs);
+  return coverage;
+}
+
+async function discoverAccountsWithDebt(
+  config: PartialBootstrapConfig,
+  input: { readonly poolAddress: Address; readonly from: bigint; readonly head: bigint },
+): Promise<{
+  readonly discovery: LogDiscoveryResult;
+  readonly discoverySource: BootstrapDiscoverySource;
+  readonly withDebt: readonly Address[];
+}> {
+  let discovery: LogDiscoveryResult;
+  let discoverySource: BootstrapDiscoverySource = config.forcedDiscoverySource ?? "logs";
   if (config.skipLogDiscovery === true && config.discoveredAccounts !== undefined) {
     discovery = {
       accounts: config.discoveredAccounts,
       borrowAccounts: [],
-      blocksScanned: head - from,
+      blocksScanned: input.head - input.from,
       totalLogs: 0,
     };
   } else {
@@ -117,9 +244,9 @@ export async function runPartialBootstrapSweep(
     try {
       discovery = await discoverUsersFromPoolLogs({
         clients: logClients,
-        poolAddress,
-        fromBlock: from,
-        toBlock: head,
+        poolAddress: input.poolAddress,
+        fromBlock: input.from,
+        toBlock: input.head,
         chunkBlocks: config.chunkBlocks ?? 2_000n,
         logger: config.logger,
       });
@@ -139,7 +266,7 @@ export async function runPartialBootstrapSweep(
       discovery = {
         accounts: subgraphAccounts,
         borrowAccounts: [],
-        blocksScanned: head - from,
+        blocksScanned: input.head - input.from,
         totalLogs: 0,
       };
     }
@@ -147,45 +274,12 @@ export async function runPartialBootstrapSweep(
 
   const withDebt = await filterAccountsWithDebt(
     config.client,
-    poolAddress,
+    input.poolAddress,
     discovery.accounts,
     config.accountBatchSize ?? 250,
   );
 
-  const seedResult = await seedModelFromOnChain({
-    client: config.client,
-    model: config.model,
-    poolAddress,
-    poolAddressesProvider: chainConfig.aave.poolAddressesProvider,
-    uiPoolDataProvider: chainConfig.aave.uiPoolDataProvider,
-    accounts: withDebt,
-    blockNumber: head,
-    batchSize: config.reserveDataBatchSize ?? 50,
-    logger: config.logger,
-  });
-
-  const coverage = buildCoverage({
-    discoverySource,
-    discovery,
-    withDebtCount: withDebt.length,
-    usersSeeded: seedResult.seeded,
-    seedErrors: seedResult.errors,
-    lookbackDays: config.lookbackDays,
-    startedAt,
-    model: config.model,
-    cacheHit: false,
-  });
-
-  if (config.cacheEnabled !== false && seedResult.seeded > 0) {
-    await snapshotStore.save(buildSnapshotFromModel(config.model, {
-      chain: config.chain,
-      discoverySource,
-      blockNumber: head,
-    }));
-  }
-
-  logCoverage(config, coverage, poolAddress, from, head, discovery.totalLogs);
-  return coverage;
+  return { discovery, discoverySource, withDebt };
 }
 
 function buildCoverage(input: {
@@ -194,10 +288,12 @@ function buildCoverage(input: {
   readonly withDebtCount: number;
   readonly usersSeeded: number;
   readonly seedErrors: number;
+  readonly accountsAllowlistMatched: number;
   readonly lookbackDays: number;
   readonly startedAt: number;
   readonly model: LocalPositionModel;
   readonly cacheHit: boolean;
+  readonly discoveryCacheHit: boolean;
 }): PartialBootstrapCoverage {
   return {
     discoverySource: input.discoverySource,
@@ -206,6 +302,7 @@ function buildCoverage(input: {
     usersWithDebt: input.withDebtCount,
     usersSeeded: input.usersSeeded,
     seedErrors: input.seedErrors,
+    accountsAllowlistMatched: input.accountsAllowlistMatched,
     blocksScanned: input.discovery.blocksScanned,
     lookbackDays: input.lookbackDays,
     elapsedMs: Date.now() - input.startedAt,
@@ -214,6 +311,7 @@ function buildCoverage(input: {
       ? 0
       : (input.withDebtCount / input.discovery.accounts.length) * 100,
     cacheHit: input.cacheHit,
+    discoveryCacheHit: input.discoveryCacheHit,
   };
 }
 
@@ -229,6 +327,10 @@ function logCoverage(
     discoverySource: coverage.discoverySource,
     bootstrapSource: coverage.discoverySource,
     cacheHit: coverage.cacheHit,
+    discoveryCacheHit: coverage.discoveryCacheHit,
+    accountsDiscovered: coverage.uniqueUsersFromLogs,
+    accountsWithDebt: coverage.usersWithDebt,
+    accountsAllowlistMatched: coverage.accountsAllowlistMatched,
     uniqueUsersFromLogs: coverage.uniqueUsersFromLogs,
     borrowLogUniqueUsers: coverage.borrowLogUniqueUsers,
     usersWithDebt: coverage.usersWithDebt,
@@ -306,10 +408,12 @@ async function seedModelFromOnChain(input: {
   readonly accounts: readonly Address[];
   readonly blockNumber: bigint;
   readonly batchSize: number;
+  readonly reserveAllowlist?: readonly Address[];
   readonly logger: LoggerLike;
-}): Promise<{ readonly seeded: number; readonly errors: number }> {
+}): Promise<{ readonly seeded: number; readonly errors: number; readonly allowlistMatched: number }> {
   let seeded = 0;
   let errors = 0;
+  let allowlistMatched = 0;
 
   for (let i = 0; i < input.accounts.length; i += input.batchSize) {
     const batch = input.accounts.slice(i, i + input.batchSize);
@@ -373,17 +477,23 @@ async function seedModelFromOnChain(input: {
         }
       }
 
+      if (input.reserveAllowlist !== undefined
+        && input.reserveAllowlist.length > 0
+        && !reservesTouchAllowlist(reserves, input.reserveAllowlist)) {
+        continue;
+      }
+      allowlistMatched += 1;
+
       try {
-        input.model.seedFromOnChainSnapshot({
+        seedModelFromAccountSnapshot(input.model, {
           account: address,
-          blockNumber: input.blockNumber,
           eModeCategoryId,
           healthFactorWad: accountData[5],
           totalCollateralBase: accountData[0],
           totalDebtBase,
           liquidationThreshold: accountData[3],
           reserves,
-        });
+        }, input.blockNumber);
         seeded += 1;
       } catch (error) {
         errors += 1;
@@ -395,7 +505,7 @@ async function seedModelFromOnChain(input: {
     }
   }
 
-  return { seeded, errors };
+  return { seeded, errors, allowlistMatched };
 }
 
 export function lookbackDaysToBlocks(days: number): bigint {

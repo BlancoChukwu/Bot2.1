@@ -5,7 +5,7 @@ import type { LoggerLike } from "../bot";
 import type { BootstrapDiscoverySource } from "./bootstrapTypes";
 import type { ExportedBootstrapPosition, LocalPositionModel } from "./localPositionModel";
 
-export const BOOTSTRAP_SNAPSHOT_VERSION = 1 as const;
+export const BOOTSTRAP_SNAPSHOT_VERSION = 2 as const;
 
 export type BootstrapPositionSnapshot = ExportedBootstrapPosition;
 

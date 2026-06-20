@@ -10,6 +10,9 @@ export type PositionTier = "healthy" | "watch" | "urgent" | "liquidatable";
 const WAD = 1_000_000_000_000_000_000n;
 const BPS = 10_000n;
 const BASE_LT_BPS = 8500n;
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+export const MAX_HF_WAD = (1n << 256n) - 1n;
 
 export interface ReserveConfig {
   readonly asset: Address;
@@ -27,6 +30,7 @@ export interface UserPosition {
   debtIndexAtUpdate: Map<string, bigint>;
   cachedHfWad: bigint;
   confidence: PositionConfidence;
+  isFullySeeded: boolean;
   lastConfirmedBlock: bigint;
   lastActivityBlock: bigint;
   eModeCategoryId: number;
@@ -39,6 +43,7 @@ export interface LocalPositionModelConfig {
   readonly purity: EventPurityConfig;
   readonly urgentHfWad: bigint;
   readonly watchHfWad: bigint;
+  readonly reserveAllowlist?: readonly Address[];
 }
 
 export interface TierChange {
@@ -46,6 +51,12 @@ export interface TierChange {
   readonly tier: PositionTier;
   readonly localHfWad: bigint;
   readonly isNew: boolean;
+  readonly isFullySeeded: boolean;
+}
+
+export interface AaveEventApplyResult {
+  readonly changes: readonly TierChange[];
+  readonly firstTouchReconcile?: Address;
 }
 
 export interface ExportedBootstrapPosition {
@@ -66,10 +77,17 @@ export class LocalPositionModel {
   readonly positions = new Map<string, UserPosition>();
   readonly prices = new Map<string, bigint>();
   readonly reserveConfig = new Map<string, ReserveConfig>();
+  private readonly allowlistSet: ReadonlySet<string> | undefined;
   private flashblockTickCount = 0n;
   private evictionTotal = 0;
 
-  public constructor(private readonly config: LocalPositionModelConfig) {}
+  public constructor(private readonly config: LocalPositionModelConfig) {
+    if (config.reserveAllowlist !== undefined && config.reserveAllowlist.length > 0) {
+      this.allowlistSet = new Set(config.reserveAllowlist.map((addr) => addr.toLowerCase()));
+    } else {
+      this.allowlistSet = undefined;
+    }
+  }
 
   public registerPriceFeed(_feed: Address, asset: Address, initialPrice: bigint): void {
     this.prices.set(asset.toLowerCase(), initialPrice);
@@ -93,20 +111,42 @@ export class LocalPositionModel {
     return this.flashblockTickCount % this.config.purity.reserveIndexRefreshBlocks === 0n;
   }
 
-  public applyAaveEvent(event: ParsedAavePoolEvent): readonly TierChange[] {
+  public isFullySeeded(account: Address): boolean {
+    return this.positions.get(account.toLowerCase())?.isFullySeeded ?? false;
+  }
+
+  public removePosition(account: Address): void {
+    this.positions.delete(account.toLowerCase());
+  }
+
+  public tierChangeForAccount(account: Address, isNew: boolean): TierChange | undefined {
+    const position = this.positions.get(account.toLowerCase());
+    if (position === undefined) {
+      return undefined;
+    }
+    return this.toTierChange(position, isNew);
+  }
+
+  public applyAaveEvent(event: ParsedAavePoolEvent): AaveEventApplyResult {
     if (event.name === "ReserveDataUpdated") {
       this.registerReserve(event.reserve);
       this.applyReserveIndexUpdate(event);
-      return [];
+      return { changes: [] };
     }
 
     const account = resolveUserAddress(event);
     if (account === undefined) {
-      return [];
+      return { changes: [] };
+    }
+
+    const accountKey = account.toLowerCase();
+    const existing = this.positions.get(accountKey);
+    if (existing === undefined && !this.isReserveInAllowlist(event.reserve)) {
+      return { changes: [] };
     }
 
     this.registerReserve(event.reserve);
-    const isNew = !this.positions.has(account.toLowerCase());
+    const isNew = existing === undefined;
     const position = this.getOrCreate(account, event.meta.blockNumber);
     position.lastActivityBlock = event.meta.blockNumber;
 
@@ -140,19 +180,25 @@ export class LocalPositionModel {
       }
     }
 
-    if (!this.positions.has(account.toLowerCase())) {
-      return [];
+    if (!this.positions.has(accountKey)) {
+      return { changes: [] };
     }
+
+    if (!position.isFullySeeded) {
+      this.enforceHardCap(event.meta.blockNumber);
+      return { changes: [], firstTouchReconcile: account };
+    }
+
     position.cachedHfWad = this.recomputeHf(position);
     this.enforceHardCap(event.meta.blockNumber);
-    return [this.toTierChange(position, isNew)];
+    return { changes: [this.toTierChange(position, isNew)] };
   }
 
   public applyPriceEvent(event: ParsedChainlinkPriceEvent): readonly TierChange[] {
     this.prices.set(event.asset.toLowerCase(), event.price);
     const changes: TierChange[] = [];
     for (const position of this.positions.values()) {
-      if (!positionTouchesAsset(position, event.asset)) {
+      if (!position.isFullySeeded || !positionTouchesAsset(position, event.asset)) {
         continue;
       }
       position.cachedHfWad = this.recomputeHf(position);
@@ -168,10 +214,11 @@ export class LocalPositionModel {
     liquidationThreshold: bigint,
     healthFactor: bigint,
     blockNumber: bigint,
-  eModeCategoryId: number,
-): void {
+    eModeCategoryId: number,
+  ): void {
     const position = this.getOrCreate(account, blockNumber);
     position.confidence = "high";
+    position.isFullySeeded = true;
     position.lastConfirmedBlock = blockNumber;
     position.eModeCategoryId = eModeCategoryId;
     position.lastTotalCollateralBase = totalCollateralBase;
@@ -225,6 +272,7 @@ export class LocalPositionModel {
 
     position.eModeCategoryId = input.eModeCategoryId;
     position.confidence = "high";
+    position.isFullySeeded = true;
     position.lastConfirmedBlock = input.blockNumber;
     position.lastActivityBlock = input.blockNumber;
     position.lastTotalCollateralBase = input.totalCollateralBase;
@@ -237,6 +285,7 @@ export class LocalPositionModel {
         totalDebtBase: input.totalDebtBase,
         currentLiquidationThreshold: input.liquidationThreshold,
       });
+    this.enforceHardCap(input.blockNumber);
   }
 
   public classifyTier(localHfWad: bigint): PositionTier {
@@ -263,7 +312,7 @@ export class LocalPositionModel {
   public exportBootstrapSnapshots(): readonly ExportedBootstrapPosition[] {
     const out: ExportedBootstrapPosition[] = [];
     for (const position of this.positions.values()) {
-      if (position.debt.size === 0) {
+      if (!position.isFullySeeded || position.debt.size === 0) {
         continue;
       }
       const reserves: { asset: Address; scaledCollateral: string; scaledDebt: string }[] = [];
@@ -293,6 +342,13 @@ export class LocalPositionModel {
     return out;
   }
 
+  private isReserveInAllowlist(reserve: Address): boolean {
+    if (this.allowlistSet === undefined) {
+      return true;
+    }
+    return this.allowlistSet.has(reserve.toLowerCase());
+  }
+
   private getOrCreate(account: Address, blockNumber: bigint): UserPosition {
     const key = account.toLowerCase();
     const existing = this.positions.get(key);
@@ -305,8 +361,9 @@ export class LocalPositionModel {
       debt: new Map(),
       collateralIndexAtUpdate: new Map(),
       debtIndexAtUpdate: new Map(),
-      cachedHfWad: (1n << 256n) - 1n,
+      cachedHfWad: MAX_HF_WAD,
       confidence: "low",
+      isFullySeeded: false,
       lastConfirmedBlock: 0n,
       lastActivityBlock: blockNumber,
       eModeCategoryId: 0,
@@ -340,7 +397,7 @@ export class LocalPositionModel {
     }
 
     if (totalDebt === 0n) {
-      return (1n << 256n) - 1n;
+      return MAX_HF_WAD;
     }
     return (weightedCollateral * WAD) / totalDebt;
   }
@@ -473,15 +530,22 @@ export class LocalPositionModel {
       tier: this.classifyTier(position.cachedHfWad),
       localHfWad: position.cachedHfWad,
       isNew,
+      isFullySeeded: position.isFullySeeded,
     };
   }
 }
 
 function resolveUserAddress(event: ParsedAavePoolEvent): Address | undefined {
-  if (event.name === "LiquidationCall") {
-    return event.user;
+  const raw = event.name === "LiquidationCall"
+    ? event.user
+    : event.onBehalfOf ?? event.user;
+  if (raw === undefined) {
+    return undefined;
   }
-  return event.onBehalfOf ?? event.user;
+  if (raw.toLowerCase() === ZERO_ADDRESS) {
+    return undefined;
+  }
+  return raw;
 }
 
 function positionTouchesAsset(position: UserPosition, asset: Address): boolean {

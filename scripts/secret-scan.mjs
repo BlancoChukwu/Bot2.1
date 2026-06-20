@@ -14,6 +14,9 @@ const secretAssignment =
 let failed = false;
 for (const file of staged) {
   const normalized = file.replace(/\\/g, "/");
+  if (normalized === ".env.example") {
+    continue;
+  }
   if (blockedPathPattern.test(normalized)) {
     console.error(`secret-scan: blocked staged secret or local-runtime file: ${file}`);
     failed = true;

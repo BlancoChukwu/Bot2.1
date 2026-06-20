@@ -52,6 +52,7 @@ describe("partialBootstrapSweep", () => {
       chunkBlocks: 10_000n,
       accountBatchSize: 10,
       reserveDataBatchSize: 10,
+      cacheEnabled: false,
     });
 
     expect(coverage.uniqueUsersFromLogs).toBeGreaterThan(0);

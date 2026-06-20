@@ -13,6 +13,7 @@ describe("eventPurityConfig", () => {
     expect(config.bootstrapLookbackDays).toBe(14);
     expect(config.bootstrapCacheEnabled).toBe(true);
     expect(config.bootstrapCacheTtlHours).toBe(24);
+    expect(config.positionCacheHardCap).toBe(8_000);
   });
 
   it("converts hf thresholds to wad", () => {

@@ -1018,6 +1018,10 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         "FLASHBLOCKS_ENABLED requires WS_RPC_URL_PRIMARY (Alchemy/QuickNode Flashblocks WSS) — HTTP pending getLogs polling is removed",
       );
     }
+    const reserveAllowlist = parseWatchlistReserveAllowlist(
+      process.env.WATCHLIST_RESERVE_ALLOWLIST,
+      config.chain,
+    );
     eventPurityStack = new EventPurityStack({
       chain: config.chain,
       poolAddress: activePoolAddress,
@@ -1025,6 +1029,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       executionClient: publicClient as unknown as PublicClient,
       feedRegistry: config.priceFeedRegistry ?? defaultPriceFeedRegistry(),
       purity: config.eventPurity,
+      reserveAllowlist,
       bootstrapSubgraphUrl: config.aaveSubgraphUrl,
       bootstrapLogRpcUrls: dedupeRpcUrls([
         config.executionRpcUrlPrimary,

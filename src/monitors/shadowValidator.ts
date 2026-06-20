@@ -1,11 +1,12 @@
 import type { Address, PublicClient } from "viem";
 import type { EventPurityConfig } from "../config/eventPurityConfig";
 import type { LoggerLike } from "../bot";
-import type { LocalPositionModel } from "./localPositionModel";
+import { MAX_HF_WAD, type LocalPositionModel } from "./localPositionModel";
 import { poolEmodeAbi } from "./aaveEmode";
 import { aavePoolAbi } from "../protocols/aaveV3";
 
 const WAD = 1_000_000_000_000_000_000n;
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
 export interface ShadowSample {
   readonly account: Address;
@@ -68,11 +69,33 @@ export class ShadowValidator {
   public constructor(private readonly config: ShadowValidatorConfig) {}
 
   public maybeSample(account: Address, localHfWad: bigint, blockNumber: bigint): Promise<ShadowSample | undefined> {
+    const skipReason = this.skipReason(account, localHfWad);
+    if (skipReason !== undefined) {
+      this.config.logger.info("shadow_sample_skipped", {
+        account,
+        reason: skipReason,
+        blockNumber: Number(blockNumber),
+      });
+      return Promise.resolve(undefined);
+    }
     this.sampleCounter += 1;
     if (this.sampleCounter % this.config.purity.shadowSampleRate !== 0) {
       return Promise.resolve(undefined);
     }
     return this.sample(account, localHfWad, blockNumber);
+  }
+
+  private skipReason(account: Address, localHfWad: bigint): string | undefined {
+    if (account.toLowerCase() === ZERO_ADDRESS) {
+      return "zero_address";
+    }
+    if (!this.config.model.isFullySeeded(account)) {
+      return "not_fully_seeded";
+    }
+    if (localHfWad >= MAX_HF_WAD) {
+      return "max_hf_sentinel";
+    }
+    return undefined;
   }
 
   public async sample(account: Address, localHfWad: bigint, blockNumber: bigint): Promise<ShadowSample | undefined> {

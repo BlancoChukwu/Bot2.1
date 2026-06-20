@@ -24,7 +24,8 @@ import {
   filterAccountsWithDebt,
 } from "./onChainBorrowerDiscovery";
 import { parseWatchlistReserveAllowlist } from "../config/watchlistReserveAllowlist";
-import { filterSnapshotsByAllowlist } from "../config/watchlistReserveFilter";
+import { filterAccountsTouchingReserveAllowlist } from "../config/watchlistReserveFilter";
+import { getChainConfig } from "../config/chains";
 
 export interface WatchlistCoordinatorConfig {
   readonly chain: SupportedChain;
@@ -535,15 +536,15 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
     if (accounts.length === 0) {
       return;
     }
-    const allowed = new Set<string>();
-    const batchSize = this.config.multicallBatchSize ?? 250;
-    for (let i = 0; i < accounts.length; i += batchSize) {
-      const batch = accounts.slice(i, i + batchSize);
-      const snapshots = await this.snapshotProvider.refreshBorrowers(this.config.chain, batch);
-      for (const snapshot of filterSnapshotsByAllowlist(snapshots, allowlist)) {
-        allowed.add(snapshot.account.toLowerCase());
-      }
-    }
+    const chainConfig = getChainConfig(this.config.chain);
+    const allowed = await filterAccountsTouchingReserveAllowlist({
+      client: this.config.readClient,
+      uiPoolDataProvider: chainConfig.aave.uiPoolDataProvider,
+      poolAddressesProvider: chainConfig.aave.poolAddressesProvider,
+      accounts,
+      allowlist,
+      batchSize: this.config.multicallBatchSize ?? 250,
+    });
     let pruned = 0;
     for (const account of accounts) {
       if (!allowed.has(account.toLowerCase())) {
