@@ -58,9 +58,12 @@ Start the bot within **15 minutes** of generating the receipt (safety gate TTL).
 ```bash
 chmod +x start-simulation.sh start-production.sh start-production-budget.sh \
   start-event-purity-soak.sh start-event-purity-production.sh \
+  watch-bot.sh \
   scripts/launcher-run-bot-detached.sh
 ./start-event-purity-soak.sh         # 48h shadow soak (recommended)
 ./start-event-purity-production.sh   # live after soak passes
+./watch-bot.sh                       # live monitor (status + session summary)
+./watch-bot.sh --once                # single snapshot
 ./start-simulation.sh                # legacy soak
 ./start-production.sh                # legacy live
 ```
