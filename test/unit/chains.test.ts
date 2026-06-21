@@ -18,6 +18,7 @@ describe("chain configuration", () => {
 
   it("supports Base for arbitration rollout", () => {
     expect(getChainConfig("base").chainId).toBe(8453);
+    expect(getChainConfig("base").aave.uiPoolDataProvider).toBe("0x0C6BC4a12039788be08F87e87Cff87FEDbd1D386");
     expect(parseSupportedChain("base")).toBe("base");
   });
 

@@ -293,11 +293,10 @@ export function pendingLogToRaw(log: Record<string, unknown>): ReturnType<typeof
 }
 
 export function chainlinkLogsFilter(feed: Address): Record<string, unknown> {
+  // Address-only filter: some WS providers (e.g. Chainstack) reject logs subs with topics.
+  // AnswerUpdated events are filtered client-side in parseChainlinkAnswerUpdatedLog.
   return {
     address: feed,
-    topics: [
-      "0x0559884fd3a460db3073d7f8961304184bd105c8d1956eed26df2440bf4172f",
-    ],
   };
 }
 

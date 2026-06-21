@@ -1,3 +1,4 @@
+/** Aave v3-origin UserReserveData (stable-rate fields removed in current deployments). */
 export const uiPoolDataProviderAbi = [
   {
     type: "function",
@@ -15,10 +16,7 @@ export const uiPoolDataProviderAbi = [
           { name: "underlyingAsset", type: "address" },
           { name: "scaledATokenBalance", type: "uint256" },
           { name: "usageAsCollateralEnabledOnUser", type: "bool" },
-          { name: "stableBorrowRate", type: "uint256" },
           { name: "scaledVariableDebt", type: "uint256" },
-          { name: "principalStableDebt", type: "uint256" },
-          { name: "stableBorrowLastUpdateTimestamp", type: "uint256" },
         ],
       },
       { name: "userEmodeCategoryId", type: "uint8" },
