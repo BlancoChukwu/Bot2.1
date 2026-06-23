@@ -6,7 +6,7 @@ const DEFAULT_MAX_STALE_MS = 900_000;
 const DEFAULT_USD_DECIMALS = 8;
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
 
-const chainlinkAggregatorAbi = [
+export const chainlinkAggregatorAbi = [
   {
     name: "latestRoundData",
     type: "function",

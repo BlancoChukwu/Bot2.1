@@ -86,6 +86,9 @@ export class ShadowValidator {
   }
 
   private skipReason(account: Address, localHfWad: bigint): string | undefined {
+    if (!this.config.model.isPricesBootstrapped()) {
+      return "prices_not_bootstrapped";
+    }
     if (account.toLowerCase() === ZERO_ADDRESS) {
       return "zero_address";
     }

@@ -1,6 +1,8 @@
 import type { Address } from "viem";
 import type { EventPurityConfig } from "../config/eventPurityConfig";
 import { hfThresholdToWad } from "../config/eventPurityConfig";
+import { FEED_HEARTBEATS, MAX_UINT256 } from "../config/oracleBootstrap";
+import type { LoggerLike } from "../bot";
 import { calculateHealthFactor } from "../protocols/aaveV3";
 import type { ParsedAavePoolEvent, ParsedChainlinkPriceEvent } from "./aaveEventParser";
 
@@ -11,8 +13,24 @@ const WAD = 1_000_000_000_000_000_000n;
 const BPS = 10_000n;
 const BASE_LT_BPS = 8500n;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+const DEFAULT_FEED_DECIMALS = 8;
 
-export const MAX_HF_WAD = (1n << 256n) - 1n;
+export { MAX_HF_WAD } from "../config/oracleBootstrap";
+
+export interface FeedState {
+  answer: bigint;
+  decimals: number;
+  updatedAt: number;
+  feedAddress: Address;
+  asset: Address;
+}
+
+export type HfResult =
+  | { status: "ok"; hf: bigint }
+  | { status: "price_incomplete"; missingAssets: Address[] }
+  | { status: "price_stale"; staleAssets: Address[] }
+  | { status: "no_debt"; hf: typeof MAX_UINT256 }
+  | { status: "error"; reason: string };
 
 export interface ReserveConfig {
   readonly asset: Address;
@@ -20,6 +38,7 @@ export interface ReserveConfig {
   liquidityIndex: bigint;
   variableBorrowIndex: bigint;
   indexUpdatedAtBlock: bigint;
+  liquidationBonus: bigint | null;
 }
 
 export interface UserPosition {
@@ -44,6 +63,7 @@ export interface LocalPositionModelConfig {
   readonly urgentHfWad: bigint;
   readonly watchHfWad: bigint;
   readonly reserveAllowlist?: readonly Address[];
+  readonly logger?: LoggerLike;
 }
 
 export interface TierChange {
@@ -76,10 +96,12 @@ export interface ExportedBootstrapPosition {
 export class LocalPositionModel {
   readonly positions = new Map<string, UserPosition>();
   readonly prices = new Map<string, bigint>();
+  readonly feedStates = new Map<string, FeedState>();
   readonly reserveConfig = new Map<string, ReserveConfig>();
   private readonly allowlistSet: ReadonlySet<string> | undefined;
   private flashblockTickCount = 0n;
   private evictionTotal = 0;
+  private _pricesBootstrapped = false;
 
   public constructor(private readonly config: LocalPositionModelConfig) {
     if (config.reserveAllowlist !== undefined && config.reserveAllowlist.length > 0) {
@@ -89,8 +111,43 @@ export class LocalPositionModel {
     }
   }
 
+  public isPricesBootstrapped(): boolean {
+    return this._pricesBootstrapped;
+  }
+
+  public markPricesBootstrapped(): void {
+    this._pricesBootstrapped = true;
+  }
+
   public registerPriceFeed(_feed: Address, asset: Address, initialPrice: bigint): void {
     this.prices.set(asset.toLowerCase(), initialPrice);
+  }
+
+  public registerBootstrapPrice(
+    asset: Address,
+    normalizedPrice: bigint,
+    feedState: FeedState,
+  ): void {
+    const key = asset.toLowerCase();
+    this.prices.set(key, normalizedPrice);
+    this.feedStates.set(key, feedState);
+  }
+
+  public setReserveLiquidationBonus(asset: Address, bonus: bigint | null): void {
+    const key = asset.toLowerCase();
+    const reserve = this.reserveConfig.get(key);
+    if (reserve === undefined) {
+      this.reserveConfig.set(key, {
+        asset,
+        liquidationThresholdBps: BASE_LT_BPS,
+        liquidityIndex: WAD,
+        variableBorrowIndex: WAD,
+        indexUpdatedAtBlock: 0n,
+        liquidationBonus: bonus,
+      });
+      return;
+    }
+    this.reserveConfig.set(key, { ...reserve, liquidationBonus: bonus });
   }
 
   public registerReserve(asset: Address, liquidationThresholdBps = BASE_LT_BPS): void {
@@ -102,6 +159,7 @@ export class LocalPositionModel {
         liquidityIndex: WAD,
         variableBorrowIndex: WAD,
         indexUpdatedAtBlock: 0n,
+        liquidationBonus: null,
       });
     }
   }
@@ -189,20 +247,68 @@ export class LocalPositionModel {
       return { changes: [], firstTouchReconcile: account };
     }
 
-    position.cachedHfWad = this.recomputeHf(position);
+    const hfResult = this.applyHfResult(position, isNew);
     this.enforceHardCap(event.meta.blockNumber);
-    return { changes: [this.toTierChange(position, isNew)] };
+    return hfResult;
   }
 
   public applyPriceEvent(event: ParsedChainlinkPriceEvent): readonly TierChange[] {
-    this.prices.set(event.asset.toLowerCase(), event.price);
+    const answer = event.price;
+    const assetKey = event.asset.toLowerCase();
+
+    if (answer <= 0n) {
+      this.config.logger?.error("FEED_INVALID_PRICE", { asset: event.asset, feed: event.feed, answer: answer.toString() });
+      return [];
+    }
+
+    const existingFeedState = this.feedStates.get(assetKey);
+    const decimals = existingFeedState?.decimals ?? DEFAULT_FEED_DECIMALS;
+    if (existingFeedState === undefined) {
+      this.config.logger?.warn("feed_state_missing_for_price_event", {
+        asset: event.asset,
+        feed: event.feed,
+        usingDefaultDecimals: DEFAULT_FEED_DECIMALS,
+      });
+    }
+
+    const normalizedPrice = answer * 10n ** BigInt(18 - decimals);
+    this.prices.set(assetKey, normalizedPrice);
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (existingFeedState !== undefined) {
+      this.feedStates.set(assetKey, {
+        ...existingFeedState,
+        answer,
+        updatedAt: nowSec,
+      });
+    }
+
     const changes: TierChange[] = [];
     for (const position of this.positions.values()) {
       if (!position.isFullySeeded || !positionTouchesAsset(position, event.asset)) {
         continue;
       }
-      position.cachedHfWad = this.recomputeHf(position);
-      changes.push(this.toTierChange(position, false));
+      const hfResult = this.recomputeHf(position, nowSec);
+      switch (hfResult.status) {
+        case "ok":
+        case "no_debt":
+          position.cachedHfWad = hfResult.hf;
+          changes.push(this.toTierChange(position, false));
+          break;
+        case "price_incomplete":
+          this.config.logger?.info("hf_skip_price_incomplete", { missingAssets: hfResult.missingAssets });
+          break;
+        case "price_stale":
+          this.config.logger?.warn("hf_skip_price_stale", { staleAssets: hfResult.staleAssets });
+          break;
+        case "error":
+          this.config.logger?.error("hf_error", { reason: hfResult.reason });
+          break;
+        default: {
+          const _exhaustive: never = hfResult;
+          return _exhaustive;
+        }
+      }
     }
     return changes;
   }
@@ -342,6 +448,85 @@ export class LocalPositionModel {
     return out;
   }
 
+  /**
+   * Recomputes local HF from cached prices and reserve config.
+   * @param nowSec Real Unix timestamp in seconds — never a block number.
+   */
+  public recomputeHf(position: UserPosition, nowSec: number): HfResult {
+    try {
+      if (!this._pricesBootstrapped) {
+        const missingAssets = collectPositionAssets(position);
+        return { status: "price_incomplete", missingAssets };
+      }
+
+      const missingAssets = collectMissingPriceAssets(position, this.prices);
+      if (missingAssets.length > 0) {
+        return { status: "price_incomplete", missingAssets };
+      }
+
+      const staleAssets = collectStalePriceAssets(position, this.feedStates, nowSec);
+      if (staleAssets.length > 0) {
+        return { status: "price_stale", staleAssets };
+      }
+
+      let weightedCollateral = 0n;
+      let totalDebt = 0n;
+
+      for (const [assetKey, amount] of position.collateral) {
+        const reserve = this.reserveConfig.get(assetKey);
+        const price = this.prices.get(assetKey);
+        if (reserve === undefined || price === undefined || amount === 0n) {
+          continue;
+        }
+        const scaled = this.scaleCollateralAmount(position, assetKey, amount, reserve);
+        weightedCollateral += (scaled * price * reserve.liquidationThresholdBps) / BPS;
+      }
+
+      for (const [assetKey, amount] of position.debt) {
+        const reserve = this.reserveConfig.get(assetKey);
+        const price = this.prices.get(assetKey);
+        if (reserve === undefined || price === undefined || amount === 0n) {
+          continue;
+        }
+        const scaled = this.scaleDebtAmount(position, assetKey, amount, reserve);
+        totalDebt += scaled * price;
+      }
+
+      if (totalDebt === 0n) {
+        // Aave infinite HF sentinel for no-debt positions.
+        return { status: "no_debt", hf: MAX_UINT256 };
+      }
+
+      return { status: "ok", hf: (weightedCollateral * WAD) / totalDebt };
+    } catch (error) {
+      return { status: "error", reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  private applyHfResult(position: UserPosition, isNew: boolean): AaveEventApplyResult {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const result = this.recomputeHf(position, nowSec);
+    switch (result.status) {
+      case "ok":
+      case "no_debt":
+        position.cachedHfWad = result.hf;
+        return { changes: [this.toTierChange(position, isNew)] };
+      case "price_incomplete":
+        this.config.logger?.info("hf_skip_price_incomplete", { missingAssets: result.missingAssets });
+        return { changes: [] };
+      case "price_stale":
+        this.config.logger?.warn("hf_skip_price_stale", { staleAssets: result.staleAssets });
+        return { changes: [] };
+      case "error":
+        this.config.logger?.error("hf_error", { reason: result.reason });
+        return { changes: [] };
+      default: {
+        const _exhaustive: never = result;
+        return _exhaustive;
+      }
+    }
+  }
+
   private isReserveInAllowlist(reserve: Address): boolean {
     if (this.allowlistSet === undefined) {
       return true;
@@ -361,7 +546,7 @@ export class LocalPositionModel {
       debt: new Map(),
       collateralIndexAtUpdate: new Map(),
       debtIndexAtUpdate: new Map(),
-      cachedHfWad: MAX_HF_WAD,
+      cachedHfWad: MAX_UINT256,
       confidence: "low",
       isFullySeeded: false,
       lastConfirmedBlock: 0n,
@@ -370,36 +555,6 @@ export class LocalPositionModel {
     };
     this.positions.set(key, created);
     return created;
-  }
-
-  private recomputeHf(position: UserPosition): bigint {
-    let weightedCollateral = 0n;
-    let totalDebt = 0n;
-
-    for (const [assetKey, amount] of position.collateral) {
-      const reserve = this.reserveConfig.get(assetKey);
-      const price = this.prices.get(assetKey);
-      if (reserve === undefined || price === undefined || amount === 0n) {
-        continue;
-      }
-      const scaled = this.scaleCollateralAmount(position, assetKey, amount, reserve);
-      weightedCollateral += (scaled * price * reserve.liquidationThresholdBps) / BPS;
-    }
-
-    for (const [assetKey, amount] of position.debt) {
-      const reserve = this.reserveConfig.get(assetKey);
-      const price = this.prices.get(assetKey);
-      if (reserve === undefined || price === undefined || amount === 0n) {
-        continue;
-      }
-      const scaled = this.scaleDebtAmount(position, assetKey, amount, reserve);
-      totalDebt += scaled * price;
-    }
-
-    if (totalDebt === 0n) {
-      return MAX_HF_WAD;
-    }
-    return (weightedCollateral * WAD) / totalDebt;
   }
 
   private scaleCollateralAmount(
@@ -533,6 +688,67 @@ export class LocalPositionModel {
       isFullySeeded: position.isFullySeeded,
     };
   }
+}
+
+function collectPositionAssets(position: UserPosition): Address[] {
+  const assets: Address[] = [];
+  for (const [assetKey, amount] of position.collateral) {
+    if (amount > 0n) {
+      assets.push(assetKey as Address);
+    }
+  }
+  for (const [assetKey, amount] of position.debt) {
+    if (amount > 0n) {
+      assets.push(assetKey as Address);
+    }
+  }
+  return assets;
+}
+
+function collectMissingPriceAssets(
+  position: UserPosition,
+  prices: ReadonlyMap<string, bigint>,
+): Address[] {
+  const missing: Address[] = [];
+  const keys = new Set([...position.collateral.keys(), ...position.debt.keys()]);
+  for (const assetKey of keys) {
+    const collateral = position.collateral.get(assetKey) ?? 0n;
+    const debt = position.debt.get(assetKey) ?? 0n;
+    if (collateral === 0n && debt === 0n) {
+      continue;
+    }
+    const price = prices.get(assetKey);
+    if (price === undefined || price === 1n) {
+      missing.push(assetKey as Address);
+    }
+  }
+  return missing;
+}
+
+function collectStalePriceAssets(
+  position: UserPosition,
+  feedStates: ReadonlyMap<string, FeedState>,
+  nowSec: number,
+): Address[] {
+  const stale: Address[] = [];
+  const keys = new Set([...position.collateral.keys(), ...position.debt.keys()]);
+  for (const assetKey of keys) {
+    const collateral = position.collateral.get(assetKey) ?? 0n;
+    const debt = position.debt.get(assetKey) ?? 0n;
+    if (collateral === 0n && debt === 0n) {
+      continue;
+    }
+    const feedState = feedStates.get(assetKey);
+    if (feedState === undefined) {
+      continue;
+    }
+    const heartbeat = FEED_HEARTBEATS[feedState.feedAddress.toLowerCase()] ?? 3600;
+    const staleThreshold = heartbeat * 1.5;
+    if (nowSec - feedState.updatedAt > staleThreshold) {
+      stale.push(assetKey as Address);
+    }
+  }
+  return stale;
 }
 
 function resolveUserAddress(event: ParsedAavePoolEvent): Address | undefined {
