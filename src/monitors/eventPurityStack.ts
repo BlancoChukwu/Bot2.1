@@ -10,7 +10,6 @@ import {
   BOOTSTRAP_RETRY_DELAY_MS,
   CRITICAL_FEEDS,
   FEED_HEARTBEATS,
-  MULTICALL3_ADDRESS,
   protocolDataProviderAbi,
   SEQUENCER_GRACE_PERIOD_SECONDS,
 } from "../config/oracleBootstrap";
@@ -58,6 +57,164 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function parseSequencerRound(result: unknown): { answer: bigint; startedAt: number } | undefined {
+  if (Array.isArray(result)) {
+    const answer = result[1];
+    const startedAt = result[2];
+    if (typeof answer !== "bigint") {
+      return undefined;
+    }
+    return { answer, startedAt: Number(startedAt) };
+  }
+  if (typeof result === "object" && result !== null) {
+    const record = result as { answer?: unknown; startedAt?: unknown };
+    if (typeof record.answer !== "bigint") {
+      return undefined;
+    }
+    return { answer: record.answer, startedAt: Number(record.startedAt) };
+  }
+  return undefined;
+}
+
+function parseLatestRoundData(result: unknown): { answer: bigint; updatedAt: number } | undefined {
+  if (Array.isArray(result)) {
+    const answer = result[1];
+    const updatedAt = result[3];
+    if (typeof answer !== "bigint") {
+      return undefined;
+    }
+    return { answer, updatedAt: Number(updatedAt) };
+  }
+  if (typeof result === "object" && result !== null) {
+    const record = result as { answer?: unknown; updatedAt?: unknown };
+    if (typeof record.answer !== "bigint") {
+      return undefined;
+    }
+    return { answer: record.answer, updatedAt: Number(record.updatedAt) };
+  }
+  return undefined;
+}
+
+function parseFeedDecimals(result: unknown): number | undefined {
+  if (typeof result === "number") {
+    return result;
+  }
+  if (typeof result === "bigint") {
+    return Number(result);
+  }
+  return undefined;
+}
+
+function parseLiquidationBonus(result: unknown): bigint | undefined {
+  if (typeof result === "object" && result !== null && "liquidationBonus" in result) {
+    const bonus = (result as { liquidationBonus: unknown }).liquidationBonus;
+    return typeof bonus === "bigint" ? bonus : undefined;
+  }
+  if (Array.isArray(result) && typeof result[3] === "bigint") {
+    return result[3];
+  }
+  return undefined;
+}
+
+async function readFeedPair(
+  client: PublicClient,
+  feed: Address,
+): Promise<{ answer: bigint; updatedAt: number; decimals: number } | undefined> {
+  try {
+    const [lrdRaw, decRaw] = await Promise.all([
+      client.readContract({
+        address: feed,
+        abi: chainlinkAggregatorAbi,
+        functionName: "latestRoundData",
+      }),
+      client.readContract({
+        address: feed,
+        abi: chainlinkAggregatorAbi,
+        functionName: "decimals",
+      }),
+    ]);
+    const lrd = parseLatestRoundData(lrdRaw);
+    const decimals = parseFeedDecimals(decRaw);
+    if (lrd === undefined || decimals === undefined) {
+      return undefined;
+    }
+    return { ...lrd, decimals };
+  } catch {
+    return undefined;
+  }
+}
+
+function registerFeedIfWarm(input: {
+  asset: Address;
+  feed: Address;
+  answer: bigint;
+  updatedAt: number;
+  decimals: number;
+  blockTimestamp: number;
+  model: LocalPositionModel;
+  logger: LoggerLike;
+  warmCriticalFeeds: Set<string>;
+  bootstrappedPrices: Map<Address, { feed: Address; price: bigint; decimals: number }>;
+}): void {
+  const {
+    asset: assetAddr,
+    feed: feedAddr,
+    answer,
+    updatedAt,
+    decimals,
+    blockTimestamp,
+    model,
+    logger,
+    warmCriticalFeeds,
+    bootstrappedPrices,
+  } = input;
+
+  if (answer <= 0n) {
+    logger.error("FEED_INVALID_PRICE", { asset: assetAddr, feed: feedAddr, answer: answer.toString() });
+    return;
+  }
+  if (decimals > 18) {
+    logger.error("FEED_DECIMAL_OVERFLOW", { asset: assetAddr, feed: feedAddr, decimals });
+    return;
+  }
+
+  const normalizedPrice = answer * 10n ** BigInt(18 - decimals);
+  const ageSec = blockTimestamp - updatedAt;
+  const feedKey = feedAddr.toLowerCase();
+  if (FEED_HEARTBEATS[feedKey] === undefined) {
+    logger.warn("FEED_HEARTBEAT_UNKNOWN", { feed: feedAddr, asset: assetAddr, usingDefault: 3600 });
+  }
+  const heartbeat = FEED_HEARTBEATS[feedKey] ?? 3600;
+  const staleThreshold = heartbeat * 1.5;
+  const isStale = ageSec > staleThreshold;
+
+  logger.info("feed_bootstrap", {
+    asset: assetAddr,
+    normalizedPrice: normalizedPrice.toString(),
+    ageSec,
+    heartbeat,
+    status: isStale ? "STALE" : "WARM",
+  });
+
+  if (isStale) {
+    logger.warn("FEED_STALE", { asset: assetAddr, feed: feedAddr, ageSec, staleThreshold });
+    return;
+  }
+
+  model.registerBootstrapPrice(assetAddr, normalizedPrice, {
+    answer,
+    decimals,
+    updatedAt,
+    feedAddress: feedAddr,
+    asset: assetAddr,
+  });
+  bootstrappedPrices.set(assetAddr, { feed: feedAddr, price: normalizedPrice, decimals });
+
+  if (CRITICAL_FEEDS.some((f) => f.toLowerCase() === feedKey)) {
+    warmCriticalFeeds.add(feedKey);
+  }
 }
 
 export interface EventPurityStackConfig {
@@ -423,16 +580,20 @@ export async function runOraclePriceBootstrap(
         }),
         input.executionClient.getBlock({ blockTag: "latest" }),
       ]);
-      const [, answer, startedAt] = seqResult as readonly [bigint, bigint, bigint, bigint, bigint];
+      const sequencerRound = parseSequencerRound(seqResult);
+      if (sequencerRound === undefined) {
+        throw new Error("sequencer_check_parse_failed");
+      }
+      const { answer, startedAt } = sequencerRound;
       blockTimestamp = Number(block.timestamp);
       const sequencerUp = answer === 0n;
-      const graceElapsed = blockTimestamp - Number(startedAt) >= SEQUENCER_GRACE_PERIOD_SECONDS;
+      const graceElapsed = blockTimestamp - startedAt >= SEQUENCER_GRACE_PERIOD_SECONDS;
       const healthy = sequencerUp && graceElapsed;
 
       input.logger.info("sequencer_check", {
         attempt,
         answer: answer.toString(),
-        startedAt: Number(startedAt),
+        startedAt,
         blockTimestamp,
         healthy,
       });
@@ -504,7 +665,6 @@ export async function runOraclePriceBootstrap(
   const results = await input.executionClient.multicall({
     contracts,
     allowFailure: true,
-    multicallAddress: MULTICALL3_ADDRESS,
   }) as readonly MulticallResult[];
 
   const warmCriticalFeeds = new Set<string>();
@@ -517,6 +677,14 @@ export async function runOraclePriceBootstrap(
     const entry = feedIndex[i];
     const response = results[i];
     if (entry === undefined || response === undefined) {
+      if (entry !== undefined) {
+        input.logger.warn("oracle_multicall_subcall_missing", {
+          asset: entry.asset,
+          feed: entry.feed,
+          type: entry.type,
+          index: i,
+        });
+      }
       continue;
     }
 
@@ -526,11 +694,12 @@ export async function runOraclePriceBootstrap(
         input.model.setReserveLiquidationBonus(entry.asset, null);
         continue;
       }
-      const {
-        liquidationBonus,
-      } = response.result as {
-        liquidationBonus: bigint;
-      };
+      const liquidationBonus = parseLiquidationBonus(response.result);
+      if (liquidationBonus === undefined) {
+        input.logger.warn("RESERVE_CONFIG_FETCH_FAILED", { asset: entry.asset, reason: "parse_failed" });
+        input.model.setReserveLiquidationBonus(entry.asset, null);
+        continue;
+      }
       input.model.registerReserve(entry.asset);
       input.model.setReserveLiquidationBonus(entry.asset, liquidationBonus);
       continue;
@@ -542,15 +711,21 @@ export async function runOraclePriceBootstrap(
         asset: entry.asset,
         feed: entry.feed,
         type: entry.type,
+        error: "error" in response ? String((response as { error?: unknown }).error) : undefined,
       });
       continue;
     }
 
     if (entry.type === "lrd") {
-      const [, answer, , updatedAt] = response.result as readonly [bigint, bigint, bigint, bigint, bigint];
-      lrdByKey.set(key, { answer, updatedAt: Number(updatedAt) });
+      const lrd = parseLatestRoundData(response.result);
+      if (lrd !== undefined) {
+        lrdByKey.set(key, lrd);
+      }
     } else {
-      decByKey.set(key, Number(response.result as number | bigint));
+      const decimals = parseFeedDecimals(response.result);
+      if (decimals !== undefined) {
+        decByKey.set(key, decimals);
+      }
     }
   }
 
@@ -561,61 +736,36 @@ export async function runOraclePriceBootstrap(
     const assetAddr = asset as Address;
     const feedAddr = feedConfig.feed;
     const key = `${assetAddr.toLowerCase()}:${feedAddr.toLowerCase()}`;
-    const lrd = lrdByKey.get(key);
-    const decimalsRaw = decByKey.get(key);
+    let lrd = lrdByKey.get(key);
+    let decimalsRaw = decByKey.get(key);
 
     if (lrd === undefined || decimalsRaw === undefined) {
-      input.logger.warn("feed_bootstrap_skipped", { asset: assetAddr, feed: feedAddr, reason: "missing_multicall_pair" });
-      continue;
+      const fallback = await readFeedPair(input.executionClient, feedAddr);
+      if (fallback === undefined) {
+        input.logger.warn("feed_bootstrap_skipped", {
+          asset: assetAddr,
+          feed: feedAddr,
+          reason: "missing_multicall_pair",
+        });
+        continue;
+      }
+      input.logger.info("feed_bootstrap_read_fallback", { asset: assetAddr, feed: feedAddr });
+      lrd = { answer: fallback.answer, updatedAt: fallback.updatedAt };
+      decimalsRaw = fallback.decimals;
     }
 
-    const { answer, updatedAt } = lrd;
-    const decimals = decimalsRaw;
-
-    if (answer <= 0n) {
-      input.logger.error("FEED_INVALID_PRICE", { asset: assetAddr, feed: feedAddr, answer: answer.toString() });
-      continue;
-    }
-    if (decimals > 18) {
-      input.logger.error("FEED_DECIMAL_OVERFLOW", { asset: assetAddr, feed: feedAddr, decimals });
-      continue;
-    }
-
-    const normalizedPrice = answer * 10n ** BigInt(18 - decimals);
-    const ageSec = blockTimestamp - updatedAt;
-    const feedKey = feedAddr.toLowerCase();
-    if (FEED_HEARTBEATS[feedKey] === undefined) {
-      input.logger.warn("FEED_HEARTBEAT_UNKNOWN", { feed: feedAddr, asset: assetAddr, usingDefault: 3600 });
-    }
-    const heartbeat = FEED_HEARTBEATS[feedKey] ?? 3600;
-    const staleThreshold = heartbeat * 1.5;
-    const isStale = ageSec > staleThreshold;
-
-    input.logger.info("feed_bootstrap", {
+    registerFeedIfWarm({
       asset: assetAddr,
-      normalizedPrice: normalizedPrice.toString(),
-      ageSec,
-      heartbeat,
-      status: isStale ? "STALE" : "WARM",
+      feed: feedAddr,
+      answer: lrd.answer,
+      updatedAt: lrd.updatedAt,
+      decimals: decimalsRaw,
+      blockTimestamp,
+      model: input.model,
+      logger: input.logger,
+      warmCriticalFeeds,
+      bootstrappedPrices,
     });
-
-    if (isStale) {
-      input.logger.warn("FEED_STALE", { asset: assetAddr, feed: feedAddr, ageSec, staleThreshold });
-      continue;
-    }
-
-    input.model.registerBootstrapPrice(assetAddr, normalizedPrice, {
-      answer,
-      decimals,
-      updatedAt,
-      feedAddress: feedAddr,
-      asset: assetAddr,
-    });
-    bootstrappedPrices.set(assetAddr, { feed: feedAddr, price: normalizedPrice, decimals });
-
-    if (CRITICAL_FEEDS.some((f) => f.toLowerCase() === feedKey)) {
-      warmCriticalFeeds.add(feedKey);
-    }
   }
 
   const criticalFeedsOk = CRITICAL_FEEDS.every((f) => warmCriticalFeeds.has(f.toLowerCase()));
@@ -657,8 +807,13 @@ async function runBootstrapDiagnosticCrossCheck(
         address: row.feed,
         abi: chainlinkAggregatorAbi,
         functionName: "latestRoundData",
-      }) as readonly [bigint, bigint, bigint, bigint, bigint];
-      const directAnswer = directResult[1];
+      });
+      const directRound = parseLatestRoundData(directResult);
+      if (directRound === undefined) {
+        input.logger.warn("bootstrap_crosscheck_failed", { asset, reason: "parse_failed" });
+        continue;
+      }
+      const directAnswer = directRound.answer;
       const directNormalized = directAnswer * 10n ** BigInt(18 - row.decimals);
       const expectedPrice = row.price;
       const delta = expectedPrice > directNormalized
