@@ -17,6 +17,6 @@ describe("nodeHeapLimits", () => {
     const limits = memoryLimitsFromNodeHeap(650);
     expect(limits.warnBytes).toBe(Math.floor(650 * 0.72) * 1024 * 1024);
     expect(limits.ceilBytes).toBe(Math.floor(650 * 0.9) * 1024 * 1024);
-    expect(limits.rssWarnBytes).toBe(380 * 1024 * 1024);
+    expect(limits.rssWarnBytes).toBe(430 * 1024 * 1024);
   });
 });

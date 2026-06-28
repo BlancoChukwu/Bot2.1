@@ -16,6 +16,16 @@ export function memoryLimitsFromNodeHeap(maxHeapMb = parseMaxOldSpaceSizeMb()): 
 } {
   const warnBytes = Math.floor(maxHeapMb * 0.72) * 1024 * 1024;
   const ceilBytes = Math.floor(maxHeapMb * 0.9) * 1024 * 1024;
-  const rssWarnBytes = 380 * 1024 * 1024;
+  const rssWarnMb = parseRssWarnMb();
+  const rssWarnBytes = rssWarnMb * 1024 * 1024;
   return { warnBytes, ceilBytes, rssWarnBytes };
+}
+
+function parseRssWarnMb(): number {
+  const raw = process.env.RSS_WARN_MB;
+  if (raw === undefined || raw.trim() === "") {
+    return 430;
+  }
+  const parsed = Number(raw.trim());
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 430;
 }

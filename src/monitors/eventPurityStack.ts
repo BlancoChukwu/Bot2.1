@@ -24,6 +24,7 @@ import type { ParsedIngestionEvent } from "./aaveEventParser";
 import { runPartialBootstrapSweep, type PartialBootstrapCoverage } from "./partialBootstrapSweep";
 import { createBootstrapLogClients } from "./bootstrapRpcClients";
 import { setBootstrapRuntimeStatus } from "../runtime/bootstrapRuntimeStatus";
+import { pollLocalFeedFreshness } from "./localFeedFreshnessPoll";
 import { reconcileAndSeedPosition } from "./positionOnChainReconcile";
 
 const WAD = 1_000_000_000_000_000_000n;
@@ -235,6 +236,7 @@ export interface EventPurityStackConfig {
     readonly account: Address;
     readonly confirmed: ConfirmResult;
   }) => void | Promise<void>;
+  readonly onBlockObserved?: (blockNumber: bigint) => void;
 }
 
 export class EventPurityStack {
@@ -351,6 +353,23 @@ export class EventPurityStack {
     return this.bootstrapStatus;
   }
 
+  public async refreshFeedFreshness(blockNumber: bigint): Promise<void> {
+    if (blockNumber === 0n || !this.pricesBootstrapped) {
+      return;
+    }
+    const chainFeeds = this.config.feedRegistry[this.config.chain] ?? {};
+    const assets = Object.keys(chainFeeds).map((asset) => asset as Address);
+    const changes = await pollLocalFeedFreshness({
+      client: this.config.executionClient,
+      chain: this.config.chain,
+      model: this.model,
+      feedRegistry: this.config.feedRegistry,
+      assets,
+      logger: this.config.logger,
+    });
+    await this.handleTierChanges(changes, blockNumber);
+  }
+
   private publishBootstrapStatus(coverage: PartialBootstrapCoverage): void {
     setBootstrapRuntimeStatus({
       bootstrapSource: coverage.discoverySource,
@@ -375,6 +394,9 @@ export class EventPurityStack {
   }
 
   private async handleEvent(event: ParsedIngestionEvent): Promise<void> {
+    if (event.meta.blockNumber > 0n) {
+      this.config.onBlockObserved?.(event.meta.blockNumber);
+    }
     if (event.kind === "chainlink_price") {
       const changes = this.model.applyPriceEvent(event);
       await this.handleTierChanges(changes, event.meta.blockNumber);
@@ -474,6 +496,7 @@ export class EventPurityStack {
   }
 
   private async handleFlashblockTick(blockNumber: bigint): Promise<void> {
+    this.config.onBlockObserved?.(blockNumber);
     this.flashblockTickCount += 1n;
     if (this.flashblockTickCount % 1_800n === 0n) {
       this.shadow.logMetricsSnapshot("flashblock_interval");

@@ -252,16 +252,42 @@ export class LocalPositionModel {
     return hfResult;
   }
 
-  public applyPriceEvent(event: ParsedChainlinkPriceEvent): readonly TierChange[] {
-    const answer = event.price;
-    const assetKey = event.asset.toLowerCase();
-
+  public applyFeedPriceUpdate(
+    asset: Address,
+    feed: Address,
+    answer: bigint,
+    decimals: number,
+    updatedAtSec: number,
+  ): readonly TierChange[] {
     if (answer <= 0n) {
-      this.config.logger?.error("FEED_INVALID_PRICE", { asset: event.asset, feed: event.feed, answer: answer.toString() });
+      this.config.logger?.error("FEED_INVALID_PRICE", {
+        asset,
+        feed,
+        answer: answer.toString(),
+      });
+      return [];
+    }
+    if (decimals > 18) {
+      this.config.logger?.error("FEED_DECIMAL_OVERFLOW", { asset, feed, decimals });
       return [];
     }
 
-    const existingFeedState = this.feedStates.get(assetKey);
+    const assetKey = asset.toLowerCase();
+    const normalizedPrice = answer * 10n ** BigInt(18 - decimals);
+    this.prices.set(assetKey, normalizedPrice);
+    this.feedStates.set(assetKey, {
+      answer,
+      decimals,
+      updatedAt: updatedAtSec,
+      feedAddress: feed,
+      asset,
+    });
+
+    return this.recomputeTierChangesForAsset(asset, updatedAtSec);
+  }
+
+  public applyPriceEvent(event: ParsedChainlinkPriceEvent): readonly TierChange[] {
+    const existingFeedState = this.feedStates.get(event.asset.toLowerCase());
     const decimals = existingFeedState?.decimals ?? DEFAULT_FEED_DECIMALS;
     if (existingFeedState === undefined) {
       this.config.logger?.warn("feed_state_missing_for_price_event", {
@@ -271,46 +297,14 @@ export class LocalPositionModel {
       });
     }
 
-    const normalizedPrice = answer * 10n ** BigInt(18 - decimals);
-    this.prices.set(assetKey, normalizedPrice);
-
-    const nowSec = Math.floor(Date.now() / 1000);
-    if (existingFeedState !== undefined) {
-      this.feedStates.set(assetKey, {
-        ...existingFeedState,
-        answer,
-        updatedAt: nowSec,
-      });
-    }
-
-    const changes: TierChange[] = [];
-    for (const position of this.positions.values()) {
-      if (!position.isFullySeeded || !positionTouchesAsset(position, event.asset)) {
-        continue;
-      }
-      const hfResult = this.recomputeHf(position, nowSec);
-      switch (hfResult.status) {
-        case "ok":
-        case "no_debt":
-          position.cachedHfWad = hfResult.hf;
-          changes.push(this.toTierChange(position, false));
-          break;
-        case "price_incomplete":
-          this.config.logger?.info("hf_skip_price_incomplete", { missingAssets: hfResult.missingAssets });
-          break;
-        case "price_stale":
-          this.config.logger?.warn("hf_skip_price_stale", { staleAssets: hfResult.staleAssets });
-          break;
-        case "error":
-          this.config.logger?.error("hf_error", { reason: hfResult.reason });
-          break;
-        default: {
-          const _exhaustive: never = hfResult;
-          return _exhaustive;
-        }
-      }
-    }
-    return changes;
+    const updatedAtSec = event.oracleUpdatedAtSec ?? Math.floor(Date.now() / 1000);
+    return this.applyFeedPriceUpdate(
+      event.asset,
+      event.feed,
+      event.price,
+      decimals,
+      updatedAtSec,
+    );
   }
 
   public confirmOnChain(
@@ -503,6 +497,40 @@ export class LocalPositionModel {
     }
   }
 
+  private recomputeTierChangesForAsset(asset: Address, nowSec: number): TierChange[] {
+    const changes: TierChange[] = [];
+    for (const position of this.positions.values()) {
+      if (!position.isFullySeeded || !positionTouchesAsset(position, asset)) {
+        continue;
+      }
+      const hfResult = this.recomputeHf(position, nowSec);
+      switch (hfResult.status) {
+        case "ok":
+        case "no_debt":
+          position.cachedHfWad = hfResult.hf;
+          changes.push(this.toTierChange(position, false));
+          break;
+        case "price_incomplete":
+          this.config.logger?.info("hf_skip_price_incomplete", {
+            missingAssets: hfResult.missingAssets,
+            missingCount: hfResult.missingAssets.length,
+          });
+          break;
+        case "price_stale":
+          this.config.logger?.warn("hf_skip_price_stale", { staleAssets: hfResult.staleAssets });
+          break;
+        case "error":
+          this.config.logger?.error("hf_error", { reason: hfResult.reason });
+          break;
+        default: {
+          const _exhaustive: never = hfResult;
+          return _exhaustive;
+        }
+      }
+    }
+    return changes;
+  }
+
   private applyHfResult(position: UserPosition, isNew: boolean): AaveEventApplyResult {
     const nowSec = Math.floor(Date.now() / 1000);
     const result = this.recomputeHf(position, nowSec);
@@ -512,7 +540,10 @@ export class LocalPositionModel {
         position.cachedHfWad = result.hf;
         return { changes: [this.toTierChange(position, isNew)] };
       case "price_incomplete":
-        this.config.logger?.info("hf_skip_price_incomplete", { missingAssets: result.missingAssets });
+        this.config.logger?.info("hf_skip_price_incomplete", {
+          missingAssets: result.missingAssets,
+          missingCount: result.missingAssets.length,
+        });
         return { changes: [] };
       case "price_stale":
         this.config.logger?.warn("hf_skip_price_stale", { staleAssets: result.staleAssets });

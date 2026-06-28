@@ -46,6 +46,7 @@ export interface ParsedChainlinkPriceEvent {
   readonly feed: Address;
   readonly asset: Address;
   readonly price: bigint;
+  readonly oracleUpdatedAtSec: number;
 }
 
 export type ParsedIngestionEvent = ParsedAavePoolEvent | ParsedChainlinkPriceEvent;
@@ -167,6 +168,13 @@ export function parseChainlinkAnswerUpdatedLog(
     if (price <= 0n) {
       return undefined;
     }
+    const updatedAtRaw = decoded.args.updatedAt;
+    const oracleUpdatedAtSec = typeof updatedAtRaw === "bigint"
+      ? Number(updatedAtRaw)
+      : Number(updatedAtRaw);
+    if (!Number.isFinite(oracleUpdatedAtSec) || oracleUpdatedAtSec <= 0) {
+      return undefined;
+    }
     const blockNumber = meta.blockNumber ?? log.blockNumber ?? 0n;
     return {
       kind: "chainlink_price",
@@ -180,6 +188,7 @@ export function parseChainlinkAnswerUpdatedLog(
       feed: log.address as Address,
       asset,
       price,
+      oracleUpdatedAtSec,
     };
   } catch {
     return undefined;

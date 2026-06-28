@@ -137,6 +137,24 @@ describe("localPositionModel HfResult", () => {
     }
   });
 
+  it("applyFeedPriceUpdate uses chainlink updatedAt for staleness checks", () => {
+    registerWarmPrices();
+    const position = seedTwoAssetPosition();
+
+    const freshUpdatedAt = NOW_SEC - 100;
+    model.applyFeedPriceUpdate(
+      weth,
+      wethFeed,
+      300_000_000_000n,
+      8,
+      freshUpdatedAt,
+    );
+
+    const result = model.recomputeHf(position, NOW_SEC);
+    expect(result.status).toBe("ok");
+    expect(model.feedStates.get(weth.toLowerCase())?.updatedAt).toBe(freshUpdatedAt);
+  });
+
   it("returns price_stale when feed updatedAt exceeds heartbeat threshold", () => {
     registerWarmPrices();
     const position = seedTwoAssetPosition();

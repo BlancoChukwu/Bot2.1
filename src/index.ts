@@ -523,7 +523,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       chain: config.chain,
       feedRegistry: config.priceFeedRegistry,
       maxStaleMs: config.oracleMaxStaleMs,
-      heartbeatWarnMs: config.oracleMaxStaleMs,
+      heartbeatWarnMs: parseMinNumber(process.env.ORACLE_HEARTBEAT_WARN_MS, 3_600_000, 1_000, "ORACLE_HEARTBEAT_WARN_MS"),
       ...(config.chain === "base" ? { aaveOracleAddress: baseAaveOracleAddress } : {}),
       logger,
       onFreshnessObserved: (observation) => {
@@ -535,11 +535,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         );
       },
     });
-  if (
-    priceOracleCache !== undefined
-    && config.chain === "base"
-    && !(parseBoolean(process.env.USE_EVENT_WATCHLIST, false) && config.flashblocksEnabled)
-  ) {
+  if (priceOracleCache !== undefined && config.chain === "base") {
     priceOracleCache.startBackgroundPoll(
       [canonicalBaseWeth, canonicalBaseUsdc, canonicalBaseCbBtc],
       config.oraclePollIntervalMs,
@@ -741,6 +737,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   const arbQueue = new ArbitrageOpportunityQueue();
   let watchlistCoordinatorRef: WatchlistCoordinator | undefined;
   let hybridDetectionRef: HybridDetectionPipeline | undefined;
+  let latestKnownBlock: bigint = 0n;
   const memoryLimits = memoryLimitsFromNodeHeap();
   const memoryMonitor = startMemoryMonitor({
     logger,
@@ -823,6 +820,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     }, blockRescanDebounceMs);
   const onBlockWatchlistSweep = useEventWatchlist
     ? (blockNumber: bigint) => {
+      latestKnownBlock = blockNumber;
       logger.info("watchlist_block_activity", {
         chain: config.chain,
         blockNumber: blockNumber.toString(),
@@ -1042,8 +1040,16 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         : { redisUrl: optionalEnv(process.env, "REDIS_URL")! }),
       logger,
       metrics,
-      onLiquidatableCandidate: async () => {
+      onBlockObserved: (blockNumber) => {
+        latestKnownBlock = blockNumber;
+      },
+      onLiquidatableCandidate: async (candidate) => {
         if (!config.eventPurity.enableLiveTx) {
+          logger.info("liquidatable_candidate_detected_gate_closed", {
+            chain: config.chain,
+            account: candidate.account,
+            reason: "enable_live_tx_false",
+          });
           return;
         }
         await orchestrator.runOnce();
@@ -1170,6 +1176,16 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     }
     if (eventPurityStack !== undefined) {
       await eventPurityStack.start();
+      if (config.chain === "base") {
+        const feedFreshnessPollTimer = setInterval(() => {
+          void eventPurityStack.refreshFeedFreshness(latestKnownBlock).catch((error) => {
+            logger.warn("feed_freshness_poll_failed", { error: String(error) });
+          });
+        }, config.oraclePollIntervalMs);
+        shutdown.addHook("event_purity_feed_freshness_poll_stop", async () => {
+          clearInterval(feedFreshnessPollTimer);
+        });
+      }
     }
     if (!config.eventPurity.enableArbitrage && config.flashblocksPrimaryLoop) {
       logger.info("flashblocks_primary_loop_skipped", {
