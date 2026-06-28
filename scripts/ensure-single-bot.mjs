@@ -4,7 +4,7 @@
  * Usage: node scripts/ensure-single-bot.mjs [--status|--stop]
  */
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, readlinkSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,8 +14,30 @@ const mode = process.argv.includes("--status") ? "status" : "stop";
 
 function isBotCommandLine(cmd) {
   if (!cmd) return false;
-  if (/dist[\\/]src[\\/]index\.js/i.test(cmd)) return true;
-  return /ts-node/i.test(cmd) && /index\.ts/i.test(cmd);
+  const normalized = cmd.trim();
+  // pgrep -af matches any cmdline containing the pattern — exclude shells/tools.
+  if (/^(sh|bash|dash|zsh)\s+-c/i.test(normalized)) return false;
+  if (/pgrep|grep|ensure-single-bot|watch-bot/i.test(normalized)) return false;
+  if (/\bnode\s+\S*dist[\\/]src[\\/]index\.js(?:\s|$|>>)/i.test(normalized)) {
+    return true;
+  }
+  return /\bts-node\b/i.test(normalized) && /\bindex\.ts\b/i.test(normalized);
+}
+
+function processWorkingDirectory(pid) {
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    return undefined;
+  }
+}
+
+function isRepoBotProcess(pid, cmd) {
+  if (!isBotCommandLine(cmd)) {
+    return false;
+  }
+  const cwd = processWorkingDirectory(pid);
+  return cwd === undefined || cwd === repoRoot;
 }
 
 function parseLockPid() {
@@ -61,7 +83,7 @@ function listBotProcesses() {
             cmd: line.slice(sep + 1),
           };
         })
-        .filter((row) => Number.isInteger(row.pid) && row.pid > 0);
+        .filter((row) => Number.isInteger(row.pid) && row.pid > 0 && isRepoBotProcess(row.pid, row.cmd));
     } catch {
       return [];
     }
@@ -82,7 +104,7 @@ function listBotProcesses() {
         if (!match) return null;
         const pid = Number(match[1]);
         const cmd = match[2];
-        if (!isBotCommandLine(cmd)) return null;
+        if (!isRepoBotProcess(pid, cmd)) return null;
         return { pid, cmd };
       })
       .filter(Boolean);
