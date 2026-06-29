@@ -2,6 +2,7 @@ import type { Address, PublicClient } from "viem";
 import type { EventPurityConfig } from "../config/eventPurityConfig";
 import type { LoggerLike } from "../bot";
 import { MAX_HF_WAD, type LocalPositionModel } from "./localPositionModel";
+import { computeShadowDriftBps } from "./localPositionHfPolicy";
 import { poolEmodeAbi } from "./aaveEmode";
 import { aavePoolAbi } from "../protocols/aaveV3";
 
@@ -68,7 +69,42 @@ export class ShadowValidator {
 
   public constructor(private readonly config: ShadowValidatorConfig) {}
 
-  public maybeSample(account: Address, localHfWad: bigint, blockNumber: bigint): Promise<ShadowSample | undefined> {
+  public maybeSample(account: Address, blockNumber: bigint, nowSec?: number): Promise<ShadowSample | undefined> {
+    const position = this.config.model.positions.get(account.toLowerCase());
+    if (position === undefined) {
+      return Promise.resolve(undefined);
+    }
+
+    const sampledAtSec = nowSec ?? Math.floor(Date.now() / 1000);
+    const hfResult = this.config.model.recomputeHf(position, sampledAtSec);
+    if (hfResult.status === "price_incomplete") {
+      this.config.logger.info("shadow_sample_skipped", {
+        account,
+        reason: "price_incomplete",
+        missingCount: hfResult.missingAssets.length,
+        blockNumber: Number(blockNumber),
+      });
+      return Promise.resolve(undefined);
+    }
+    if (hfResult.status === "price_stale") {
+      this.config.logger.info("shadow_sample_skipped", {
+        account,
+        reason: "price_stale",
+        blockNumber: Number(blockNumber),
+      });
+      return Promise.resolve(undefined);
+    }
+
+    const localHfWad = this.config.model.resolveEffectiveHfForTier(position, hfResult);
+    if (localHfWad === undefined) {
+      this.config.logger.info("shadow_sample_skipped", {
+        account,
+        reason: hfResult.status,
+        blockNumber: Number(blockNumber),
+      });
+      return Promise.resolve(undefined);
+    }
+
     const skipReason = this.skipReason(account, localHfWad);
     if (skipReason !== undefined) {
       this.config.logger.info("shadow_sample_skipped", {
@@ -126,7 +162,7 @@ export class ShadowValidator {
     const eModeCategoryId = Number(eModeRaw);
     const isEMode = eModeCategoryId > 0;
     const onChainHfWad = accountData[5];
-    const driftBps = computeDriftBps(localHfWad, onChainHfWad);
+    const driftBps = computeShadowDriftBps(localHfWad, onChainHfWad);
     const localTier = this.config.model.classifyTier(localHfWad);
     const onChainLiquidatable = onChainHfWad < WAD;
     const isFalseNegative = onChainLiquidatable && (localTier === "healthy" || localTier === "watch");
@@ -259,10 +295,4 @@ function finalizeBucket(
   };
 }
 
-function computeDriftBps(localHfWad: bigint, onChainHfWad: bigint): number {
-  if (onChainHfWad === 0n) {
-    return 10_000;
-  }
-  const diff = localHfWad > onChainHfWad ? localHfWad - onChainHfWad : onChainHfWad - localHfWad;
-  return Number((diff * 10_000n) / onChainHfWad);
-}
+export { computeShadowDriftBps } from "./localPositionHfPolicy";

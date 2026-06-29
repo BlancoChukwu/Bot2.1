@@ -315,6 +315,9 @@ export class EventPurityStack {
       this.bootstrapCoveragePct = coverage.estimatedDebtorCoveragePct;
       this.bootstrapStatus = coverage;
       this.publishBootstrapStatus(coverage);
+      if (coverage.cacheHit) {
+        await this.refreshReserveIndices();
+      }
     } else {
       this.config.logger.info("partial_bootstrap_skipped", {
         reason: "BOOTSTRAP_ENABLED=false",
@@ -470,7 +473,7 @@ export class EventPurityStack {
       } else if (change.tier === "watch") {
         this.confirmQueue.enqueueWatch(change.account);
       }
-      void this.shadow.maybeSample(change.account, change.localHfWad, blockNumber);
+      void this.shadow.maybeSample(change.account, blockNumber);
     }
     const confirmed = await this.confirmQueue.flushUrgent();
     for (const row of confirmed) {

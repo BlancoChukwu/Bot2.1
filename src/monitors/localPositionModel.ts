@@ -5,6 +5,7 @@ import { FEED_HEARTBEATS, MAX_UINT256 } from "../config/oracleBootstrap";
 import type { LoggerLike } from "../bot";
 import { calculateHealthFactor } from "../protocols/aaveV3";
 import type { ParsedAavePoolEvent, ParsedChainlinkPriceEvent } from "./aaveEventParser";
+import { resolveHfFromResult } from "./localPositionHfPolicy";
 
 export type PositionConfidence = "high" | "low";
 export type PositionTier = "healthy" | "watch" | "urgent" | "liquidatable";
@@ -446,6 +447,10 @@ export class LocalPositionModel {
    * Recomputes local HF from cached prices and reserve config.
    * @param nowSec Real Unix timestamp in seconds — never a block number.
    */
+  public resolveEffectiveHfForTier(position: UserPosition, hfResult: HfResult): bigint | undefined {
+    return resolveHfFromResult(position, hfResult);
+  }
+
   public recomputeHf(position: UserPosition, nowSec: number): HfResult {
     try {
       if (!this._pricesBootstrapped) {
@@ -504,11 +509,13 @@ export class LocalPositionModel {
         continue;
       }
       const hfResult = this.recomputeHf(position, nowSec);
+      const committed = this.commitHfFromRecompute(position, hfResult);
+      if (committed !== undefined) {
+        changes.push(this.toTierChange(position, false));
+      }
       switch (hfResult.status) {
         case "ok":
         case "no_debt":
-          position.cachedHfWad = hfResult.hf;
-          changes.push(this.toTierChange(position, false));
           break;
         case "price_incomplete":
           this.config.logger?.info("hf_skip_price_incomplete", {
@@ -531,14 +538,26 @@ export class LocalPositionModel {
     return changes;
   }
 
+  private commitHfFromRecompute(position: UserPosition, hfResult: HfResult): bigint | undefined {
+    const effective = resolveHfFromResult(position, hfResult);
+    if (effective === undefined) {
+      return undefined;
+    }
+    position.cachedHfWad = effective;
+    return effective;
+  }
+
   private applyHfResult(position: UserPosition, isNew: boolean): AaveEventApplyResult {
     const nowSec = Math.floor(Date.now() / 1000);
     const result = this.recomputeHf(position, nowSec);
+    const committed = this.commitHfFromRecompute(position, result);
+    if (committed !== undefined) {
+      return { changes: [this.toTierChange(position, isNew)] };
+    }
     switch (result.status) {
       case "ok":
       case "no_debt":
-        position.cachedHfWad = result.hf;
-        return { changes: [this.toTierChange(position, isNew)] };
+        return { changes: [] };
       case "price_incomplete":
         this.config.logger?.info("hf_skip_price_incomplete", {
           missingAssets: result.missingAssets,

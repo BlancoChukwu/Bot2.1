@@ -201,6 +201,30 @@ describe("localPositionModel HfResult", () => {
     expect(model.classifyTier(990_000_000_000_000_000n)).toBe("liquidatable");
   });
 
+  it("keeps snapshot HF when feed recompute diverges in danger zone", () => {
+    const snapshotHf = 985_667_837_263_193_100n;
+    registerWarmPrices();
+    model.seedFromOnChainSnapshot({
+      account: user,
+      blockNumber: 10n,
+      eModeCategoryId: 0,
+      healthFactorWad: snapshotHf,
+      totalCollateralBase: 51_444n,
+      totalDebtBase: 41_859n,
+      liquidationThreshold: 8_500n,
+      reserves: [
+        { asset: weth, scaledCollateral: 1_000_000_000_000n, scaledDebt: 0n },
+        { asset: usdc, scaledCollateral: 0n, scaledDebt: 500_000_000_000n },
+      ],
+    });
+
+    model.applyFeedPriceUpdate(weth, wethFeed, 300_000_000_000n, 8, NOW_SEC);
+    const position = model.positions.get(user.toLowerCase())!;
+    expect(position.cachedHfWad).toBeLessThan(1_100_000_000_000_000_000n);
+    expect(position.cachedHfWad).toBeGreaterThan(900_000_000_000_000_000n);
+    expect(model.classifyTier(position.cachedHfWad)).not.toBe("healthy");
+  });
+
   it("evicts at hard cap for fully seeded positions", () => {
     model.markPricesBootstrapped();
     for (let i = 0; i < 10; i += 1) {

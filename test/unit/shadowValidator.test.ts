@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parseEventPurityConfig, hfThresholdToWad } from "../../src/config/eventPurityConfig";
-import { ShadowValidator } from "../../src/monitors/shadowValidator";
+import { ShadowValidator, computeShadowDriftBps } from "../../src/monitors/shadowValidator";
 import { LocalPositionModel } from "../../src/monitors/localPositionModel";
 import type { LoggerLike } from "../../src/bot";
 import type { Address, PublicClient } from "viem";
@@ -84,5 +84,41 @@ describe("shadowValidator segmented metrics", () => {
       shadow_fn_rate_eMode_pct: expect.any(Number),
       tuningBucket: "non_eMode",
     });
+  });
+
+  it("skips shadow sample when recompute hits price_incomplete", async () => {
+    model.markPricesBootstrapped();
+    const shadow = new ShadowValidator({
+      client: makeClient(),
+      poolAddress: pool,
+      model,
+      purity,
+      logger,
+    });
+    model.seedFromOnChainSnapshot({
+      account: userNonEmode,
+      blockNumber: 10n,
+      eModeCategoryId: 0,
+      healthFactorWad: 985_667_837_263_193_100n,
+      totalCollateralBase: 51_444n,
+      totalDebtBase: 41_859n,
+      liquidationThreshold: 8_500n,
+      reserves: [{
+        asset: "0x4200000000000000000000000000000000000006",
+        scaledCollateral: 1_000n,
+        scaledDebt: 0n,
+      }],
+    });
+
+    await shadow.maybeSample(userNonEmode, 100n);
+    const skipCall = (logger.info as ReturnType<typeof vi.fn>).mock.calls.find(
+      (call) => call[0] === "shadow_sample_skipped" && call[1]?.reason === "price_incomplete",
+    );
+    expect(skipCall).toBeDefined();
+  });
+
+  it("caps drift bps for billion-HF local vs near-liquidatable on-chain", () => {
+    const drift = computeShadowDriftBps(9_800_000_000n * 1_000_000_000_000_000_000n, 990_000_000_000_000_000n);
+    expect(drift).toBe(10_000);
   });
 });
