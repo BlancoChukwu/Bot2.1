@@ -145,14 +145,14 @@ describe("parseRuntimeConfig", () => {
     })).rejects.toThrow(/startup rejected/i);
   });
 
-  it("defaults to the non-negotiable 0.5 percent minimum net profit margin", () => {
+  it("defaults to the non-negotiable 0.75 percent minimum net profit margin", () => {
     const config = parseRuntimeConfig({
       RPC_URL: "https://optimism.example",
       AAVE_SUBGRAPH_URL: "https://subgraph.example",
       PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
     });
 
-    expect(config.minProfitMarginBps).toBe(50);
+    expect(config.minProfitMarginBps).toBe(75);
   });
 
   it("rejects startup without a private key", () => {
@@ -304,14 +304,14 @@ describe("parseRuntimeConfig", () => {
     ).toThrow(/LIQUIDATION_RECEIVER_ADDRESS/);
   });
 
-  it("rejects profit margin below live floor (50 bps)", () => {
+  it("rejects profit margin below live floor (75 bps)", () => {
     expect(() =>
       parseRuntimeConfig({
         RPC_URL: "https://optimism.example",
         AAVE_SUBGRAPH_URL: "https://subgraph.example",
         PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
         SIMULATION_MODE: "false",
-        MIN_PROFIT_MARGIN_BPS: "49",
+        MIN_PROFIT_MARGIN_BPS: "74",
       }),
     ).toThrow(/MIN_PROFIT_MARGIN_BPS/);
   });

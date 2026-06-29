@@ -16,7 +16,7 @@ describe("DeploymentSafetyGate", () => {
       simulationMode: false,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
-      minProfitMarginBps: 50,
+      minProfitMarginBps: 75,
     });
 
     expect(result).toEqual({
@@ -32,7 +32,7 @@ describe("DeploymentSafetyGate", () => {
       simulationMode: false,
       hasMetricsEndpoint: true,
       registeredChains: ["optimism"],
-      minProfitMarginBps: 50,
+      minProfitMarginBps: 75,
       dryRunValidation: {
         success: true,
         validatedAtMs: Date.now(),
@@ -79,7 +79,7 @@ describe("DeploymentSafetyGate", () => {
     }
   });
 
-  it("blocks live mode when margin is below 50 bps", () => {
+  it("blocks live mode when margin is below 75 bps", () => {
     const gate = new DeploymentSafetyGate();
     const result = gate.evaluate({
       simulationMode: false,
@@ -97,7 +97,7 @@ describe("DeploymentSafetyGate", () => {
     });
     expect(result.status).toBe("blocked");
     if (result.status === "blocked") {
-      expect(result.reasons).toContain("MIN_PROFIT_MARGIN_BPS must be at least 50 in live mode");
+      expect(result.reasons).toContain("MIN_PROFIT_MARGIN_BPS must be at least 75 in live mode");
     }
   });
 

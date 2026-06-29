@@ -73,6 +73,7 @@ const counts = {
   event_purity_liquidatable_candidate: 0,
   hybrid_detection_failure: 0,
   partial_bootstrap_getlogs_retry: 0,
+  hf_price_gap_summary: 0,
 };
 
 let firstTs;
@@ -143,6 +144,9 @@ for (const rawLine of readLogLines(logPath)) {
         nonEModeWithinDriftTolerance: row.non_eMode_within_drift_tolerance,
         nonEModeWithinFnTarget: row.non_eMode_within_fn_target,
       };
+      break;
+    case "hf_price_gap_summary":
+      counts.hf_price_gap_summary += 1;
       break;
     case "ws_event_layer_started":
       wsStarted = true;

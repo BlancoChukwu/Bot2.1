@@ -11,6 +11,7 @@ export interface MemoryMonitorConfig {
   readonly rssWarnBytes?: number;
   readonly intervalMs?: number;
   readonly onRssSample?: (rssBytes: number) => void;
+  readonly onHighRssWarning?: () => void;
   readonly onCeilingHit?: () => void;
   readonly exitProcess?: (code: number) => never;
   readonly componentCounters?: () => Record<string, number>;
@@ -80,6 +81,7 @@ function applyMemorySample(
       rssMb: sample.rssMb,
       rssWarnMb: Math.round(rssWarnBytes / 1e6),
     });
+    config.onHighRssWarning?.();
   }
   if (sample.action === "warn" || sample.action === "ceiling") {
     const level = sample.action === "ceiling" ? "error" : "warn";

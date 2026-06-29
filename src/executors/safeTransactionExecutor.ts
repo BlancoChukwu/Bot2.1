@@ -110,6 +110,7 @@ export interface SafeTransactionExecutorConfig {
   readonly privateFirstChains?: readonly SupportedChain[];
   readonly dryRunMode?: boolean;
   readonly rejectBeforePreview?: (request: SafeExecutionRequest) => Promise<string | undefined>;
+  readonly rejectBeforeBroadcast?: (request: SafeExecutionRequest) => Promise<string | undefined>;
   readonly quoteExecutionGasCap?: (input: { readonly expectedProfitUsd: number; readonly gasLimit: bigint }) => Promise<{
     readonly maxFeePerGas: bigint;
   }>;
@@ -245,6 +246,17 @@ export class SafeTransactionExecutor {
         transaction.provider,
         Date.now() - startedAt,
       );
+      const broadcastRejectReason = await this.config.rejectBeforeBroadcast?.(request);
+      if (broadcastRejectReason !== undefined) {
+        this.releaseNonce(request, preflight.nonce);
+        this.config.logger.warn("execution_rejected_hf_not_liquidatable", {
+          chain: request.chain,
+          opportunityId: request.opportunityId,
+          account: request.account,
+          reason: broadcastRejectReason,
+        });
+        return { status: "rejected", reason: "final_simulation_failed" };
+      }
       return await this.submitWithReplacement(request, transaction, overrides);
     } catch (error) {
       this.config.metrics.recordError();

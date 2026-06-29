@@ -6,6 +6,7 @@ import type { LoggerLike } from "../bot";
 import { calculateHealthFactor } from "../protocols/aaveV3";
 import type { ParsedAavePoolEvent, ParsedChainlinkPriceEvent } from "./aaveEventParser";
 import { resolveHfFromResult } from "./localPositionHfPolicy";
+import { HfPriceGapAggregator } from "../utils/logRateLimiter";
 
 export type PositionConfidence = "high" | "low";
 export type PositionTier = "healthy" | "watch" | "urgent" | "liquidatable";
@@ -18,12 +19,15 @@ const DEFAULT_FEED_DECIMALS = 8;
 
 export { MAX_HF_WAD } from "../config/oracleBootstrap";
 
+export type PriceSource = "chainlink" | "aave" | "peg";
+
 export interface FeedState {
   answer: bigint;
   decimals: number;
   updatedAt: number;
   feedAddress: Address;
   asset: Address;
+  source?: PriceSource;
 }
 
 export type HfResult =
@@ -103,6 +107,7 @@ export class LocalPositionModel {
   private flashblockTickCount = 0n;
   private evictionTotal = 0;
   private _pricesBootstrapped = false;
+  private readonly priceGapAggregator = new HfPriceGapAggregator({ windowSec: 60 });
 
   public constructor(private readonly config: LocalPositionModelConfig) {
     if (config.reserveAllowlist !== undefined && config.reserveAllowlist.length > 0) {
@@ -406,6 +411,30 @@ export class LocalPositionModel {
     return this.evictionTotal;
   }
 
+  public evictUnderMemoryPressure(blockNumber: bigint): number {
+    const startSize = this.positions.size;
+    const pressureCap = Math.floor(this.config.purity.positionCacheHardCap * 0.75);
+    const sorted = [...this.positions.values()].sort(
+      (a, b) => Number(a.lastActivityBlock - b.lastActivityBlock),
+    );
+    for (const position of sorted) {
+      if (this.positions.size <= pressureCap) {
+        break;
+      }
+      const tier = this.classifyTier(position.cachedHfWad);
+      if (tier === "urgent" || tier === "watch" || tier === "liquidatable") {
+        continue;
+      }
+      if (position.cachedHfWad < (3n * WAD) / 2n) {
+        continue;
+      }
+      this.positions.delete(position.account.toLowerCase());
+      this.evictionTotal += 1;
+    }
+    this.evictInactiveHealthy(blockNumber);
+    return startSize - this.positions.size;
+  }
+
   public size(): number {
     return this.positions.size;
   }
@@ -518,10 +547,7 @@ export class LocalPositionModel {
         case "no_debt":
           break;
         case "price_incomplete":
-          this.config.logger?.info("hf_skip_price_incomplete", {
-            missingAssets: hfResult.missingAssets,
-            missingCount: hfResult.missingAssets.length,
-          });
+          this.recordPriceGap(position.account, hfResult.missingAssets);
           break;
         case "price_stale":
           this.config.logger?.warn("hf_skip_price_stale", { staleAssets: hfResult.staleAssets });
@@ -559,10 +585,7 @@ export class LocalPositionModel {
       case "no_debt":
         return { changes: [] };
       case "price_incomplete":
-        this.config.logger?.info("hf_skip_price_incomplete", {
-          missingAssets: result.missingAssets,
-          missingCount: result.missingAssets.length,
-        });
+        this.recordPriceGap(position.account, result.missingAssets);
         return { changes: [] };
       case "price_stale":
         this.config.logger?.warn("hf_skip_price_stale", { staleAssets: result.staleAssets });
@@ -729,6 +752,14 @@ export class LocalPositionModel {
     }
   }
 
+  private recordPriceGap(account: Address, missingAssets: readonly Address[]): void {
+    const summary = this.priceGapAggregator.record(account, missingAssets);
+    if (summary === undefined) {
+      return;
+    }
+    this.config.logger?.info("hf_price_gap_summary", summary);
+  }
+
   private toTierChange(position: UserPosition, isNew: boolean): TierChange {
     return {
       account: position.account,
@@ -790,6 +821,9 @@ function collectStalePriceAssets(
     }
     const feedState = feedStates.get(assetKey);
     if (feedState === undefined) {
+      continue;
+    }
+    if (feedState.source === "aave" || feedState.source === "peg") {
       continue;
     }
     const heartbeat = FEED_HEARTBEATS[feedState.feedAddress.toLowerCase()] ?? 3600;

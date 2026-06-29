@@ -36,6 +36,8 @@ import { buildLiquidationExecutionRequest } from "./executors/liquidationExecuti
 import { LocalNonceManager } from "./executors/nonceManager";
 import { PrivateSubmissionClient, type PrivateTxMode } from "./executors/PrivateSubmissionClient";
 import { SafeTransactionExecutor } from "./executors/safeTransactionExecutor";
+import { validateLiquidatableHealthFactor } from "./executors/liquidationHfPreflight";
+import { WebhookAlerter } from "./alerts/webhookAlerter";
 import { ViemExecutionClient } from "./executors/viemExecutionClient";
 import { ParallelBroadcastClient } from "./executors/parallelBroadcastClient";
 import { quoteBaseExecutionGas } from "./executors/baseGasModel";
@@ -195,10 +197,10 @@ type Env = Record<string, string | undefined>;
 
 const runtimeEnvSchema = z.record(z.string(), z.string().optional());
 /** Live mode: Aave-style risk floor (0.5%). */
-const minimumProfitMarginBpsLive = 50;
+const minimumProfitMarginBpsLive = 75;
 /** Simulation: lower floor so quotes / approvals are easier to observe (raise before live). */
 const minimumProfitMarginBpsSimulation = 40;
-const defaultProfitMarginBps = 50;
+const defaultProfitMarginBps = 75;
 const defaultFlashLoanFeeBps = 5;
 const defaultFlashLoanSlippageFloorBps = 500;
 const placeholderPrivateKey = "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -463,6 +465,12 @@ function buildExecutionPreflightClient(input: {
 
 function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner {
   const logger = createLogger(config.logLevel);
+  const webhookAlerter = new WebhookAlerter({
+    logger,
+    ...(optionalEnv(process.env, "ALERT_WEBHOOK_URL") === undefined
+      ? {}
+      : { webhookUrl: optionalEnv(process.env, "ALERT_WEBHOOK_URL")! }),
+  });
   const account = privateKeyToAccount(config.privateKey);
   const resolvedAaveCache = loadResolvedAaveAddressCache();
   const registry = createChainRegistry({
@@ -493,6 +501,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   const cachedResolvedForActive = resolvedAaveCache[config.chain];
   let activeChainConfig = withResolvedAave(getChainConfig(config.chain), cachedResolvedForActive);
   let activePoolAddress = activeChainConfig.aave.pool;
+  let latestKnownBlock: bigint = 0n;
   const publicClient = createFailoverPublicClient({
     chain: config.chain,
     rpcUrl: config.executionRpcUrlPrimary,
@@ -733,11 +742,30 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       }
       return undefined;
     },
+    rejectBeforeBroadcast: async (request) => {
+      const hfCheck = await validateLiquidatableHealthFactor({
+        client: publicClient as unknown as PublicClient,
+        poolAddress: activePoolAddress,
+        account: request.account,
+        ...(latestKnownBlock > 0n ? { detectionBlock: latestKnownBlock } : {}),
+      });
+      if (!hfCheck.ok) {
+        logger.warn("execution_rejected_hf_not_liquidatable", {
+          chain: request.chain,
+          account: request.account,
+          reason: hfCheck.reason,
+          healthFactor: hfCheck.healthFactor?.toString(),
+          detectionBlock: latestKnownBlock.toString(),
+          head: hfCheck.head?.toString(),
+        });
+        return hfCheck.reason;
+      }
+      return undefined;
+    },
   });
   const arbQueue = new ArbitrageOpportunityQueue();
   let watchlistCoordinatorRef: WatchlistCoordinator | undefined;
   let hybridDetectionRef: HybridDetectionPipeline | undefined;
-  let latestKnownBlock: bigint = 0n;
   const memoryLimits = memoryLimitsFromNodeHeap();
   const memoryMonitor = startMemoryMonitor({
     logger,
@@ -745,6 +773,16 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     ceilBytes: memoryLimits.ceilBytes,
     rssWarnBytes: memoryLimits.rssWarnBytes,
     onRssSample: (rssBytes) => metrics.setProcessRssBytes(rssBytes),
+    onHighRssWarning: () => {
+      if (eventPurityStackRef === undefined || latestKnownBlock === 0n) {
+        return;
+      }
+      const evicted = eventPurityStackRef.model.evictUnderMemoryPressure(latestKnownBlock);
+      if (evicted > 0) {
+        logger.warn("memory_pressure_eviction", { evicted, blockNumber: latestKnownBlock.toString() });
+        void webhookAlerter.notify("memory_pressure_eviction", { evicted });
+      }
+    },
     componentCounters: () => ({
       watchlistSize: watchlistCoordinatorRef?.watchlist.size() ?? 0,
       cacheEntries: hybridDetectionRef?.cache.size(config.chain) ?? 0,
@@ -1004,6 +1042,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   watchlistCoordinatorRef = watchlistCoordinator;
   hybridDetectionRef = hybridDetection;
   let eventPurityStack: EventPurityStack | undefined;
+  let eventPurityStackRef: EventPurityStack | undefined;
   let flashblockPrimaryLoop: FlashblockPrimaryLoop | undefined;
   const rpcHealthMonitor = new RpcHealthMonitor(200, 30_000);
   let rpcHealthTimer: NodeJS.Timeout | undefined;
@@ -1044,6 +1083,18 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         latestKnownBlock = blockNumber;
       },
       onLiquidatableCandidate: async (candidate) => {
+        logger.info("liquidatable_candidate_preview", {
+          chain: config.chain,
+          account: candidate.account,
+          healthFactor: Number(candidate.confirmed.healthFactor) / 1e18,
+          simulationMode: config.simulationMode,
+          enableLiveTx: config.eventPurity.enableLiveTx,
+          blockNumber: latestKnownBlock.toString(),
+        });
+        void webhookAlerter.notify("liquidatable_candidate", {
+          account: candidate.account,
+          healthFactor: Number(candidate.confirmed.healthFactor) / 1e18,
+        });
         if (!config.eventPurity.enableLiveTx) {
           logger.info("liquidatable_candidate_detected_gate_closed", {
             chain: config.chain,
@@ -1052,9 +1103,18 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
           });
           return;
         }
+        if (config.simulationMode) {
+          logger.info("liquidation_dry_run_preview", {
+            chain: config.chain,
+            account: candidate.account,
+            healthFactor: Number(candidate.confirmed.healthFactor) / 1e18,
+          });
+          return;
+        }
         await orchestrator.runOnce();
       },
     });
+    eventPurityStackRef = eventPurityStack;
   }
   if (useEventWatchlist && config.flashblocksEnabled && config.flashblocksPrimaryLoop && eventPurityStack === undefined) {
     flashblockPrimaryLoop = new FlashblockPrimaryLoop({

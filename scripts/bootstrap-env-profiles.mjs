@@ -101,6 +101,8 @@ eventPuritySoak = upsert(eventPuritySoak, "RPC_BUDGET_MODE", "true");
 eventPuritySoak = upsert(eventPuritySoak, "ENABLE_LIVE_TX", "false");
 eventPuritySoak = upsert(eventPuritySoak, "SKIP_DEPLOYMENT_SAFETY_GATE", "true");
 eventPuritySoak = upsert(eventPuritySoak, "ENABLE_HEAP_SNAPSHOTS", "true");
+eventPuritySoak = upsert(eventPuritySoak, "SHADOW_MAX_SAMPLES_PER_DAY", "10000");
+eventPuritySoak = upsert(eventPuritySoak, "RSS_WARN_MB", "400");
 writeFileSync(resolve(root, ".env.event-purity-soak"), eventPuritySoak, "utf8");
 
 let eventPurityProduction = applyEventPurityStack(production);

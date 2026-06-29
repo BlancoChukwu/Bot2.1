@@ -1,6 +1,7 @@
 const defaultSafetyBuffer = 1.25;
 const defaultLiquidationGasUnits = 420_000;
 const defaultBonusBps = 500;
+const defaultGasBufferMultiplier = 1.5;
 const bpsScale = 10_000;
 
 export interface LiquidationProfitabilityInput {
@@ -27,11 +28,13 @@ export function estimateLiquidationGasCostUsd(
   gasPriceWei: bigint,
   nativePriceUsd8: bigint,
   gasUnits: number = defaultLiquidationGasUnits,
+  gasBufferMultiplier: number = defaultGasBufferMultiplier,
 ): number {
   if (nativePriceUsd8 <= 0n) {
     return 0;
   }
-  const gasCostWei = gasPriceWei * BigInt(gasUnits);
+  const bufferedGasUnits = BigInt(Math.ceil(gasUnits * gasBufferMultiplier));
+  const gasCostWei = gasPriceWei * bufferedGasUnits;
   return Number((gasCostWei * nativePriceUsd8) / 1_000_000_000_000_000_000n) / 1e8;
 }
 

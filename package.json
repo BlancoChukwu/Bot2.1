@@ -38,7 +38,14 @@
     "test:flashblocks": "node scripts/flashblocks-connection-test.mjs",
     "report:competitive-gap": "node scripts/competitive-gap-report.mjs --hours 48",
     "review:daily-pipeline": "node scripts/daily-pipeline-review.mjs",
-    "pairs:top-base": "node scripts/select-top-base-pairs.mjs"
+    "pairs:top-base": "node scripts/select-top-base-pairs.mjs",
+    "preflight:oracle-base": "node scripts/preflight-oracle-base.mjs",
+    "preflight:p0-gate": "node scripts/preflight-p0-gate.mjs",
+    "validate:candidates": "node scripts/validate-liquidatable-candidate.mjs",
+    "audit:position-completeness": "node scripts/audit-position-completeness.mjs",
+    "audit:unconfirmed-tier": "node scripts/audit-unconfirmed-tier-positions.mjs",
+    "test:mev-relay": "node scripts/test-mev-relay-latency.mjs",
+    "replay:base-liquidations": "node scripts/replay-base-liquidations.mjs"
   },
   "keywords": [],
   "author": "",

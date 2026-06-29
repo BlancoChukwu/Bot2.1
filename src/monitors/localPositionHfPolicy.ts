@@ -96,6 +96,14 @@ export function resolveEffectiveHfWad(position: UserPosition, perReserveHf: bigi
     return aggregate;
   }
 
+  if (
+    position.confidence === "high"
+    && aggregate !== undefined
+    && relativeDivergenceBps(aggregate, capped) > HF_DIVERGENCE_RATIO_BPS
+  ) {
+    return aggregate;
+  }
+
   if (shouldRejectPerReserveOverwrite(position, capped)) {
     return position.cachedHfWad;
   }

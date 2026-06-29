@@ -1,0 +1,21 @@
+[Unit]
+Description=Aave V3 Base liquidation watch-bot (event-purity stack)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=liquidator
+WorkingDirectory=/opt/optimism-aave-v3-liquidator-ts
+Environment=DOTENV_CONFIG_PATH=/opt/optimism-aave-v3-liquidator-ts/.env.event-purity-production
+Environment=NODE_OPTIONS=--max-old-space-size=650 --expose-gc
+ExecStart=/usr/bin/node dist/src/index.js
+Restart=always
+RestartSec=10
+MemoryMax=1100M
+LimitNOFILE=65535
+StandardOutput=append:/var/log/aave-liquidator/bot.log
+StandardError=append:/var/log/aave-liquidator/bot.err.log
+
+[Install]
+WantedBy=multi-user.target

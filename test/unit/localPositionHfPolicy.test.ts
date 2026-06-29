@@ -48,7 +48,19 @@ describe("localPositionHfPolicy", () => {
     expect(resolveEffectiveHfWad(position, perReserveWrong)).toBe(aggregate);
   });
 
-  it("rejects >50% overwrite for high-confidence snapshots outside danger zone", () => {
+  it("uses aggregate when high-confidence divergence exceeds threshold outside danger zone", () => {
+    const position = makePosition({
+      cachedHfWad: 2_000_000_000_000_000_000n,
+      lastTotalCollateralBase: 10_000n,
+      lastTotalDebtBase: 4_000n,
+      lastLiquidationThreshold: 8_500n,
+    });
+    const aggregate = aggregateHfWad(position)!;
+    const perReserveWrong = 4_000_000_000_000_000_000n;
+    expect(resolveEffectiveHfWad(position, perReserveWrong)).toBe(aggregate);
+  });
+
+  it("rejects >50% overwrite via shouldRejectPerReserveOverwrite", () => {
     const position = makePosition({
       cachedHfWad: 2_000_000_000_000_000_000n,
       lastTotalCollateralBase: 10_000n,
@@ -57,7 +69,6 @@ describe("localPositionHfPolicy", () => {
     });
     const proposed = 4_000_000_000_000_000_000n;
     expect(shouldRejectPerReserveOverwrite(position, proposed)).toBe(true);
-    expect(resolveEffectiveHfWad(position, proposed)).toBe(position.cachedHfWad);
   });
 
   it("caps runaway per-reserve HF for dust debt", () => {

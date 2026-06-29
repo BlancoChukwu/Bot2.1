@@ -28,8 +28,8 @@ export class DeploymentSafetyGate {
     if (!input.hasMetricsEndpoint) {
       reasons.push("Metrics endpoint is required");
     }
-    if (!input.simulationMode && input.minProfitMarginBps < 50) {
-      reasons.push("MIN_PROFIT_MARGIN_BPS must be at least 50 in live mode");
+    if (!input.simulationMode && input.minProfitMarginBps < 75) {
+      reasons.push("MIN_PROFIT_MARGIN_BPS must be at least 75 in live mode");
     }
     if (input.simulationMode && input.minProfitMarginBps < 40) {
       reasons.push("MIN_PROFIT_MARGIN_BPS must be at least 40 in simulation mode");

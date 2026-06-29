@@ -26,6 +26,9 @@ import { createBootstrapLogClients } from "./bootstrapRpcClients";
 import { setBootstrapRuntimeStatus } from "../runtime/bootstrapRuntimeStatus";
 import { pollLocalFeedFreshness } from "./localFeedFreshnessPoll";
 import { reconcileAndSeedPosition } from "./positionOnChainReconcile";
+import { bootstrapAaveOracleGapFill } from "../oracle/aaveOraclePrice";
+import { aavePoolAbi } from "../protocols/aaveV3";
+import { poolEmodeAbi } from "./aaveEmode";
 
 const WAD = 1_000_000_000_000_000_000n;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -246,6 +249,7 @@ export class EventPurityStack {
   readonly confirmQueue: TieredConfirmQueue;
   readonly shadow: ShadowValidator;
   private indexRefreshInFlight = false;
+  private aggregateRefreshInFlight = false;
   private flashblockTickCount = 0n;
   private bootstrapCoveragePct: number | undefined;
   private bootstrapStatus: PartialBootstrapCoverage | undefined;
@@ -325,6 +329,17 @@ export class EventPurityStack {
     }
 
     const bootstrapResult = await this.bootstrapOraclePrices();
+    const gapFill = await bootstrapAaveOracleGapFill({
+      client: this.config.executionClient,
+      model: this.model,
+      logger: this.config.logger,
+    });
+    if (gapFill.failed.length > 0) {
+      this.config.logger.warn("oracle_gap_fill_partial", {
+        warmed: gapFill.warmed,
+        failed: gapFill.failed,
+      });
+    }
     this.pricesBootstrapped = bootstrapResult.pricesBootstrapped;
 
     const head = await this.config.executionClient.getBlockNumber();
@@ -511,6 +526,9 @@ export class EventPurityStack {
         shadow_false_negative_total: this.shadow.getFalseNegativeTotal(),
         blockNumber: Number(blockNumber),
       });
+      void this.refreshUrgentWatchAggregates(blockNumber).catch((error) => {
+        this.config.logger.warn("aggregate_refresh_failed", { error: String(error) });
+      });
     }
 
     const shouldRefresh = this.model.onFlashblockTick(blockNumber);
@@ -572,6 +590,79 @@ export class EventPurityStack {
         });
       }
     }
+  }
+
+  private async refreshUrgentWatchAggregates(blockNumber: bigint): Promise<void> {
+    if (this.aggregateRefreshInFlight) {
+      return;
+    }
+    const accounts = this.collectUrgentWatchAccounts();
+    if (accounts.length === 0) {
+      return;
+    }
+    this.aggregateRefreshInFlight = true;
+    try {
+      const batchSize = 250;
+      for (let i = 0; i < accounts.length; i += batchSize) {
+        const batch = accounts.slice(i, i + batchSize);
+        const accountResults = await this.config.executionClient.multicall({
+          contracts: batch.map((address) => ({
+            address: this.config.poolAddress,
+            abi: aavePoolAbi,
+            functionName: "getUserAccountData",
+            args: [address],
+          })),
+          allowFailure: true,
+        });
+        const emodeResults = await this.config.executionClient.multicall({
+          contracts: batch.map((address) => ({
+            address: this.config.poolAddress,
+            abi: poolEmodeAbi,
+            functionName: "getUserEMode",
+            args: [address],
+          })),
+          allowFailure: true,
+        });
+        for (let j = 0; j < batch.length; j += 1) {
+          const address = batch[j]!;
+          const row = accountResults[j];
+          if (row?.status !== "success") {
+            continue;
+          }
+          const data = row.result as unknown as readonly [bigint, bigint, bigint, bigint, bigint, bigint];
+          const emode = emodeResults[j];
+          this.model.confirmOnChain(
+            address,
+            data[0],
+            data[1],
+            data[3],
+            data[5],
+            blockNumber,
+            emode?.status === "success" ? Number(emode.result) : 0,
+          );
+        }
+      }
+      this.config.logger.info("aggregate_refresh_complete", {
+        accounts: accounts.length,
+        blockNumber: Number(blockNumber),
+      });
+    } finally {
+      this.aggregateRefreshInFlight = false;
+    }
+  }
+
+  private collectUrgentWatchAccounts(): Address[] {
+    const out: Address[] = [];
+    for (const position of this.model.positions.values()) {
+      if (!position.isFullySeeded) {
+        continue;
+      }
+      const tier = this.model.classifyTier(position.cachedHfWad);
+      if (tier === "urgent" || tier === "watch" || tier === "liquidatable") {
+        out.push(position.account);
+      }
+    }
+    return out;
   }
 
   private async bootstrapOraclePrices(): Promise<OracleBootstrapResult> {

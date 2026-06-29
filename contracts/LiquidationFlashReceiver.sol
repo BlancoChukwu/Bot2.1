@@ -9,6 +9,15 @@ interface IERC20 {
 }
 
 interface IAavePool {
+    function getUserAccountData(address user) external view returns (
+        uint256 totalCollateralBase,
+        uint256 totalDebtBase,
+        uint256 availableBorrowsBase,
+        uint256 currentLiquidationThreshold,
+        uint256 ltv,
+        uint256 healthFactor
+    );
+
     function liquidationCall(
         address collateralAsset,
         address debtAsset,
@@ -39,7 +48,7 @@ contract LiquidationFlashReceiver {
     IAavePool public immutable POOL;
     ISwapRouter02 public immutable SWAP_ROUTER;
     uint24 public immutable swapFee;
-    uint256 public constant RECEIVER_VERSION = 1;
+    uint256 public constant RECEIVER_VERSION = 2;
     uint256 internal constant BPS = 10_000;
     /// @dev Max slippage on the collateral -> debt swap (200 = 2%).
     uint256 public constant SWAP_SLIPPAGE_BPS = 200;
@@ -102,6 +111,10 @@ contract LiquidationFlashReceiver {
         }
 
         require(debt.approve(address(POOL), debtToCover), "approve pool liq");
+
+        (, , , , , uint256 hfBeforeLiq) = POOL.getUserAccountData(user);
+        require(hfBeforeLiq < 1e18, "HF_NOT_LIQUIDATABLE");
+
         POOL.liquidationCall(collateralAsset, debtAsset, user, debtToCover, receiveAToken);
 
         uint256 owe = amount + premium;

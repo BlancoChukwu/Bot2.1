@@ -22,7 +22,7 @@ import {
 import type { PositionCheckpointStore } from "./positionCheckpointStore";
 
 const DEFAULT_CHUNK = 2000n;
-const MAX_DEDUP = 50_000;
+const MAX_DEDUP = 15_000;
 
 export interface WsEventLayerConfig {
   readonly chain: SupportedChain;
