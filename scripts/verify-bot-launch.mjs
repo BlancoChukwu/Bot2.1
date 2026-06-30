@@ -2,6 +2,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const logFile = resolve(process.argv[2] ?? "");
 if (!logFile) {
@@ -9,7 +10,7 @@ if (!logFile) {
   process.exit(1);
 }
 
-execSync("powershell -NoProfile -Command \"Start-Sleep -Seconds 4\"", { stdio: "ignore" });
+await sleep(4_000);
 
 let text = "";
 if (existsSync(logFile)) {

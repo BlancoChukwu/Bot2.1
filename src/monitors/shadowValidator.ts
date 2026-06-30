@@ -144,20 +144,31 @@ export class ShadowValidator {
     }
     this.samplesToday += 1;
 
-    const [accountData, eModeRaw] = await Promise.all([
-      this.config.client.readContract({
-        address: this.config.poolAddress,
-        abi: aavePoolAbi,
-        functionName: "getUserAccountData",
-        args: [account],
-      }),
-      this.config.client.readContract({
-        address: this.config.poolAddress,
-        abi: poolEmodeAbi,
-        functionName: "getUserEMode",
-        args: [account],
-      }).catch(() => 0n),
-    ]);
+    let accountData: readonly [bigint, bigint, bigint, bigint, bigint, bigint];
+    let eModeRaw: bigint;
+    try {
+      [accountData, eModeRaw] = await Promise.all([
+        this.config.client.readContract({
+          address: this.config.poolAddress,
+          abi: aavePoolAbi,
+          functionName: "getUserAccountData",
+          args: [account],
+        }),
+        this.config.client.readContract({
+          address: this.config.poolAddress,
+          abi: poolEmodeAbi,
+          functionName: "getUserEMode",
+          args: [account],
+        }).catch(() => 0n),
+      ]);
+    } catch (error) {
+      this.config.logger.warn("shadow_sample_rpc_failed", {
+        account,
+        blockNumber: Number(blockNumber),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
 
     const eModeCategoryId = Number(eModeRaw);
     const isEMode = eModeCategoryId > 0;

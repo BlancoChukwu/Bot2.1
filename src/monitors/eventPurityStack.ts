@@ -488,7 +488,12 @@ export class EventPurityStack {
       } else if (change.tier === "watch") {
         this.confirmQueue.enqueueWatch(change.account);
       }
-      void this.shadow.maybeSample(change.account, blockNumber);
+      void this.shadow.maybeSample(change.account, blockNumber).catch((error) => {
+        this.config.logger.warn("shadow_maybe_sample_failed", {
+          account: change.account,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
     }
     const confirmed = await this.confirmQueue.flushUrgent();
     for (const row of confirmed) {

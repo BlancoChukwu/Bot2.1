@@ -117,6 +117,28 @@ describe("shadowValidator segmented metrics", () => {
     expect(skipCall).toBeDefined();
   });
 
+  it("returns undefined when on-chain read fails instead of throwing", async () => {
+    const failingClient = {
+      readContract: vi.fn(async () => {
+        throw new Error("rpc_rate_limited");
+      }),
+    } as unknown as PublicClient;
+    const shadow = new ShadowValidator({
+      client: failingClient,
+      poolAddress: pool,
+      model,
+      purity,
+      logger,
+    });
+
+    const result = await shadow.sample(userNonEmode, 1_200_000_000_000_000_000n, 100n);
+    expect(result).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      "shadow_sample_rpc_failed",
+      expect.objectContaining({ account: userNonEmode }),
+    );
+  });
+
   it("caps drift bps for billion-HF local vs near-liquidatable on-chain", () => {
     const drift = computeShadowDriftBps(9_800_000_000n * 1_000_000_000_000_000_000n, 990_000_000_000_000_000n);
     expect(drift).toBe(10_000);
