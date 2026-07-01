@@ -5,6 +5,7 @@ cd "$ROOT"
 
 echo "Aave V3 — EVENT-PURITY 48h SOAK (shadow)"
 echo "Profile: .env.event-purity-soak"
+echo "Branch:  revised-live-bot (pull before start — includes oracle validation + USDbC peg fast-path)"
 if [[ ! -f "$ROOT/.env.event-purity-soak" ]]; then
   echo "Missing .env.event-purity-soak — run: npm run env:bootstrap"
   exit 1

@@ -103,6 +103,7 @@ eventPuritySoak = upsert(eventPuritySoak, "SKIP_DEPLOYMENT_SAFETY_GATE", "true")
 eventPuritySoak = upsert(eventPuritySoak, "ENABLE_HEAP_SNAPSHOTS", "true");
 eventPuritySoak = upsert(eventPuritySoak, "SHADOW_MAX_SAMPLES_PER_DAY", "10000");
 eventPuritySoak = upsert(eventPuritySoak, "RSS_WARN_MB", "400");
+eventPuritySoak = upsert(eventPuritySoak, "PEG_DERIVATION_FRESHNESS_MULTIPLIER", "2.5");
 writeFileSync(resolve(root, ".env.event-purity-soak"), eventPuritySoak, "utf8");
 
 let eventPurityProduction = applyEventPurityStack(production);
@@ -111,6 +112,8 @@ eventPurityProduction = upsert(eventPurityProduction, "SIMULATION_MODE", "false"
 eventPurityProduction = upsert(eventPurityProduction, "RPC_BUDGET_MODE", "false");
 eventPurityProduction = upsert(eventPurityProduction, "ENABLE_LIVE_TX", "true");
 eventPurityProduction = upsert(eventPurityProduction, "SKIP_DEPLOYMENT_SAFETY_GATE", "false");
+eventPurityProduction = upsert(eventPurityProduction, "RSS_WARN_MB", "400");
+eventPurityProduction = upsert(eventPurityProduction, "PEG_DERIVATION_FRESHNESS_MULTIPLIER", "2.5");
 writeFileSync(resolve(root, ".env.event-purity-production"), eventPurityProduction, "utf8");
 
 console.log(JSON.stringify({

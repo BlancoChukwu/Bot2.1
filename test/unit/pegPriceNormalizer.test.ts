@@ -4,8 +4,9 @@ import {
   isUsdbcAsset,
   pegDivergenceBps,
   pegUsdbcFromUsdcPrice,
+  resolvePegPriceWad18,
 } from "../../src/oracle/pegPriceNormalizer";
-import { BASE_USDBC } from "../../src/oracle/baseReserveAssets";
+import { BASE_USDC, BASE_USDBC } from "../../src/oracle/baseReserveAssets";
 
 describe("pegPriceNormalizer", () => {
   it("pegs USDbC to USDC normalized price", () => {
@@ -22,5 +23,11 @@ describe("pegPriceNormalizer", () => {
     const aave = 100_000_000n;
     expect(pegDivergenceBps(peg, aave)).toBe(0);
     expect(isPegDivergenceAcceptable(peg, aave)).toBe(true);
+  });
+
+  it("resolves USDbC price from USDC map entry", () => {
+    const usdc = 999_500_000_000_000_000n;
+    const prices = new Map<string, bigint>([[BASE_USDC.toLowerCase(), usdc]]);
+    expect(resolvePegPriceWad18(BASE_USDBC, prices)).toBe(usdc);
   });
 });

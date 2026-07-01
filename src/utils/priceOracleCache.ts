@@ -538,7 +538,7 @@ const CRITICAL_BASE_FEED_EXPECTATIONS: readonly {
 export function validateAndNormalizeFeedAddress(
   token: Address,
   feed: Address | string | undefined,
-  context: { readonly chain: SupportedChain; readonly logger?: PriceOracleLogger },
+  context: { readonly chain: SupportedChain; readonly logger?: PriceOracleLogger | undefined },
 ): Address | undefined {
   if (feed === undefined || feed === null || feed === "") {
     context.logger?.error("price_oracle_invalid_feed_address", {

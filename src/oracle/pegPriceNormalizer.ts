@@ -21,6 +21,35 @@ export function pegReferenceAsset(asset: Address): Address | undefined {
   return undefined;
 }
 
+export function pegAssetsDerivedFrom(referenceAsset: Address): readonly Address[] {
+  if (referenceAsset.toLowerCase() === BASE_USDC.toLowerCase()) {
+    return [BASE_USDBC];
+  }
+  return [];
+}
+
+export function resolvePegPriceWad18(
+  asset: Address,
+  prices: ReadonlyMap<string, bigint>,
+): bigint | undefined {
+  const reference = pegReferenceAsset(asset);
+  if (reference === undefined) {
+    return undefined;
+  }
+  const referencePrice = prices.get(reference.toLowerCase());
+  if (referencePrice === undefined || referencePrice <= 1n) {
+    return undefined;
+  }
+  if (isUsdbcAsset(asset)) {
+    return pegUsdbcFromUsdcPrice(referencePrice);
+  }
+  return undefined;
+}
+
+export function isPegTrackedAsset(asset: Address): boolean {
+  return pegReferenceAsset(asset) !== undefined;
+}
+
 export function pegDivergenceBps(pegPriceWad18: bigint, aavePriceBase8: bigint): number {
   if (aavePriceBase8 === 0n) {
     return Number(BPS);
