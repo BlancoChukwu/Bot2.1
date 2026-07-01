@@ -7,6 +7,18 @@ import { calculateHealthFactor } from "../protocols/aaveV3";
 import type { ParsedAavePoolEvent, ParsedChainlinkPriceEvent } from "./aaveEventParser";
 import { resolveHfFromResult } from "./localPositionHfPolicy";
 import { HfPriceGapAggregator } from "../utils/logRateLimiter";
+import {
+  pegAssetsDerivedFrom,
+  pegReferenceAsset,
+  resolvePegPriceWad18,
+} from "../oracle/pegPriceNormalizer";
+import { BASE_USDC, BASE_USDBC } from "../oracle/baseReserveAssets";
+import {
+  filterHealthyPegAssetsFromGapList,
+  pegUsdbcPriceFromHealthyReference,
+  resolveEffectiveAssetPriceWad18,
+  type PegReferenceHealthInput,
+} from "../oracle/healthyPegAsset";
 
 export type PositionConfidence = "high" | "low";
 export type PositionTier = "healthy" | "watch" | "urgent" | "liquidatable";
@@ -289,7 +301,58 @@ export class LocalPositionModel {
       asset,
     });
 
-    return this.recomputeTierChangesForAsset(asset, updatedAtSec);
+    const pegChanges = this.syncDerivedPegPrices(updatedAtSec, asset);
+    const directChanges = this.recomputeTierChangesForAsset(asset, updatedAtSec);
+    if (pegChanges.length === 0) {
+      return directChanges;
+    }
+    const merged = [...directChanges];
+    const seen = new Set(merged.map((change) => change.account.toLowerCase()));
+    for (const change of pegChanges) {
+      if (!seen.has(change.account.toLowerCase())) {
+        merged.push(change);
+        seen.add(change.account.toLowerCase());
+      }
+    }
+    return merged;
+  }
+
+  /** Keeps 1:1 peg assets (e.g. USDbC) aligned with their reference stable price. */
+  public syncDerivedPegPrices(nowSec: number, updatedReferenceAsset?: Address): readonly TierChange[] {
+    const pegAssets: Address[] = updatedReferenceAsset !== undefined
+      ? [...pegAssetsDerivedFrom(updatedReferenceAsset)]
+      : [];
+    if (updatedReferenceAsset === undefined) {
+      for (const assetKey of this.prices.keys()) {
+        const asset = assetKey as Address;
+        if (pegReferenceAsset(asset) !== undefined) {
+          pegAssets.push(asset);
+        }
+      }
+    }
+
+    const changes: TierChange[] = [];
+    for (const pegAsset of pegAssets) {
+      const pegKey = pegAsset.toLowerCase();
+      const pegPrice = resolvePegPriceWad18(pegAsset, this.prices);
+      const reference = pegReferenceAsset(pegAsset);
+      if (pegPrice === undefined || reference === undefined) {
+        continue;
+      }
+      if (this.prices.get(pegKey) === pegPrice) {
+        continue;
+      }
+      this.registerBootstrapPrice(pegAsset, pegPrice, {
+        answer: pegPrice / 10n ** 10n,
+        decimals: 8,
+        updatedAt: nowSec,
+        feedAddress: reference,
+        asset: pegAsset,
+        source: "peg",
+      });
+      changes.push(...this.recomputeTierChangesForAsset(pegAsset, nowSec));
+    }
+    return changes;
   }
 
   public applyPriceEvent(event: ParsedChainlinkPriceEvent): readonly TierChange[] {
@@ -487,7 +550,11 @@ export class LocalPositionModel {
         return { status: "price_incomplete", missingAssets };
       }
 
-      const missingAssets = collectMissingPriceAssets(position, this.prices);
+      this.syncDerivedPegPrices(nowSec);
+      this.materializeHealthyPegPrices(nowSec);
+
+      const healthInput = this.pegHealthInput(nowSec);
+      const missingAssets = collectMissingPriceAssets(position, healthInput);
       if (missingAssets.length > 0) {
         return { status: "price_incomplete", missingAssets };
       }
@@ -502,7 +569,7 @@ export class LocalPositionModel {
 
       for (const [assetKey, amount] of position.collateral) {
         const reserve = this.reserveConfig.get(assetKey);
-        const price = this.prices.get(assetKey);
+        const price = resolveEffectiveAssetPriceWad18(assetKey as Address, healthInput);
         if (reserve === undefined || price === undefined || amount === 0n) {
           continue;
         }
@@ -512,7 +579,7 @@ export class LocalPositionModel {
 
       for (const [assetKey, amount] of position.debt) {
         const reserve = this.reserveConfig.get(assetKey);
-        const price = this.prices.get(assetKey);
+        const price = resolveEffectiveAssetPriceWad18(assetKey as Address, healthInput);
         if (reserve === undefined || price === undefined || amount === 0n) {
           continue;
         }
@@ -546,9 +613,16 @@ export class LocalPositionModel {
         case "ok":
         case "no_debt":
           break;
-        case "price_incomplete":
-          this.recordPriceGap(position.account, hfResult.missingAssets);
+        case "price_incomplete": {
+          const gapAssets = filterHealthyPegAssetsFromGapList(
+            hfResult.missingAssets,
+            this.pegHealthInput(nowSec),
+          );
+          if (gapAssets.length > 0) {
+            this.recordPriceGap(position.account, gapAssets);
+          }
           break;
+        }
         case "price_stale":
           this.config.logger?.warn("hf_skip_price_stale", { staleAssets: hfResult.staleAssets });
           break;
@@ -584,9 +658,16 @@ export class LocalPositionModel {
       case "ok":
       case "no_debt":
         return { changes: [] };
-      case "price_incomplete":
-        this.recordPriceGap(position.account, result.missingAssets);
+      case "price_incomplete": {
+        const gapAssets = filterHealthyPegAssetsFromGapList(
+          result.missingAssets,
+          this.pegHealthInput(nowSec),
+        );
+        if (gapAssets.length > 0) {
+          this.recordPriceGap(position.account, gapAssets);
+        }
         return { changes: [] };
+      }
       case "price_stale":
         this.config.logger?.warn("hf_skip_price_stale", { staleAssets: result.staleAssets });
         return { changes: [] };
@@ -752,6 +833,36 @@ export class LocalPositionModel {
     }
   }
 
+  private pegHealthInput(nowSec: number): PegReferenceHealthInput {
+    return {
+      prices: this.prices,
+      feedStates: this.feedStates,
+      nowSec,
+    };
+  }
+
+  /** Writes USDbC into the local price map when USDC reference is fresh — no RPC. */
+  private materializeHealthyPegPrices(nowSec: number): void {
+    const input = this.pegHealthInput(nowSec);
+    const pegPrice = pegUsdbcPriceFromHealthyReference(input);
+    if (pegPrice === undefined) {
+      return;
+    }
+    const pegKey = BASE_USDBC.toLowerCase();
+    if (this.prices.get(pegKey) === pegPrice) {
+      return;
+    }
+    const usdcState = this.feedStates.get(BASE_USDC.toLowerCase());
+    this.registerBootstrapPrice(BASE_USDBC, pegPrice, {
+      answer: pegPrice / 10n ** 10n,
+      decimals: 8,
+      updatedAt: usdcState?.updatedAt ?? nowSec,
+      feedAddress: BASE_USDC,
+      asset: BASE_USDBC,
+      source: "peg",
+    });
+  }
+
   private recordPriceGap(account: Address, missingAssets: readonly Address[]): void {
     const summary = this.priceGapAggregator.record(account, missingAssets);
     if (summary === undefined) {
@@ -788,7 +899,7 @@ function collectPositionAssets(position: UserPosition): Address[] {
 
 function collectMissingPriceAssets(
   position: UserPosition,
-  prices: ReadonlyMap<string, bigint>,
+  input: PegReferenceHealthInput,
 ): Address[] {
   const missing: Address[] = [];
   const keys = new Set([...position.collateral.keys(), ...position.debt.keys()]);
@@ -798,10 +909,11 @@ function collectMissingPriceAssets(
     if (collateral === 0n && debt === 0n) {
       continue;
     }
-    const price = prices.get(assetKey);
-    if (price === undefined || price === 1n) {
-      missing.push(assetKey as Address);
+    const effectivePrice = resolveEffectiveAssetPriceWad18(assetKey as Address, input);
+    if (effectivePrice !== undefined) {
+      continue;
     }
+    missing.push(assetKey as Address);
   }
   return missing;
 }

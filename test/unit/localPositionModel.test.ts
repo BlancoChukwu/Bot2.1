@@ -10,6 +10,7 @@ import type { ParsedAavePoolEvent } from "../../src/monitors/aaveEventParser";
 
 const weth = "0x4200000000000000000000000000000000000006" as const;
 const usdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as const;
+const usdbc = "0xd9aAEc86B65D6f6A7B5B1b0C42FFA531710b6CA" as const;
 const wethFeed = "0x71041dddad3595F9CEd3dCCFBe3D1F4b0a16Bb70" as const;
 const user = "0x1111111111111111111111111111111111111111" as const;
 
@@ -135,6 +136,47 @@ describe("localPositionModel HfResult", () => {
       expect(result.hf).toBeGreaterThan(500_000_000_000_000_000n);
       expect(result.hf).toBeLessThan(30_000_000_000_000_000_000n);
     }
+  });
+
+  it("propagates USDbC peg price when USDC feed updates", () => {
+    registerWarmPrices();
+    model.registerReserve(usdbc, 8500n);
+    model.registerPriceFeed(usdc, usdbc, 1n);
+
+    model.applyFeedPriceUpdate(
+      usdc,
+      "0x7e860098F58bBFC8648a4311b374B1D669a2bc6B",
+      100_050_000n,
+      8,
+      NOW_SEC,
+    );
+
+    expect(model.prices.get(usdbc.toLowerCase())).toBeGreaterThan(1n);
+    expect(model.feedStates.get(usdbc.toLowerCase())?.source).toBe("peg");
+  });
+
+  it("computes HF for USDbC positions when USDC is fresh without USDbC map entry", () => {
+    registerWarmPrices();
+    model.registerReserve(usdbc, 8500n);
+    model.seedFromOnChainSnapshot({
+      account: user,
+      blockNumber: 10n,
+      eModeCategoryId: 0,
+      healthFactorWad: 1_200_000_000_000_000_000n,
+      totalCollateralBase: 1_000n,
+      totalDebtBase: 100n,
+      liquidationThreshold: 8_500n,
+      reserves: [
+        { asset: usdbc, scaledCollateral: 1_000n, scaledDebt: 0n },
+        { asset: weth, scaledCollateral: 0n, scaledDebt: 100n },
+      ],
+    });
+    const position = model.positions.get(user.toLowerCase())!;
+
+    const result = model.recomputeHf(position, NOW_SEC);
+
+    expect(result.status).toBe("ok");
+    expect(model.prices.get(usdbc.toLowerCase())).toBe(USDC_NORMALIZED);
   });
 
   it("applyFeedPriceUpdate uses chainlink updatedAt for staleness checks", () => {

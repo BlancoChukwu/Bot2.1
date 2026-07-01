@@ -13,6 +13,10 @@ import {
   pegDivergenceBps,
   pegUsdbcFromUsdcPrice,
 } from "./pegPriceNormalizer";
+import {
+  pegUsdbcPriceFromHealthyReference,
+  type PegReferenceHealthInput,
+} from "./healthyPegAsset";
 import { collectAssetsNeedingGapFill, computeOracleCoverage } from "./oracleCoverage";
 
 const AAVE_PRICE_DECIMALS = 8;
@@ -165,6 +169,17 @@ export async function bootstrapAaveOracleGapFill(input: {
   }
 
   for (const asset of assets.filter(isUsdbcAsset)) {
+    const healthInput: PegReferenceHealthInput = {
+      prices: input.model.prices,
+      feedStates: input.model.feedStates,
+      nowSec,
+    };
+    const healthyPegPrice = pegUsdbcPriceFromHealthyReference(healthInput);
+    if (healthyPegPrice !== undefined) {
+      registerPegPrice(input.model, asset, healthyPegPrice, BASE_USDC, input.logger, nowSec);
+      warmed += 1;
+      continue;
+    }
     const usdcPrice = input.model.prices.get(BASE_USDC.toLowerCase());
     if (usdcPrice === undefined || usdcPrice <= 1n) {
       failed.push(asset);

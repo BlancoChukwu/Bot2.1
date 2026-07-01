@@ -1,6 +1,11 @@
+import type { Address } from "viem";
 import { MAX_UINT256 } from "../config/oracleBootstrap";
 import { calculateHealthFactor } from "../protocols/aaveV3";
 import type { HfResult, UserPosition } from "./localPositionModel";
+import {
+  filterHealthyPegAssetsFromGapList,
+  type PegReferenceHealthInput,
+} from "../oracle/healthyPegAsset";
 
 const WAD = 1_000_000_000_000_000_000n;
 const BPS = 10_000n;
@@ -109,6 +114,13 @@ export function resolveEffectiveHfWad(position: UserPosition, perReserveHf: bigi
   }
 
   return capped;
+}
+
+export function filterGapMissingAssetsForHealthyPegs(
+  missingAssets: readonly Address[],
+  input: PegReferenceHealthInput,
+): Address[] {
+  return filterHealthyPegAssetsFromGapList(missingAssets, input);
 }
 
 export function resolveHfFromResult(position: UserPosition, hfResult: HfResult): bigint | undefined {
