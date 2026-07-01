@@ -19,6 +19,30 @@ export interface PegReferenceHealthInput {
   readonly nowSec: number;
 }
 
+/** Max USDC age for peg derivation as a multiple of Chainlink heartbeat (default 2.5×). */
+export const DEFAULT_PEG_DERIVATION_FRESHNESS_MULTIPLIER = 2.5;
+
+export function pegDerivationFreshnessMultiplier(): number {
+  const raw = process.env.PEG_DERIVATION_FRESHNESS_MULTIPLIER?.trim();
+  if (raw === undefined || raw.length === 0) {
+    return DEFAULT_PEG_DERIVATION_FRESHNESS_MULTIPLIER;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_PEG_DERIVATION_FRESHNESS_MULTIPLIER;
+  }
+  return parsed;
+}
+
+function isUsdcFreshEnoughForPegDerivation(
+  usdcFeed: PegFeedState,
+  nowSec: number,
+): boolean {
+  const heartbeat = FEED_HEARTBEATS[usdcFeed.feedAddress.toLowerCase()] ?? 3600;
+  const maxAgeSec = heartbeat * pegDerivationFreshnessMultiplier();
+  return nowSec - usdcFeed.updatedAt <= maxAgeSec;
+}
+
 /** True when a peg asset (USDbC) can inherit a fresh USDC reference price locally. */
 export function shouldRelaxFreshnessForHealthyPeg(
   asset: Address,
@@ -39,8 +63,7 @@ export function shouldRelaxFreshnessForHealthyPeg(
   if (usdcFeed.source === "aave" || usdcFeed.source === "peg") {
     return true;
   }
-  const heartbeat = FEED_HEARTBEATS[usdcFeed.feedAddress.toLowerCase()] ?? 3600;
-  return input.nowSec - usdcFeed.updatedAt <= heartbeat * 1.5;
+  return isUsdcFreshEnoughForPegDerivation(usdcFeed, input.nowSec);
 }
 
 export function resolveHealthyPegPriceWad18(

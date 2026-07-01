@@ -861,6 +861,12 @@ export class LocalPositionModel {
       asset: BASE_USDBC,
       source: "peg",
     });
+    this.config.logger?.info("usdbc_healthy_peg_materialized_from_usdc", {
+      pegAsset: BASE_USDBC,
+      referenceAsset: BASE_USDC,
+      pegPriceWad18: pegPrice.toString(),
+      usdcUpdatedAt: usdcState?.updatedAt ?? nowSec,
+    });
   }
 
   private recordPriceGap(account: Address, missingAssets: readonly Address[]): void {
