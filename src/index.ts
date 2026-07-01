@@ -103,13 +103,7 @@ import {
   startBorrowerWatchlistRescanner,
 } from "./monitors/borrowerWatchlistRescanner";
 import { scheduleHeapSnapshots } from "./utils/heapSnapshotHarness";
-import { startMemoryMonitor, triggerSurvivalExit } from "./utils/memoryMonitor";
-import {
-  createMemorySurvivalState,
-  recordMemoryPressureEviction,
-  shouldTriggerSurvivalExit,
-} from "./utils/memoryAttribution";
-import { getInFlightRpcCount } from "./utils/rpcCallMetrics";
+import { startMemoryMonitor } from "./utils/memoryMonitor";
 import { registerHeapSnapshotOnSignal } from "./utils/heapSnapshotOnSignal";
 import { memoryLimitsFromNodeHeap } from "./utils/nodeHeapLimits";
 import { RpcHealthMonitor } from "./utils/rpcHealthMonitor";
@@ -509,7 +503,6 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   let activeChainConfig = withResolvedAave(getChainConfig(config.chain), cachedResolvedForActive);
   let activePoolAddress = activeChainConfig.aave.pool;
   let latestKnownBlock: bigint = 0n;
-  let eventPurityStackRef: EventPurityStack | undefined;
   const publicClient = createFailoverPublicClient({
     chain: config.chain,
     rpcUrl: config.executionRpcUrlPrimary,
@@ -775,81 +768,20 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   let watchlistCoordinatorRef: WatchlistCoordinator | undefined;
   let hybridDetectionRef: HybridDetectionPipeline | undefined;
   const memoryLimits = memoryLimitsFromNodeHeap();
-  const memorySnapshotIntervalMs = parseMinNumber(
-    process.env.MEMORY_SNAPSHOT_INTERVAL_MS,
-    30_000,
-    5_000,
-    "MEMORY_SNAPSHOT_INTERVAL_MS",
-  );
-  const memorySurvivalSustainedMs = parseMinNumber(
-    process.env.MEMORY_SURVIVAL_SUSTAINED_MS,
-    5 * 60_000,
-    60_000,
-    "MEMORY_SURVIVAL_SUSTAINED_MS",
-  );
-  const memorySurvivalMinEviction = parseMinNumber(
-    process.env.MEMORY_SURVIVAL_MIN_EVICTION,
-    5,
-    0,
-    "MEMORY_SURVIVAL_MIN_EVICTION",
-  );
-  const memorySurvivalWarningThreshold = parseMinNumber(
-    process.env.MEMORY_SURVIVAL_WARNING_THRESHOLD,
-    3,
-    1,
-    "MEMORY_SURVIVAL_WARNING_THRESHOLD",
-  );
-  let memorySurvivalState = createMemorySurvivalState();
-  const runGcDiagnosticOnHighRss = (process.env.NODE_OPTIONS ?? "").includes("--expose-gc");
   const memoryMonitor = startMemoryMonitor({
     logger,
     warnBytes: memoryLimits.warnBytes,
     ceilBytes: memoryLimits.ceilBytes,
     rssWarnBytes: memoryLimits.rssWarnBytes,
-    intervalMs: memorySnapshotIntervalMs,
-    runGcDiagnosticOnHighRss,
     onRssSample: (rssBytes) => metrics.setProcessRssBytes(rssBytes),
-    attributionCounters: () => ({
-      wsSubs: eventPurityStackRef?.getWsSubscriptionCount() ?? 0,
-      inFlightRpc: getInFlightRpcCount(),
-      shadowQueueDepth: eventPurityStackRef?.shadow.getQueueDepth() ?? 0,
-    }),
     onHighRssWarning: () => {
-      const rssMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
-      let evicted = 0;
-      if (eventPurityStackRef !== undefined && latestKnownBlock > 0n) {
-        evicted = eventPurityStackRef.model.evictUnderMemoryPressure(latestKnownBlock);
-        if (evicted > 0) {
-          logger.warn("memory_pressure_eviction", { evicted, blockNumber: latestKnownBlock.toString() });
-          void webhookAlerter.notify("memory_pressure_eviction", { evicted });
-        }
+      if (eventPurityStackRef === undefined || latestKnownBlock === 0n) {
+        return;
       }
-      const nowMs = Date.now();
-      memorySurvivalState = recordMemoryPressureEviction(memorySurvivalState, {
-        evicted,
-        rssAboveWarn: true,
-        nowMs,
-        config: {
-          sustainedRssWarnMs: memorySurvivalSustainedMs,
-          minEvictionCount: memorySurvivalMinEviction,
-        },
-      });
-      if (shouldTriggerSurvivalExit(memorySurvivalState, {
-        nowMs,
-        config: {
-          sustainedRssWarnMs: memorySurvivalSustainedMs,
-          minEvictionCount: memorySurvivalMinEviction,
-        },
-        consecutiveWarningThreshold: memorySurvivalWarningThreshold,
-      })) {
-        void triggerSurvivalExit({
-          logger,
-          reason: "sustained_high_rss_after_eviction",
-          rssMb,
-          onSurvivalExit: async () => {
-            await eventPurityStackRef?.flushSurvivalState(latestKnownBlock);
-          },
-        });
+      const evicted = eventPurityStackRef.model.evictUnderMemoryPressure(latestKnownBlock);
+      if (evicted > 0) {
+        logger.warn("memory_pressure_eviction", { evicted, blockNumber: latestKnownBlock.toString() });
+        void webhookAlerter.notify("memory_pressure_eviction", { evicted });
       }
     },
     componentCounters: () => ({
@@ -1111,6 +1043,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   watchlistCoordinatorRef = watchlistCoordinator;
   hybridDetectionRef = hybridDetection;
   let eventPurityStack: EventPurityStack | undefined;
+  let eventPurityStackRef: EventPurityStack | undefined;
   let flashblockPrimaryLoop: FlashblockPrimaryLoop | undefined;
   const rpcHealthMonitor = new RpcHealthMonitor(200, 30_000);
   let rpcHealthTimer: NodeJS.Timeout | undefined;
@@ -1267,7 +1200,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   });
   const liquidationReceiver = config.liquidationReceiverAddress;
   const liquidationReceiverExpectedSwapRouter = parseAddress(
-    optionalEnv(process.env, "LIQUIDATION_RECEIVER_EXPECTED_SWAP_ROUTER"),
+    process.env.LIQUIDATION_RECEIVER_EXPECTED_SWAP_ROUTER?.trim(),
   );
   const validateLiquidationReceiverRpc =
     liquidationReceiver !== undefined
