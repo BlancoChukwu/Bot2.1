@@ -1,5 +1,6 @@
-import type { Address } from "viem";
+import { getAddress, isAddress, type Address } from "viem";
 import type { SupportedChain } from "../config/chains";
+import { BASE_PROTOCOL_DATA_PROVIDER } from "../config/oracleBootstrap";
 
 const DEFAULT_CACHE_TTL_MS = 5_000;
 const DEFAULT_MAX_STALE_MS = 900_000;
@@ -110,7 +111,11 @@ export class PriceOracleCache {
     this.nowMs = config.nowMs ?? (() => Date.now());
     this.logger = config.logger;
     this.onFreshnessObserved = config.onFreshnessObserved;
-    this.feedsByToken = config.feedRegistry?.[config.chain] ?? {};
+    this.feedsByToken = sanitizeFeedsByToken(
+      config.feedRegistry?.[config.chain] ?? {},
+      config.chain,
+      this.logger,
+    );
   }
 
   public async getUsdPrice(token: Address): Promise<bigint> {
@@ -230,7 +235,7 @@ export class PriceOracleCache {
   }
 
   private async fetchOne(token: Address): Promise<bigint> {
-    const feed = this.feedsByToken[token];
+    const feed = this.resolveValidatedFeedConfig(token);
     if (feed === undefined) {
       this.logger?.warn("price_oracle_missing_feed", { chain: this.config.chain, token });
       return this.readAaveFallback(token);
@@ -258,8 +263,11 @@ export class PriceOracleCache {
 
   private async fetchMany(tokens: readonly Address[], sink: Partial<Record<Address, bigint>>): Promise<void> {
     const feedEntries = tokens
-      .map((token) => ({ token, config: this.feedsByToken[token] }))
-      .filter((entry): entry is { readonly token: Address; readonly config: OracleFeedConfig } => entry.config !== undefined);
+      .map((token) => {
+        const config = this.resolveValidatedFeedConfig(token);
+        return config === undefined ? undefined : { token, config };
+      })
+      .filter((entry): entry is { readonly token: Address; readonly config: OracleFeedConfig } => entry !== undefined);
     if (feedEntries.length === 0) {
       for (const token of tokens) {
         this.logger?.warn("price_oracle_missing_feed", { chain: this.config.chain, token });
@@ -269,7 +277,7 @@ export class PriceOracleCache {
     }
 
     for (const token of tokens) {
-      if (this.feedsByToken[token] === undefined) {
+      if (this.resolveValidatedFeedConfig(token) === undefined) {
         this.logger?.warn("price_oracle_missing_feed", { chain: this.config.chain, token });
         sink[token] = await this.readAaveFallback(token);
       }
@@ -370,22 +378,47 @@ export class PriceOracleCache {
     return rawPrice * 10n ** BigInt(DEFAULT_USD_DECIMALS - feedDecimals);
   }
 
+  private resolveValidatedFeedConfig(token: Address): OracleFeedConfig | undefined {
+    const config = this.feedsByToken[token];
+    if (config === undefined) {
+      return undefined;
+    }
+    const normalizedFeed = validateAndNormalizeFeedAddress(token, config.feed, {
+      chain: this.config.chain,
+      logger: this.logger,
+    });
+    if (normalizedFeed === undefined) {
+      return undefined;
+    }
+    if (normalizedFeed === config.feed) {
+      return config;
+    }
+    return { ...config, feed: normalizedFeed };
+  }
+
   private async resolveFeedDecimals(feed: OracleFeedConfig): Promise<number> {
     if (feed.priceDecimals !== undefined) {
       return feed.priceDecimals;
     }
-    const cached = this.feedDecimalsCache.get(feed.feed);
+    const normalizedFeed = validateAndNormalizeFeedAddress(feed.feed, feed.feed, {
+      chain: this.config.chain,
+      logger: this.logger,
+    });
+    if (normalizedFeed === undefined) {
+      return DEFAULT_USD_DECIMALS;
+    }
+    const cached = this.feedDecimalsCache.get(normalizedFeed);
     if (cached !== undefined) {
       return cached;
     }
     try {
       const decimals = await this.config.publicClient.readContract({
-        address: feed.feed,
+        address: normalizedFeed,
         abi: chainlinkAggregatorAbi,
         functionName: "decimals",
       });
       const normalized = Number(decimals);
-      this.feedDecimalsCache.set(feed.feed, normalized);
+      this.feedDecimalsCache.set(normalizedFeed, normalized);
       return normalized;
     } catch {
       return DEFAULT_USD_DECIMALS;
@@ -475,20 +508,119 @@ function toErrorMessage(error: unknown): string {
 /** Base mainnet Chainlink ETH/USD — must not use mainnet L1 feed addresses on Base. */
 export const canonicalBaseEthUsdFeed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70" as Address;
 
+/** Base mainnet Chainlink USDC/USD. */
+export const canonicalBaseUsdcUsdFeed = "0x7e860098F58bBFC8648a4311b374B1D669a2bc6B" as Address;
+
+/** Base mainnet Chainlink cbBTC/USD. */
+export const canonicalBaseCbBtcUsdFeed = "0x07DA0E54543a844a80ABE69c8A12F22B3aA59f9D" as Address;
+
 /** Aave V3 Base AaveOracle — verified on-chain 2026-05-20. */
 export const canonicalBaseAaveOracleAddress = "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156" as Address;
+
+const canonicalBaseUsdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
+const canonicalBaseWeth = "0x4200000000000000000000000000000000000006" as Address;
+const canonicalBaseCbBtc = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
+
+const NON_CHAINLINK_FEED_ADDRESSES = new Set([
+  BASE_PROTOCOL_DATA_PROVIDER.toLowerCase(),
+  canonicalBaseAaveOracleAddress.toLowerCase(),
+]);
+
+const CRITICAL_BASE_FEED_EXPECTATIONS: readonly {
+  readonly token: Address;
+  readonly expectedFeed: Address;
+}[] = [
+  { token: canonicalBaseWeth, expectedFeed: canonicalBaseEthUsdFeed },
+  { token: canonicalBaseUsdc, expectedFeed: canonicalBaseUsdcUsdFeed },
+  { token: canonicalBaseCbBtc, expectedFeed: canonicalBaseCbBtcUsdFeed },
+];
+
+export function validateAndNormalizeFeedAddress(
+  token: Address,
+  feed: Address | string | undefined,
+  context: { readonly chain: SupportedChain; readonly logger?: PriceOracleLogger },
+): Address | undefined {
+  if (feed === undefined || feed === null || feed === "") {
+    context.logger?.error("price_oracle_invalid_feed_address", {
+      chain: context.chain,
+      token,
+      feed,
+      reason: "missing",
+    });
+    return undefined;
+  }
+  if (!isAddress(feed, { strict: false })) {
+    context.logger?.error("price_oracle_invalid_feed_address", {
+      chain: context.chain,
+      token,
+      feed,
+      reason: "not_an_address",
+    });
+    return undefined;
+  }
+  let normalized: Address;
+  try {
+    normalized = getAddress(feed);
+  } catch {
+    context.logger?.error("price_oracle_invalid_feed_address", {
+      chain: context.chain,
+      token,
+      feed,
+      reason: "checksum_normalization_failed",
+    });
+    return undefined;
+  }
+  if (NON_CHAINLINK_FEED_ADDRESSES.has(normalized.toLowerCase())) {
+    context.logger?.error("price_oracle_invalid_feed_address", {
+      chain: context.chain,
+      token,
+      feed: normalized,
+      reason: "denylisted_non_chainlink_contract",
+    });
+    return undefined;
+  }
+  return normalized;
+}
+
+function sanitizeFeedsByToken(
+  raw: Readonly<Partial<Record<Address, OracleFeedConfig>>>,
+  chain: SupportedChain,
+  logger: PriceOracleLogger | undefined,
+): Readonly<Partial<Record<Address, OracleFeedConfig>>> {
+  const sanitized: Partial<Record<Address, OracleFeedConfig>> = {};
+  for (const [token, config] of Object.entries(raw)) {
+    if (config === undefined) {
+      continue;
+    }
+    const tokenAddr = token as Address;
+    const normalizedFeed = validateAndNormalizeFeedAddress(tokenAddr, config.feed, { chain, logger });
+    if (normalizedFeed === undefined) {
+      continue;
+    }
+    sanitized[tokenAddr] = {
+      ...config,
+      feed: normalizedFeed,
+    };
+  }
+  return sanitized;
+}
 
 export function assertBaseFeedRegistry(feedRegistry: OracleFeedRegistry | undefined): void {
   const baseFeeds = feedRegistry?.base;
   if (baseFeeds === undefined) {
     throw new Error("Base price feed registry is required");
   }
-  const weth = "0x4200000000000000000000000000000000000006" as Address;
-  const configured = baseFeeds[weth]?.feed;
-  if (configured === undefined) {
-    throw new Error("Base WETH feed is missing from price feed registry");
-  }
-  if (configured.toLowerCase() !== canonicalBaseEthUsdFeed.toLowerCase()) {
-    throw new Error(`Base WETH feed must be ${canonicalBaseEthUsdFeed}, got ${configured}`);
+  for (const { token, expectedFeed } of CRITICAL_BASE_FEED_EXPECTATIONS) {
+    const configured = baseFeeds[token]?.feed;
+    if (configured === undefined) {
+      throw new Error(`Base feed is missing from price feed registry for token ${token}`);
+    }
+    const normalized = validateAndNormalizeFeedAddress(token, configured, { chain: "base" });
+    if (normalized === undefined) {
+      throw new Error(`Base feed address is invalid for token ${token}: ${configured}`);
+    }
+    if (normalized.toLowerCase() !== expectedFeed.toLowerCase()) {
+      throw new Error(`Base feed for ${token} must be ${expectedFeed}, got ${configured}`);
+    }
   }
 }

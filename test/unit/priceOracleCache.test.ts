@@ -1,6 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Address } from "viem";
-import { PriceOracleCache, type OracleFeedRegistry } from "../../src/utils/priceOracleCache";
+import { BASE_PROTOCOL_DATA_PROVIDER } from "../../src/config/oracleBootstrap";
+import {
+  PriceOracleCache,
+  assertBaseFeedRegistry,
+  canonicalBaseAaveOracleAddress,
+  canonicalBaseCbBtcUsdFeed,
+  canonicalBaseEthUsdFeed,
+  canonicalBaseUsdcUsdFeed,
+  validateAndNormalizeFeedAddress,
+  type OracleFeedRegistry,
+} from "../../src/utils/priceOracleCache";
 
 const chain = "base" as const;
 const token = "0x0000000000000000000000000000000000000001" as Address;
@@ -94,5 +104,110 @@ describe("PriceOracleCache", () => {
     const price = await cache.getUsdPrice(token);
 
     expect(price).toBe(0n);
+  });
+
+  it("rejects denylisted non-chainlink feed at construction and falls back to aave", async () => {
+    const logger = { warn: vi.fn(), error: vi.fn() };
+    const aaveOracle = canonicalBaseAaveOracleAddress;
+    const readContract = vi.fn().mockResolvedValue(250_000_000_000_000_000_000n);
+    const cache = new PriceOracleCache({
+      chain,
+      feedRegistry: {
+        optimism: {},
+        arbitrum: {},
+        base: {
+          [token]: {
+            feed: BASE_PROTOCOL_DATA_PROVIDER,
+            priceDecimals: 8,
+          },
+        },
+      },
+      aaveOracleAddress: aaveOracle,
+      logger,
+      publicClient: {
+        readContract,
+        multicall: vi.fn(),
+      } as never,
+    });
+
+    const price = await cache.getUsdPrice(token);
+
+    expect(price).toBe(250_000_000_000_000_000_000n);
+    expect(logger.error).toHaveBeenCalledWith(
+      "price_oracle_invalid_feed_address",
+      expect.objectContaining({
+        reason: "denylisted_non_chainlink_contract",
+      }),
+    );
+    expect(readContract).toHaveBeenCalledWith(
+      expect.objectContaining({
+        address: aaveOracle,
+        functionName: "getAssetPrice",
+        args: [token],
+      }),
+    );
+  });
+
+  it("falls back to aave when fetchOne chainlink read throws", async () => {
+    const aaveOracle = canonicalBaseAaveOracleAddress;
+    const readContract = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("InvalidAddressError"))
+      .mockResolvedValueOnce(180_000_000n);
+    const cache = new PriceOracleCache({
+      chain,
+      feedRegistry: registry(),
+      aaveOracleAddress: aaveOracle,
+      publicClient: {
+        readContract,
+        multicall: vi.fn(),
+      } as never,
+    });
+
+    const price = await cache.getUsdPrice(token);
+
+    expect(price).toBe(180_000_000n);
+    expect(readContract).toHaveBeenCalledTimes(2);
+  });
+
+  it("validateAndNormalizeFeedAddress rejects malformed feed strings", () => {
+    const logger = { warn: vi.fn(), error: vi.fn() };
+    const normalized = validateAndNormalizeFeedAddress(token, "not-an-address", {
+      chain,
+      logger,
+    });
+    expect(normalized).toBeUndefined();
+    expect(logger.error).toHaveBeenCalledWith(
+      "price_oracle_invalid_feed_address",
+      expect.objectContaining({ reason: "not_an_address" }),
+    );
+  });
+
+  it("assertBaseFeedRegistry validates all critical Base feeds", () => {
+    const usdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
+    const weth = "0x4200000000000000000000000000000000000006" as Address;
+    const cbBtc = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
+    expect(() =>
+      assertBaseFeedRegistry({
+        optimism: {},
+        arbitrum: {},
+        base: {
+          [weth]: { feed: canonicalBaseEthUsdFeed, priceDecimals: 8 },
+          [usdc]: { feed: canonicalBaseUsdcUsdFeed, priceDecimals: 8 },
+          [cbBtc]: { feed: canonicalBaseCbBtcUsdFeed, priceDecimals: 8 },
+        },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertBaseFeedRegistry({
+        optimism: {},
+        arbitrum: {},
+        base: {
+          [weth]: { feed: BASE_PROTOCOL_DATA_PROVIDER, priceDecimals: 8 },
+          [usdc]: { feed: canonicalBaseUsdcUsdFeed, priceDecimals: 8 },
+          [cbBtc]: { feed: canonicalBaseCbBtcUsdFeed, priceDecimals: 8 },
+        },
+      }),
+    ).toThrow(/invalid/i);
   });
 });

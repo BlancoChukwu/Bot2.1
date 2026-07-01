@@ -90,6 +90,7 @@ import {
   PriceOracleCache,
   assertBaseFeedRegistry,
   canonicalBaseAaveOracleAddress,
+  validateAndNormalizeFeedAddress,
   type OracleFeedRegistry,
 } from "./utils/priceOracleCache";
 import { BorrowerCooldownRegistry } from "./utils/borrowerCooldown";
@@ -2103,12 +2104,18 @@ function parsePriceFeedRegistry(value: string | undefined): OracleFeedRegistry |
       if (typeof feed !== "string" || !/^0x[a-fA-F0-9]{40}$/.test(feed)) {
         throw new Error(`PRICE_FEED_REGISTRY_JSON.${chain}.${token}.feed must be a 20-byte hex address`);
       }
+      const normalizedFeed = validateAndNormalizeFeedAddress(token as Address, feed as Address, { chain });
+      if (normalizedFeed === undefined) {
+        throw new Error(
+          `PRICE_FEED_REGISTRY_JSON.${chain}.${token}.feed is not a valid Chainlink feed address: ${feed}`,
+        );
+      }
       const priceDecimals = (config as Record<string, unknown>).priceDecimals;
       if (priceDecimals !== undefined && (!Number.isInteger(priceDecimals) || Number(priceDecimals) < 0)) {
         throw new Error(`PRICE_FEED_REGISTRY_JSON.${chain}.${token}.priceDecimals must be a non-negative integer`);
       }
       output[chain][token as Address] = {
-        feed: feed as Address,
+        feed: normalizedFeed,
         ...(priceDecimals === undefined ? {} : { priceDecimals: Number(priceDecimals) }),
       };
     }

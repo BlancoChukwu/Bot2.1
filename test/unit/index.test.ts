@@ -70,8 +70,16 @@ describe("parseRuntimeConfig", () => {
       ARBITRAGE_MIN_PROFIT_USD: "0.25",
       PRICE_FEED_REGISTRY_JSON: JSON.stringify({
         base: {
+          "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913": {
+            feed: "0x7e860098F58bBFC8648a4311b374B1D669a2bc6B",
+            priceDecimals: 8,
+          },
           "0x4200000000000000000000000000000000000006": {
             feed: "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70",
+            priceDecimals: 8,
+          },
+          "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf": {
+            feed: "0x07DA0E54543a844a80ABE69c8A12F22B3aA59f9D",
             priceDecimals: 8,
           },
         },
@@ -98,6 +106,34 @@ describe("parseRuntimeConfig", () => {
       .toBe("0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70");
     expect(config.priceFeedRegistry?.base["0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"]?.feed)
       .toBe("0x07DA0E54543a844a80ABE69c8A12F22B3aA59f9D");
+  });
+
+  it("rejects PRICE_FEED_REGISTRY_JSON when feed is a denylisted non-chainlink contract", () => {
+    expect(() =>
+      parseRuntimeConfig({
+        CHAIN: "base",
+        RPC_URL: "https://base.example",
+        BASE_AAVE_SUBGRAPH_URL:
+          "https://gateway.thegraph.com/api/0809d0adbd54399dd534c899c2c7ca91/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF",
+        PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001",
+        PRICE_FEED_REGISTRY_JSON: JSON.stringify({
+          base: {
+            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913": {
+              feed: "0x2d8A3C5677189723C4cB8873CfC9C8976dfe292C",
+              priceDecimals: 8,
+            },
+            "0x4200000000000000000000000000000000000006": {
+              feed: "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70",
+              priceDecimals: 8,
+            },
+            "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf": {
+              feed: "0x07DA0E54543a844a80ABE69c8A12F22B3aA59f9D",
+              priceDecimals: 8,
+            },
+          },
+        }),
+      }),
+    ).toThrow(/not a valid Chainlink feed address/i);
   });
 
   it("rejects live pipeline startup when required Base token feeds are missing", () => {
