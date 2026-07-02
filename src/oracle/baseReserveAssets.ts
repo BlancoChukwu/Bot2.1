@@ -9,7 +9,7 @@ export const BASE_WETH = "0x4200000000000000000000000000000000000006" as Address
 export const BASE_CBBTC = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
 
 export const BASE_CBETH = "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22" as Address;
-export const BASE_USDBC = "0xd9aAEc86B65D6f6A7B5B1b0C42FFA531710b6CA" as Address;
+export const BASE_USDBC = "0xd9aaEC86B65d86f6A7B5B1b0c42FFA531710B6CA" as Address;
 export const BASE_GHO = "0x6Bb7a212910682DCFdbd5BCBb3e28FB4E8da10Ee" as Address;
 export const BASE_EURC = "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42" as Address;
 export const BASE_WSTETH = "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452" as Address;

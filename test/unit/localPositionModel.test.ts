@@ -10,7 +10,7 @@ import type { ParsedAavePoolEvent } from "../../src/monitors/aaveEventParser";
 
 const weth = "0x4200000000000000000000000000000000000006" as const;
 const usdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as const;
-const usdbc = "0xd9aAEc86B65D6f6A7B5B1b0C42FFA531710b6CA" as const;
+const usdbc = "0xd9aaEC86B65d86f6A7B5B1b0c42FFA531710B6CA" as const;
 const wethFeed = "0x71041dddad3595F9CEd3dCCFBe3D1F4b0a16Bb70" as const;
 const user = "0x1111111111111111111111111111111111111111" as const;
 
