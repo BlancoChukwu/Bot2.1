@@ -12,6 +12,9 @@ export interface EventPurityConfig {
   readonly shadowDriftToleranceBps: number;
   readonly shadowFnRateTargetPct: number;
   readonly shadowMaxSamplesPerDay: number;
+  readonly shadowMaxConcurrency: number;
+  readonly shadowBootstrapRampMs: number;
+  readonly shadowBootstrapSampleRateMultiplier: number;
   readonly bootstrapEnabled: boolean;
   readonly bootstrapLookbackDays: number;
   readonly bootstrapCacheEnabled: boolean;
@@ -90,6 +93,13 @@ export function parseEventPurityConfig(env: Record<string, string | undefined>):
     shadowDriftToleranceBps: parseNonNegativeNumber(env.SHADOW_DRIFT_TOLERANCE_BPS, 50, "SHADOW_DRIFT_TOLERANCE_BPS"),
     shadowFnRateTargetPct: parseNonNegativeNumber(env.SHADOW_FN_RATE_TARGET_PCT, 1.0, "SHADOW_FN_RATE_TARGET_PCT"),
     shadowMaxSamplesPerDay: parsePositiveNumber(env.SHADOW_MAX_SAMPLES_PER_DAY, 500, "SHADOW_MAX_SAMPLES_PER_DAY"),
+    shadowMaxConcurrency: parsePositiveNumber(env.SHADOW_MAX_CONCURRENCY, 8, "SHADOW_MAX_CONCURRENCY"),
+    shadowBootstrapRampMs: parsePositiveNumber(env.SHADOW_BOOTSTRAP_RAMP_MS, 600_000, "SHADOW_BOOTSTRAP_RAMP_MS"),
+    shadowBootstrapSampleRateMultiplier: parsePositiveNumber(
+      env.SHADOW_BOOTSTRAP_SAMPLE_RATE_MULTIPLIER,
+      5,
+      "SHADOW_BOOTSTRAP_SAMPLE_RATE_MULTIPLIER",
+    ),
     bootstrapEnabled: parseBoolean(env.BOOTSTRAP_ENABLED, true),
     bootstrapLookbackDays: parsePositiveNumber(env.BOOTSTRAP_LOOKBACK_DAYS, 14, "BOOTSTRAP_LOOKBACK_DAYS"),
     bootstrapCacheEnabled: parseBoolean(env.BOOTSTRAP_CACHE_ENABLED, true),

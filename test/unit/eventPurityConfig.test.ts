@@ -9,6 +9,9 @@ describe("eventPurityConfig", () => {
     expect(config.enableWatchTierConfirm).toBe(false);
     expect(config.localHfUrgent).toBe(1.05);
     expect(config.shadowSampleRate).toBe(100);
+    expect(config.shadowMaxConcurrency).toBe(8);
+    expect(config.shadowBootstrapRampMs).toBe(600_000);
+    expect(config.shadowBootstrapSampleRateMultiplier).toBe(5);
     expect(config.bootstrapEnabled).toBe(true);
     expect(config.bootstrapLookbackDays).toBe(14);
     expect(config.bootstrapCacheEnabled).toBe(true);
