@@ -295,6 +295,7 @@ export async function refreshGapFillPrices(input: {
     input.logger.info("oracle_gap_fill_refresh_complete", {
       refreshed,
       failedCount: failed.length,
+      targetCount: assets.length,
       failed: failed.slice(0, 20),
     });
     return { refreshed, failed };

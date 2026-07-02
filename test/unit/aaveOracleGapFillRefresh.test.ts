@@ -59,7 +59,7 @@ describe("refreshGapFillPrices", () => {
     );
     expect(info).toHaveBeenCalledWith(
       "oracle_gap_fill_refresh_complete",
-      expect.objectContaining({ refreshed: 1, failedCount: 0 }),
+      expect.objectContaining({ refreshed: 1, failedCount: 0, targetCount: 1 }),
     );
   });
 

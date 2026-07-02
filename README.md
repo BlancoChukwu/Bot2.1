@@ -228,15 +228,55 @@ SEAMLESS_SUBGRAPH_URL=https://gateway.thegraph.com/api/<KEY>/subgraphs/id/<SEAML
 
 Logs: `borrower_discovery_complete`, `borrower_non_aave_skipped` (when non-Aave accounts lack Aave snapshots).
 
-### PM2 (after a clean 12h session)
+### PM2 process supervision
+
+Production and soak launchers (`scripts/launcher-run-bot*.cmd`, `scripts/launcher-run-bot-detached.sh`, `scripts/start-live-24h.ps1`) start the bot via PM2 instead of a raw `node dist/src/index.js` process. The shared entry point is `scripts/pm2-bot-launch.mjs`, which deletes any stale app registration and runs `pm2 start ecosystem.config.cjs`.
 
 ```bash
 npm run build
-pm2 start ecosystem.config.cjs
-pm2 logs aave-liquidator-base
+pm2 start ecosystem.config.cjs          # manual start
+pm2 logs aave-liquidator-base           # tail stdout/stderr
+pm2 status                              # confirm supervised + RSS
+npm run bot:stop                        # stops PM2 app + stray node PIDs
 ```
 
-`max_memory_restart: 3G` restarts the process before the OS OOM killer. Stale `.runtime/bot.lock` files are removed on the next start via `singleInstanceLock`.
+**`ecosystem.config.cjs` fields (maintainer reference)**
+
+| Field | Value | Purpose |
+|-------|-------|---------|
+| `name` | `aave-liquidator-base` | PM2 app id for `pm2 logs/stop/restart` |
+| `script` | `dist/src/index.js` | Compiled bot entry (run `npm run build` first) |
+| `instances` / `exec_mode` | `1` / `fork` | Single-process bot; no cluster |
+| `autorestart` | `true` | Restart on crash |
+| `max_restarts` / `min_uptime` | `10` / `10s` | Back off after rapid crash loops |
+| `restart_delay` | `5s` | Pause between auto-restarts |
+| `node_args` | `--max-old-space-size=1024 --expose-gc` | Heap cap + manual GC for soak diagnostics |
+| `max_memory_restart` | `1200M` | PM2-level RSS guard (~6× current soak RSS) |
+| `kill_timeout` | `15s` | SIGINT→SIGKILL window on `pm2 stop` / shutdown |
+| `env` | production defaults | `SIMULATION_MODE=false`, safety gate on, cold-start sweep skipped |
+
+`kill_timeout: 15_000` is sized for `ENABLE_LIVE_TX=false`. Before enabling live tx, confirm the `shutdown.addHook` chain (checkpoint close, in-flight execution drain) finishes within 15s under load, or raise this for the live profile.
+
+Session launchers pass `--output` / `--error` to PM2 so soak logs still land in `logs/<prefix>-<timestamp>.log` alongside PM2's own log files under `~/.pm2/logs/`.
+
+`scripts/ensure-single-bot.mjs` remains a secondary guard: `--stop` calls `pm2 stop/delete aave-liquidator-base` then kills any stray `dist/src/index.js` PIDs; `--status` still reports `lockPid` from `.runtime/bot.lock` (written by the bot process PM2 supervises).
+
+**Gap-fill price refresh (oracle poll)**
+
+On Base event-purity mode, the existing `ORACLE_POLL_INTERVAL_MS` timer (default 60s) runs both Chainlink feed freshness and unconditional gap-fill refresh. Grep soak logs for:
+
+- `oracle_gap_fill_refresh_complete` — per-cycle detail (`refreshed`, `failedCount`, `targetCount`)
+- `gap_fill_refresh_poll_result` — one-line poll wrapper summary (`refreshed`, `failedCount`)
+
+After bootstrap, expect `refreshed > 0` on cycles where held positions have gap-fill assets registered in `reserveConfig`.
+
+**Platform notes**
+
+- **Windows** — PM2 must be installed globally (`npm i -g pm2`). `launcher-run-bot.cmd` starts PM2 and returns immediately (use `pm2 logs`, not the blocking foreground `node` path). Paths with spaces are quoted in `pm2-bot-launch.mjs`.
+- **Linux** — Same `pm2-bot-launch.mjs` path via `launcher-run-bot-detached.sh`. `ensure-single-bot.mjs` uses `pgrep` for stray PID detection.
+- **Not PM2-wrapped** — `scripts/live-1hr-monitor.ps1` still uses `npm run start:live` (ts-node dev path). `deploy/aave-liquidator.service` uses systemd + raw `node`.
+
+Stale `.runtime/bot.lock` files are removed on the next start via `singleInstanceLock`.
 
 ### Gate adjustment after validation (ops)
 

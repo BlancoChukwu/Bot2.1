@@ -407,9 +407,14 @@ export class EventPurityStack {
       model: this.model,
       logger: this.config.logger,
     });
+    this.config.logger.info("gap_fill_refresh_poll_result", {
+      refreshed: result.refreshed,
+      failedCount: result.failed.length,
+    });
     if (result.failed.length > 0) {
       this.config.logger.warn("oracle_gap_fill_refresh_partial", {
         refreshed: result.refreshed,
+        failedCount: result.failed.length,
         failed: result.failed,
       });
     }
