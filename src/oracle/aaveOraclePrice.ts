@@ -141,18 +141,22 @@ export async function bootstrapAaveOracleGapFill(input: {
   const oracle = input.oracle ?? BASE_AAVE_ORACLE;
   const nowSec = input.nowSec ?? Math.floor(Date.now() / 1000);
   const needed = collectAssetsNeedingGapFill(input.model);
-  const targetSet = new Set(BASE_GAP_FILL_ASSETS.map((a) => a.toLowerCase()));
-  const assets = needed.filter((asset) => targetSet.has(asset.toLowerCase()));
-  if (assets.length === 0) {
+  if (needed.length === 0) {
     logOracleBootstrapCoverage(input.model, input.logger);
     return { warmed: 0, failed: [] };
   }
 
-  for (const asset of assets) {
+  input.logger.info("oracle_gap_fill_start", {
+    targetCount: needed.length,
+    knownGapFillAssets: BASE_GAP_FILL_ASSETS.length,
+    targets: needed.slice(0, 20),
+  });
+
+  for (const asset of needed) {
     input.model.registerReserve(asset);
   }
 
-  const aaveAssets = assets.filter((asset) => !isUsdbcAsset(asset));
+  const aaveAssets = needed.filter((asset) => !isUsdbcAsset(asset));
   const aavePrices = await fetchAaveAssetPrices(input.client, oracle, aaveAssets);
 
   let warmed = 0;
@@ -168,7 +172,7 @@ export async function bootstrapAaveOracleGapFill(input: {
     warmed += 1;
   }
 
-  for (const asset of assets.filter(isUsdbcAsset)) {
+  for (const asset of needed.filter(isUsdbcAsset)) {
     const healthInput: PegReferenceHealthInput = {
       prices: input.model.prices,
       feedStates: input.model.feedStates,
@@ -200,6 +204,11 @@ export async function bootstrapAaveOracleGapFill(input: {
   }
 
   logOracleBootstrapCoverage(input.model, input.logger);
+  input.logger.info("oracle_gap_fill_complete", {
+    warmed,
+    failedCount: failed.length,
+    failed: failed.slice(0, 20),
+  });
   return { warmed, failed };
 }
 
@@ -211,6 +220,7 @@ export function logOracleBootstrapCoverage(model: LocalPositionModel, logger: Lo
     total_position_assets: coverage.totalPositionAssets,
     blind_assets: coverage.blindAssets,
     blind_positions: coverage.blindPositionCount,
+    blind_asset_addresses: coverage.blindAssetAddresses,
   });
 }
 

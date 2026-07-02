@@ -16,6 +16,10 @@ const symbolToBaseAddress: Record<string, Address> = {
   WEETH: "0x04C0599Ae5A44757c0af6F9eC3b93da8976c150A",
   GHO: "0x6Bb7a212910682DCFdbd5BCBb3e28FB4E8da10Ee",
   EURC: "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42",
+  AAVE: "0x63706e401c06ac8513145b7687a14804d17f814b",
+  TBTC: "0x236aa50979d5f3de3bd1eeb40e81137f22ab794b",
+  SYRUPUSDC: "0x660975730059246a68521a3e2fbd4740173100f5",
+  LBTC: "0xecac9c5f704e954931349da37f60e39f515c11c1",
 };
 
 export function parseWatchlistReserveAllowlist(
