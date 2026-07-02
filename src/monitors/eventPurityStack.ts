@@ -26,7 +26,7 @@ import { createBootstrapLogClients } from "./bootstrapRpcClients";
 import { setBootstrapRuntimeStatus } from "../runtime/bootstrapRuntimeStatus";
 import { pollLocalFeedFreshness } from "./localFeedFreshnessPoll";
 import { reconcileAndSeedPosition } from "./positionOnChainReconcile";
-import { bootstrapAaveOracleGapFill } from "../oracle/aaveOraclePrice";
+import { bootstrapAaveOracleGapFill, refreshGapFillPrices } from "../oracle/aaveOraclePrice";
 import { aavePoolAbi } from "../protocols/aaveV3";
 import { poolEmodeAbi } from "./aaveEmode";
 
@@ -367,6 +367,16 @@ export class EventPurityStack {
     await this.checkpoint?.close();
   }
 
+  public getWsSubscriptionCount(): number {
+    return this.wsLayer?.getActiveSubscriptionCount() ?? 0;
+  }
+
+  public async flushSurvivalState(blockNumber: bigint): Promise<void> {
+    if (blockNumber > 0n) {
+      await this.checkpoint?.saveLastProcessedBlock(blockNumber);
+    }
+  }
+
   public getBootstrapStatus(): PartialBootstrapCoverage | undefined {
     return this.bootstrapStatus;
   }
@@ -386,6 +396,23 @@ export class EventPurityStack {
       logger: this.config.logger,
     });
     await this.handleTierChanges(changes, blockNumber);
+  }
+
+  public async refreshGapFillPrices(): Promise<void> {
+    if (!this.pricesBootstrapped) {
+      return;
+    }
+    const result = await refreshGapFillPrices({
+      client: this.config.executionClient,
+      model: this.model,
+      logger: this.config.logger,
+    });
+    if (result.failed.length > 0) {
+      this.config.logger.warn("oracle_gap_fill_refresh_partial", {
+        refreshed: result.refreshed,
+        failed: result.failed,
+      });
+    }
   }
 
   private publishBootstrapStatus(coverage: PartialBootstrapCoverage): void {

@@ -64,7 +64,7 @@ cd "\$BOT_REPO_ROOT"
 if [[ "\$USE_START_LIVE" == "1" ]]; then
   npm run start:live >> "\$BOT_LOGFILE" 2>> "\$BOT_ERRFILE"
 else
-  node dist/src/index.js >> "\$BOT_LOGFILE" 2>> "\$BOT_ERRFILE"
+  node scripts/pm2-bot-launch.mjs --output "\$BOT_LOGFILE" --error "\$BOT_ERRFILE"
 fi
 echo >> "\$BOT_LOGFILE"
 echo "{\"msg\":\"launcher_session_exit\",\"exitCode\":\$?}" >> "\$BOT_LOGFILE"
@@ -79,6 +79,7 @@ chmod +x "$SESSION_FILE"
   echo "env_file=$BOT_ENV_FILE"
   echo "dotenv=$DOTENV_CONFIG_PATH"
   echo "detached=true"
+  echo "pm2_managed=true"
   echo "simulation_mode=$SIMULATION_MODE"
 } > logs/latest-session.txt
 

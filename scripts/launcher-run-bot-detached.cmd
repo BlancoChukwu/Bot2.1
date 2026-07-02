@@ -45,6 +45,7 @@ if errorlevel 1 goto :failed
   echo started=%LOGSTAMP%
   echo prefix=%BOT_LOG_PREFIX%
   echo detached=true
+  echo pm2_managed=true
   echo child_script=scripts\run-bot-detached-child.cmd
   echo node_options=%NODE_OPTIONS%
   echo rust_hotpath=%RUST_HOTPATH_ENABLED%

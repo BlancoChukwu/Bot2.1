@@ -19,7 +19,7 @@ if "%USE_START_LIVE%"=="1" (
     echo dist_missing_run_npm_build>> "%BOT_LOGFILE%"
     exit /b 1
   )
-  node dist\src\index.js >> "%BOT_LOGFILE%" 2>> "%BOT_ERRFILE%"
+  call node scripts\pm2-bot-launch.mjs --output "%BOT_LOGFILE%" --error "%BOT_ERRFILE%"
 )
 
 set EXIT_CODE=%ERRORLEVEL%

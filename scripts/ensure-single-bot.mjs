@@ -129,7 +129,27 @@ function removeStaleLock() {
   return { removed: false, reason: "held", pid: lockPid };
 }
 
+function stopPm2ManagedBot() {
+  try {
+    execSync("pm2 stop aave-liquidator-base", {
+      cwd: repoRoot,
+      stdio: "ignore",
+    });
+  } catch {
+    // pm2 not installed or app not registered
+  }
+  try {
+    execSync("pm2 delete aave-liquidator-base", {
+      cwd: repoRoot,
+      stdio: "ignore",
+    });
+  } catch {
+    // pm2 not installed or app not registered
+  }
+}
+
 function stopBots() {
+  stopPm2ManagedBot();
   const processes = listBotProcesses();
   const killed = new Set();
   for (const proc of processes) {

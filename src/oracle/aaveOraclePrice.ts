@@ -212,6 +212,98 @@ export async function bootstrapAaveOracleGapFill(input: {
   return { warmed, failed };
 }
 
+/**
+ * Tier (urgent/watch/safe) is only recomputed when a price update lands for an asset.
+ * Gating this refresh on "position is currently urgent" would mean a position never gets
+ * refreshed BECAUSE it's using a stale price to decide whether it's urgent in the first
+ * place — a circular dependency. Refresh everything currently held; do not gate on tier.
+ */
+export async function refreshGapFillPrices(input: {
+  readonly client: PublicClient;
+  readonly model: LocalPositionModel;
+  readonly logger: LoggerLike;
+  readonly oracle?: Address;
+  readonly nowSec?: number;
+}): Promise<{ refreshed: number; failed: readonly Address[] }> {
+  const oracle = input.oracle ?? BASE_AAVE_ORACLE;
+  const nowSec = input.nowSec ?? Math.floor(Date.now() / 1000);
+  const assets = BASE_GAP_FILL_ASSETS.filter((asset) =>
+    input.model.reserveConfig.has(asset.toLowerCase()),
+  );
+
+  if (assets.length === 0) {
+    return { refreshed: 0, failed: [] };
+  }
+
+  input.logger.info("oracle_gap_fill_refresh_start", {
+    targetCount: assets.length,
+    targets: assets.slice(0, 20),
+  });
+
+  try {
+    const aaveAssets = assets.filter((asset) => !isUsdbcAsset(asset));
+    const aavePrices = await fetchAaveAssetPrices(input.client, oracle, aaveAssets);
+
+    let refreshed = 0;
+    const failed: Address[] = [];
+
+    for (const asset of aaveAssets) {
+      const price = aavePrices.get(asset.toLowerCase());
+      if (price === undefined) {
+        failed.push(asset);
+        input.logger.warn("oracle_gap_fill_refresh_asset_failed", { asset });
+        continue;
+      }
+      registerAavePrice(input.model, asset, price, oracle, input.logger, nowSec);
+      refreshed += 1;
+    }
+
+    for (const asset of assets.filter(isUsdbcAsset)) {
+      const healthInput: PegReferenceHealthInput = {
+        prices: input.model.prices,
+        feedStates: input.model.feedStates,
+        nowSec,
+      };
+      const healthyPegPrice = pegUsdbcPriceFromHealthyReference(healthInput);
+      if (healthyPegPrice !== undefined) {
+        registerPegPrice(input.model, asset, healthyPegPrice, BASE_USDC, input.logger, nowSec);
+        refreshed += 1;
+        continue;
+      }
+      const usdcPrice = input.model.prices.get(BASE_USDC.toLowerCase());
+      if (usdcPrice === undefined || usdcPrice <= 1n) {
+        failed.push(asset);
+        input.logger.warn("oracle_gap_fill_refresh_asset_failed", { asset });
+        continue;
+      }
+      const pegPrice = pegUsdbcFromUsdcPrice(usdcPrice);
+      const aaveUsdbc = (await fetchAaveAssetPrices(input.client, oracle, [asset])).get(
+        asset.toLowerCase(),
+      );
+      if (aaveUsdbc !== undefined && !isPegDivergenceAcceptable(pegPrice, aaveUsdbc)) {
+        input.logger.warn("oracle_peg_divergence_warn", {
+          asset,
+          pegDivergenceBps: pegDivergenceBps(pegPrice, aaveUsdbc),
+          pegPriceWad18: pegPrice.toString(),
+          aavePriceBase8: aaveUsdbc.toString(),
+        });
+      }
+      registerPegPrice(input.model, asset, pegPrice, BASE_USDC, input.logger, nowSec);
+      refreshed += 1;
+    }
+
+    input.logger.info("oracle_gap_fill_refresh_complete", {
+      refreshed,
+      failedCount: failed.length,
+      failed: failed.slice(0, 20),
+    });
+    return { refreshed, failed };
+  } catch (error) {
+    input.logger.warn("oracle_gap_fill_refresh_failed", { error: String(error) });
+    return { refreshed: 0, failed: assets };
+  }
+}
+
 export function logOracleBootstrapCoverage(model: LocalPositionModel, logger: LoggerLike): void {
   const coverage = computeOracleCoverage(model);
   logger.info("oracle_bootstrap_coverage", {

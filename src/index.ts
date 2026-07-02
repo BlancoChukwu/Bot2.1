@@ -1242,6 +1242,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
           void eventPurityStack.refreshFeedFreshness(latestKnownBlock).catch((error) => {
             logger.warn("feed_freshness_poll_failed", { error: String(error) });
           });
+          void eventPurityStack.refreshGapFillPrices().catch((error) => {
+            logger.warn("gap_fill_refresh_poll_failed", { error: String(error) });
+          });
         }, config.oraclePollIntervalMs);
         shutdown.addHook("event_purity_feed_freshness_poll_stop", async () => {
           clearInterval(feedFreshnessPollTimer);

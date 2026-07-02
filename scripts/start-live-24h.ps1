@@ -20,13 +20,9 @@ $env:NODE_OPTIONS = "--max-old-space-size=650 --expose-gc"
 
 $log = "logs/live-24h-20260521.log"
 $errLog = "logs/live-24h-20260521.err.log"
-Write-Host "Starting single bot instance; appending to $log"
+Write-Host "Starting single bot instance via PM2; session logs at $log"
 
-# One detached cmd wrapper -> one node process; UTF-8 append.
-Start-Process -FilePath "cmd.exe" `
-  -ArgumentList "/c", "chcp 65001>nul && node dist/src/index.js >> `"$log`" 2>> `"$errLog`"" `
-  -WorkingDirectory (Get-Location) `
-  -WindowStyle Hidden
+node scripts/pm2-bot-launch.mjs --output $log --error $errLog | Out-Host
 
 Start-Sleep -Seconds 8
 $st = node scripts/ensure-single-bot.mjs --status | ConvertFrom-Json

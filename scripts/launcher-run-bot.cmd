@@ -58,10 +58,14 @@ if "%USE_START_LIVE%"=="1" (
   echo Starting: npm run start:live
   call npm run start:live >> "%LOGFILE%" 2>> "%ERRFILE%"
 ) else (
-  echo Starting: node dist\src\index.js
-  call node dist\src\index.js >> "%LOGFILE%" 2>> "%ERRFILE%"
+  echo Starting via PM2: ecosystem.config.cjs
+  call node scripts\pm2-bot-launch.mjs --output "%LOGFILE%" --error "%ERRFILE%"
+  set EXIT_CODE=0
+  echo.
+  echo Bot supervised by PM2. Tail: pm2 logs aave-liquidator-base
+  echo Session log: %LOGFILE%
+  goto :done
 )
-set EXIT_CODE=%ERRORLEVEL%
 
 >> "%LOGFILE%" echo.
 >> "%LOGFILE%" echo {"msg":"launcher_session_exit","exitCode":%EXIT_CODE%,"logFile":"%LOGFILE%","errFile":"%ERRFILE%","time":"%LOGSTAMP%"}
