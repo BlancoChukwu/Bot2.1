@@ -9,6 +9,7 @@ export interface OracleCoverageSnapshot {
   readonly blindAssets: number;
   readonly coveredPct: number;
   readonly blindPositionCount: number;
+  readonly blindAssetAddresses: readonly Address[];
 }
 
 export function collectAssetsNeedingGapFill(model: LocalPositionModel): Address[] {
@@ -28,6 +29,33 @@ export function collectAssetsNeedingGapFill(model: LocalPositionModel): Address[
     }
   }
   return [...needed].map((key) => key as Address);
+}
+
+export function collectBlindAssetAddresses(
+  model: LocalPositionModel,
+  limit = 20,
+): readonly Address[] {
+  const slotCounts = new Map<string, number>();
+  for (const position of model.positions.values()) {
+    if (!position.isFullySeeded) {
+      continue;
+    }
+    for (const assetKey of [...position.collateral.keys(), ...position.debt.keys()]) {
+      const collateral = position.collateral.get(assetKey) ?? 0n;
+      const debt = position.debt.get(assetKey) ?? 0n;
+      if (collateral === 0n && debt === 0n) {
+        continue;
+      }
+      const price = model.prices.get(assetKey);
+      if (price === undefined || price === PLACEHOLDER_PRICE) {
+        slotCounts.set(assetKey, (slotCounts.get(assetKey) ?? 0) + 1);
+      }
+    }
+  }
+  return [...slotCounts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, limit)
+    .map(([assetKey]) => assetKey as Address);
 }
 
 export function computeOracleCoverage(model: LocalPositionModel): OracleCoverageSnapshot {
@@ -71,5 +99,6 @@ export function computeOracleCoverage(model: LocalPositionModel): OracleCoverage
     blindAssets,
     coveredPct,
     blindPositionCount,
+    blindAssetAddresses: collectBlindAssetAddresses(model),
   };
 }

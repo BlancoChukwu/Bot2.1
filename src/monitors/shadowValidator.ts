@@ -3,6 +3,14 @@ import type { EventPurityConfig } from "../config/eventPurityConfig";
 import type { LoggerLike } from "../bot";
 import { MAX_HF_WAD, type LocalPositionModel } from "./localPositionModel";
 import { computeShadowDriftBps } from "./localPositionHfPolicy";
+import {
+  collectPositionAssets,
+  recordAssetDrift,
+  SHADOW_DRIFT_ATTRIBUTION_TOP_N,
+  topAssetDriftAttribution,
+  type AssetDriftAttribution,
+  type DriftBucketAccumulator,
+} from "./shadowDriftAttribution";
 import { poolEmodeAbi } from "./aaveEmode";
 import { aavePoolAbi } from "../protocols/aaveV3";
 
@@ -42,6 +50,7 @@ export interface ShadowMetricsSnapshot {
   readonly driftToleranceBps: number;
   readonly fnRateTargetPct: number;
   readonly tuningBucket: "non_eMode";
+  readonly driftByAsset: readonly AssetDriftAttribution[];
 }
 
 export interface ShadowValidatorConfig {
@@ -50,6 +59,7 @@ export interface ShadowValidatorConfig {
   readonly model: LocalPositionModel;
   readonly purity: EventPurityConfig;
   readonly logger: LoggerLike;
+  readonly startedAtMs?: number;
 }
 
 interface BucketAccumulator {
@@ -63,11 +73,21 @@ export class ShadowValidator {
   private samplesToday = 0;
   private dayKey = "";
   private sampleCounter = 0;
+  private inFlightSamples = 0;
+  private skippedDueToConcurrency = 0;
   private readonly nonEModeBucket: BucketAccumulator = emptyBucket();
   private readonly eModeBucket: BucketAccumulator = emptyBucket();
+  private readonly assetDriftBuckets = new Map<string, DriftBucketAccumulator>();
   private lastAggregateLogAt = 0;
+  private readonly startedAtMs: number;
 
-  public constructor(private readonly config: ShadowValidatorConfig) {}
+  public constructor(private readonly config: ShadowValidatorConfig) {
+    this.startedAtMs = config.startedAtMs ?? Date.now();
+  }
+
+  public getQueueDepth(): number {
+    return this.inFlightSamples;
+  }
 
   public maybeSample(account: Address, blockNumber: bigint, nowSec?: number): Promise<ShadowSample | undefined> {
     const position = this.config.model.positions.get(account.toLowerCase());
@@ -82,6 +102,7 @@ export class ShadowValidator {
         account,
         reason: "price_incomplete",
         missingCount: hfResult.missingAssets.length,
+        missingAssets: hfResult.missingAssets.slice(0, 8),
         blockNumber: Number(blockNumber),
       });
       return Promise.resolve(undefined);
@@ -115,10 +136,33 @@ export class ShadowValidator {
       return Promise.resolve(undefined);
     }
     this.sampleCounter += 1;
-    if (this.sampleCounter % this.config.purity.shadowSampleRate !== 0) {
+    const effectiveSampleRate = this.effectiveSampleRate();
+    if (this.sampleCounter % effectiveSampleRate !== 0) {
+      return Promise.resolve(undefined);
+    }
+    if (this.inFlightSamples >= this.config.purity.shadowMaxConcurrency) {
+      this.skippedDueToConcurrency += 1;
+      if (this.skippedDueToConcurrency === 1 || this.skippedDueToConcurrency % 100 === 0) {
+        this.config.logger.info("shadow_sample_skipped", {
+          account,
+          reason: "concurrency_cap",
+          inFlight: this.inFlightSamples,
+          maxConcurrency: this.config.purity.shadowMaxConcurrency,
+          skippedTotal: this.skippedDueToConcurrency,
+          blockNumber: Number(blockNumber),
+        });
+      }
       return Promise.resolve(undefined);
     }
     return this.sample(account, localHfWad, blockNumber);
+  }
+
+  private effectiveSampleRate(): number {
+    const rampMs = this.config.purity.shadowBootstrapRampMs;
+    if (Date.now() - this.startedAtMs >= rampMs) {
+      return this.config.purity.shadowSampleRate;
+    }
+    return this.config.purity.shadowSampleRate * this.config.purity.shadowBootstrapSampleRateMultiplier;
   }
 
   private skipReason(account: Address, localHfWad: bigint): string | undefined {
@@ -143,6 +187,7 @@ export class ShadowValidator {
       return undefined;
     }
     this.samplesToday += 1;
+    this.inFlightSamples += 1;
 
     let accountData: readonly [bigint, bigint, bigint, bigint, bigint, bigint];
     let eModeRaw: bigint;
@@ -168,6 +213,8 @@ export class ShadowValidator {
         error: error instanceof Error ? error.message : String(error),
       });
       return undefined;
+    } finally {
+      this.inFlightSamples = Math.max(0, this.inFlightSamples - 1);
     }
 
     const eModeCategoryId = Number(eModeRaw);
@@ -186,6 +233,15 @@ export class ShadowValidator {
     }
     if (isFalseNegative) {
       bucket.falseNegativeCount += 1;
+    }
+
+    const position = this.config.model.positions.get(account.toLowerCase());
+    if (position !== undefined) {
+      recordAssetDrift(
+        this.assetDriftBuckets,
+        collectPositionAssets(position),
+        driftBps,
+      );
     }
 
     const result: ShadowSample = {
@@ -237,6 +293,7 @@ export class ShadowValidator {
       driftToleranceBps,
       fnRateTargetPct,
       tuningBucket: "non_eMode",
+      driftByAsset: topAssetDriftAttribution(this.assetDriftBuckets, SHADOW_DRIFT_ATTRIBUTION_TOP_N),
     };
   }
 
@@ -265,6 +322,7 @@ export class ShadowValidator {
       non_eMode_within_fn_target: snapshot.nonEMode.withinFnRateTarget,
       drift_tolerance_bps: snapshot.driftToleranceBps,
       fn_rate_target_pct: snapshot.fnRateTargetPct,
+      shadow_drift_by_asset: snapshot.driftByAsset,
     });
   }
 

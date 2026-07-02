@@ -82,11 +82,47 @@ describe("shadowValidator segmented metrics", () => {
       shadow_drift_eMode_bps: expect.any(Number),
       shadow_fn_rate_non_eMode_pct: expect.any(Number),
       shadow_fn_rate_eMode_pct: expect.any(Number),
+      shadow_drift_by_asset: expect.any(Array),
       tuningBucket: "non_eMode",
     });
   });
 
-  it("skips shadow sample when recompute hits price_incomplete", async () => {
+  it("attributes drift to position assets in aggregate output", async () => {
+    const weth = "0x4200000000000000000000000000000000000006" as Address;
+    model.markPricesBootstrapped();
+    model.registerBootstrapPrice(weth, 3_000_000_000_000_000_000n, {
+      answer: 300_000_000_000n,
+      decimals: 8,
+      updatedAt: Math.floor(Date.now() / 1000),
+      feedAddress: "0x71041dddad3595F9CEd3dCCFBe3D1F4b0a16Bb70",
+      asset: weth,
+    });
+    model.seedFromOnChainSnapshot({
+      account: userNonEmode,
+      blockNumber: 10n,
+      eModeCategoryId: 0,
+      healthFactorWad: 1_100_000_000_000_000_000n,
+      totalCollateralBase: 1_000n,
+      totalDebtBase: 100n,
+      liquidationThreshold: 8_500n,
+      reserves: [{ asset: weth, scaledCollateral: 1_000n, scaledDebt: 0n }],
+    });
+
+    const shadow = new ShadowValidator({
+      client: makeClient(),
+      poolAddress: pool,
+      model,
+      purity,
+      logger,
+    });
+    await shadow.sample(userNonEmode, 1_200_000_000_000_000_000n, 100n);
+
+    const snapshot = shadow.getMetricsSnapshot();
+    expect(snapshot.driftByAsset.length).toBeGreaterThan(0);
+    expect(snapshot.driftByAsset[0]?.asset.toLowerCase()).toBe(weth.toLowerCase());
+  });
+
+  it("logs missing assets when shadow sampling is skipped for price gaps", async () => {
     model.markPricesBootstrapped();
     const shadow = new ShadowValidator({
       client: makeClient(),
@@ -115,6 +151,77 @@ describe("shadowValidator segmented metrics", () => {
       (call) => call[0] === "shadow_sample_skipped" && call[1]?.reason === "price_incomplete",
     );
     expect(skipCall).toBeDefined();
+    expect(skipCall?.[1]?.missingAssets?.length).toBeGreaterThan(0);
+  });
+
+  it("enforces shadow concurrency cap", async () => {
+    const cappedPurity = parseEventPurityConfig({
+      SHADOW_DRIFT_TOLERANCE_BPS: "50",
+      SHADOW_FN_RATE_TARGET_PCT: "1.0",
+      SHADOW_MAX_CONCURRENCY: "1",
+      SHADOW_SAMPLE_RATE: "1",
+      SHADOW_BOOTSTRAP_RAMP_MS: "1",
+      SHADOW_BOOTSTRAP_SAMPLE_RATE_MULTIPLIER: "1",
+    });
+    model.markPricesBootstrapped();
+    model.registerBootstrapPrice(
+      "0x4200000000000000000000000000000000000006" as Address,
+      3_000_000_000_000_000_000n,
+      {
+        answer: 300_000_000_000n,
+        decimals: 8,
+        updatedAt: Math.floor(Date.now() / 1000),
+        feedAddress: "0x71041dddad3595F9CEd3dCCFBe3D1F4b0a16Bb70",
+        asset: "0x4200000000000000000000000000000000000006" as Address,
+      },
+    );
+    model.seedFromOnChainSnapshot({
+      account: userNonEmode,
+      blockNumber: 10n,
+      eModeCategoryId: 0,
+      healthFactorWad: 1_100_000_000_000_000_000n,
+      totalCollateralBase: 1_000n,
+      totalDebtBase: 100n,
+      liquidationThreshold: 8_500n,
+      reserves: [{
+        asset: "0x4200000000000000000000000000000000000006" as Address,
+        scaledCollateral: 1_000n,
+        scaledDebt: 0n,
+      }],
+    });
+
+    let releaseFirst: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const gatedClient = {
+      readContract: vi.fn(async (request: Parameters<PublicClient["readContract"]>[0]) => {
+        if (request.functionName === "getUserEMode") {
+          return 0n;
+        }
+        await gate;
+        return [0n, 1_000n, 0n, 8_500n, 8_500n, 900_000_000_000_000_000n];
+      }),
+    } as unknown as PublicClient;
+
+    const shadow = new ShadowValidator({
+      client: gatedClient,
+      poolAddress: pool,
+      model,
+      purity: cappedPurity,
+      logger,
+      startedAtMs: Date.now() - 1_000_000,
+    });
+
+    const first = shadow.maybeSample(userNonEmode, 100n);
+    const second = shadow.maybeSample(userNonEmode, 101n);
+    expect(shadow.getQueueDepth()).toBe(1);
+    releaseFirst?.();
+    await first;
+    await second;
+    expect((logger.info as ReturnType<typeof vi.fn>).mock.calls.some(
+      (call) => call[0] === "shadow_sample_skipped" && call[1]?.reason === "concurrency_cap",
+    )).toBe(true);
   });
 
   it("returns undefined when on-chain read fails instead of throwing", async () => {

@@ -14,6 +14,10 @@ export const BASE_GHO = "0x6Bb7a212910682DCFdbd5BCBb3e28FB4E8da10Ee" as Address;
 export const BASE_EURC = "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42" as Address;
 export const BASE_WSTETH = "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452" as Address;
 export const BASE_WEETH = "0x04C0599Ae5A44757c0af6F9eC3b93da8976c150A" as Address;
+export const BASE_AAVE = "0x63706e401c06ac8513145b7687a14804d17f814b" as Address;
+export const BASE_TBTC = "0x236aa50979d5f3de3bd1eeb40e81137f22ab794b" as Address;
+export const BASE_SYRUP_USDC = "0x660975730059246a68521a3e2fbd4740173100f5" as Address;
+export const BASE_LBTC = "0xecac9c5f704e954931349da37f60e39f515c11c1" as Address;
 
 /** Assets priced via Aave `getAssetPrice` on the event-purity cold path. */
 export const BASE_AAVE_PRICED_ASSETS: readonly Address[] = [
@@ -22,6 +26,10 @@ export const BASE_AAVE_PRICED_ASSETS: readonly Address[] = [
   BASE_EURC,
   BASE_WSTETH,
   BASE_WEETH,
+  BASE_AAVE,
+  BASE_TBTC,
+  BASE_SYRUP_USDC,
+  BASE_LBTC,
 ] as const;
 
 export const BASE_PEG_ASSETS: readonly Address[] = [BASE_USDBC] as const;
