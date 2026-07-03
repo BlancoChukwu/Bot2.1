@@ -224,7 +224,7 @@ export async function refreshGapFillPrices(input: {
   readonly logger: LoggerLike;
   readonly oracle?: Address;
   readonly nowSec?: number;
-}): Promise<{ refreshed: number; failed: readonly Address[] }> {
+}): Promise<{ refreshed: number; failed: readonly Address[]; targetCount: number }> {
   const oracle = input.oracle ?? BASE_AAVE_ORACLE;
   const nowSec = input.nowSec ?? Math.floor(Date.now() / 1000);
   const assets = BASE_GAP_FILL_ASSETS.filter((asset) =>
@@ -232,7 +232,11 @@ export async function refreshGapFillPrices(input: {
   );
 
   if (assets.length === 0) {
-    return { refreshed: 0, failed: [] };
+    input.logger.info("oracle_gap_fill_refresh_skipped", {
+      reason: "no_registered_gap_fill_reserves",
+      targetCount: 0,
+    });
+    return { refreshed: 0, failed: [], targetCount: 0 };
   }
 
   input.logger.info("oracle_gap_fill_refresh_start", {
@@ -298,10 +302,10 @@ export async function refreshGapFillPrices(input: {
       targetCount: assets.length,
       failed: failed.slice(0, 20),
     });
-    return { refreshed, failed };
+    return { refreshed, failed, targetCount: assets.length };
   } catch (error) {
     input.logger.warn("oracle_gap_fill_refresh_failed", { error: String(error) });
-    return { refreshed: 0, failed: assets };
+    return { refreshed: 0, failed: assets, targetCount: assets.length };
   }
 }
 

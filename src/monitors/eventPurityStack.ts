@@ -400,6 +400,13 @@ export class EventPurityStack {
 
   public async refreshGapFillPrices(): Promise<void> {
     if (!this.pricesBootstrapped) {
+      this.config.logger.info("gap_fill_refresh_poll_result", {
+        refreshed: 0,
+        failedCount: 0,
+        targetCount: 0,
+        skipped: true,
+        skipReason: "prices_not_bootstrapped",
+      });
       return;
     }
     const result = await refreshGapFillPrices({
@@ -410,6 +417,7 @@ export class EventPurityStack {
     this.config.logger.info("gap_fill_refresh_poll_result", {
       refreshed: result.refreshed,
       failedCount: result.failed.length,
+      targetCount: result.targetCount,
     });
     if (result.failed.length > 0) {
       this.config.logger.warn("oracle_gap_fill_refresh_partial", {

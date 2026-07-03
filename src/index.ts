@@ -1239,6 +1239,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       await eventPurityStack.start();
       if (config.chain === "base") {
         const feedFreshnessPollTimer = setInterval(() => {
+          logger.info("oracle_poll_tick", {
+            blockNumber: latestKnownBlock.toString(),
+          });
           void eventPurityStack.refreshFeedFreshness(latestKnownBlock).catch((error) => {
             logger.warn("feed_freshness_poll_failed", { error: String(error) });
           });
@@ -1246,6 +1249,11 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
             logger.warn("gap_fill_refresh_poll_failed", { error: String(error) });
           });
         }, config.oraclePollIntervalMs);
+        logger.info("oracle_poll_timer_started", {
+          intervalMs: config.oraclePollIntervalMs,
+          chain: config.chain,
+          tasks: ["feed_freshness", "gap_fill_refresh"],
+        });
         shutdown.addHook("event_purity_feed_freshness_poll_stop", async () => {
           clearInterval(feedFreshnessPollTimer);
         });

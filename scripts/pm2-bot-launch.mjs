@@ -4,7 +4,7 @@
  * Usage: node scripts/pm2-bot-launch.mjs [--output <log>] [--error <err>]
  */
 import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -53,3 +53,16 @@ const logFlags = [
 ].filter(Boolean).join(" ");
 
 run(`pm2 start ecosystem.config.cjs ${logFlags} --update-env`.trim());
+
+if (output) {
+  appendFileSync(
+    output,
+    `${JSON.stringify({
+      level: 30,
+      time: new Date().toISOString(),
+      msg: "pm2_supervisor_started",
+      app: appName,
+    })}\n`,
+    "utf8",
+  );
+}

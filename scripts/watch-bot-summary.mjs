@@ -71,6 +71,8 @@ const counts = {
   position_on_chain_reconcile_failed: 0,
   shadow_sample_skipped: 0,
   event_purity_liquidatable_candidate: 0,
+  gap_fill_refresh_poll_result: 0,
+  oracle_poll_tick: 0,
   hybrid_detection_failure: 0,
   partial_bootstrap_getlogs_retry: 0,
   hf_price_gap_summary: 0,
@@ -81,6 +83,7 @@ let lastTs;
 let lastMemory;
 let lastRuntimeSnapshot;
 let lastShadowAggregate;
+let lastGapFillRefresh;
 let wsStarted = false;
 const rssSamples = [];
 const recentCritical = [];
@@ -145,6 +148,18 @@ for (const rawLine of readLogLines(logPath)) {
         nonEModeWithinFnTarget: row.non_eMode_within_fn_target,
       };
       break;
+    case "gap_fill_refresh_poll_result":
+      lastGapFillRefresh = {
+        time: row.time,
+        refreshed: row.refreshed,
+        failedCount: row.failedCount,
+        targetCount: row.targetCount,
+        skipped: row.skipped,
+        skipReason: row.skipReason,
+      };
+      break;
+    case "oracle_poll_timer_started":
+      break;
     case "hf_price_gap_summary":
       counts.hf_price_gap_summary += 1;
       break;
@@ -204,6 +219,14 @@ if (lastMemory) {
 }
 console.log(`  Reconcile:    ok=${counts.position_first_touch_reconciled} skipped=${counts.position_first_touch_reconcile_skipped} failed=${counts.position_on_chain_reconcile_failed}`);
 console.log(`  Candidates:   ${counts.event_purity_liquidatable_candidate} liquidatable | bootstrap retries=${counts.partial_bootstrap_getlogs_retry}`);
+if (lastGapFillRefresh || counts.gap_fill_refresh_poll_result > 0) {
+  const tickNote = counts.oracle_poll_tick > 0 ? ` ticks=${counts.oracle_poll_tick}` : "";
+  console.log(
+    `  Gap-fill:     polls=${counts.gap_fill_refresh_poll_result}${tickNote} last refreshed=${lastGapFillRefresh?.refreshed ?? "?"} target=${lastGapFillRefresh?.targetCount ?? "?"} failed=${lastGapFillRefresh?.failedCount ?? "?"}`,
+  );
+} else {
+  console.log("  Gap-fill:     no refresh poll logs (rebuild + restart required)");
+}
 console.log(`  Critical:     level50=${counts.critical_errors} ceiling=${counts.memory_ceiling_hit} hybrid_fail=${counts.hybrid_detection_failure}`);
 if (recentCritical.length > 0) {
   console.log("  Recent critical:");

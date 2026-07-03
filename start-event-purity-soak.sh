@@ -20,6 +20,11 @@ export SIMULATION_MODE=true
 export SKIP_DEPLOYMENT_SAFETY_GATE=true
 
 npm run bot:stop
+if ! command -v pm2 >/dev/null 2>&1; then
+  echo "pm2 not found — install with: npm i -g pm2"
+  exit 1
+fi
+git pull --ff-only origin master
 node scripts/ensure-redis.mjs
 npm run build
 node scripts/preflight-event-purity-env.mjs "$DOTENV_CONFIG_PATH"
