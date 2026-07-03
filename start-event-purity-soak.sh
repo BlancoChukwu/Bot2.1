@@ -25,6 +25,7 @@ if ! command -v pm2 >/dev/null 2>&1; then
   exit 1
 fi
 git pull --ff-only origin master
+echo "git_head=$(git rev-parse --short HEAD)"
 node scripts/ensure-redis.mjs
 npm run build
 node scripts/preflight-event-purity-env.mjs "$DOTENV_CONFIG_PATH"

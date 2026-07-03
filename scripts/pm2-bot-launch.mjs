@@ -21,13 +21,43 @@ function readFlag(flag) {
 const output = readFlag("--output");
 const error = readFlag("--error");
 
-function run(command) {
-  execSync(command, { cwd: repoRoot, stdio: "inherit" });
+function logLaunchEvent(msg, extra = {}) {
+  if (!output) return;
+  appendFileSync(
+    output,
+    `${JSON.stringify({
+      level: 30,
+      time: new Date().toISOString(),
+      msg,
+      ...extra,
+    })}\n`,
+    "utf8",
+  );
 }
 
-function pm2Describe() {
+function resolvePm2Bin() {
+  const pathPrefixes = [
+    process.env.PATH ?? "",
+    "/usr/local/bin",
+    "/usr/bin",
+    `${process.env.HOME ?? ""}/.local/bin`,
+    `${process.env.HOME ?? ""}/.npm-global/bin`,
+  ].join(":");
+  const env = { ...process.env, PATH: pathPrefixes };
   try {
-    execSync(`pm2 describe ${appName}`, { cwd: repoRoot, stdio: "ignore" });
+    return execSync("command -v pm2", { encoding: "utf8", env, cwd: repoRoot }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function runPm2(pm2Bin, command) {
+  execSync(`${pm2Bin} ${command}`, { cwd: repoRoot, stdio: "inherit", env: process.env });
+}
+
+function pm2Describe(pm2Bin) {
+  try {
+    execSync(`${pm2Bin} describe ${appName}`, { cwd: repoRoot, stdio: "ignore", env: process.env });
     return true;
   } catch {
     return false;
@@ -39,30 +69,40 @@ if (!existsSync(join(repoRoot, "dist", "src", "index.js"))) {
   process.exit(1);
 }
 
-try {
-  if (pm2Describe()) {
-    run(`pm2 delete ${appName}`);
-  }
-} catch {
-  // ignore stale pm2 state
+const pm2Bin = resolvePm2Bin();
+if (pm2Bin === undefined) {
+  logLaunchEvent("pm2_launch_failed", { error: "pm2 binary not found in PATH" });
+  console.error("pm2 not found — install with: npm i -g pm2");
+  process.exit(1);
 }
 
-const logFlags = [
-  output ? `--output ${JSON.stringify(output)}` : "",
-  error ? `--error ${JSON.stringify(error)}` : "",
-].filter(Boolean).join(" ");
+try {
+  if (pm2Describe(pm2Bin)) {
+    runPm2(pm2Bin, `delete ${appName}`);
+  }
 
-run(`pm2 start ecosystem.config.cjs ${logFlags} --update-env`.trim());
+  const logFlags = [
+    output ? `--output ${JSON.stringify(output)}` : "",
+    error ? `--error ${JSON.stringify(error)}` : "",
+  ].filter(Boolean).join(" ");
 
-if (output) {
-  appendFileSync(
-    output,
-    `${JSON.stringify({
-      level: 30,
-      time: new Date().toISOString(),
-      msg: "pm2_supervisor_started",
-      app: appName,
-    })}\n`,
-    "utf8",
-  );
+  runPm2(pm2Bin, `start ecosystem.config.cjs ${logFlags} --update-env`.trim());
+
+  if (!pm2Describe(pm2Bin)) {
+    throw new Error("pm2 describe failed after start");
+  }
+
+  logLaunchEvent("pm2_supervisor_started", {
+    app: appName,
+    pm2Bin,
+    dotenv: process.env.DOTENV_CONFIG_PATH,
+    simulationMode: process.env.SIMULATION_MODE,
+  });
+} catch (launchError) {
+  logLaunchEvent("pm2_launch_failed", {
+    error: launchError instanceof Error ? launchError.message : String(launchError),
+    pm2Bin,
+  });
+  console.error("pm2 launch failed:", launchError);
+  process.exit(1);
 }

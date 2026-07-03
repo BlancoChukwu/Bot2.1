@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const logFile = resolve(process.argv[2] ?? "");
 if (!logFile) {
   console.error("usage: node scripts/verify-bot-launch.mjs <log-file>");
@@ -30,6 +32,19 @@ if (text.includes("deployment_safety_gate_blocked")) {
   process.exit(1);
 }
 
+if (text.includes("pm2_launch_failed")) {
+  console.error("PM2 LAUNCH FAILED — see log:");
+  console.error(text.trim().split(/\r?\n/).slice(-8).join("\n"));
+  process.exit(1);
+}
+
+let sessionMeta = "";
+const sessionMetaPath = join(repoRoot, "logs", "latest-session.txt");
+if (existsSync(sessionMetaPath)) {
+  sessionMeta = readFileSync(sessionMetaPath, "utf8");
+}
+const expectsPm2 = sessionMeta.includes("pm2_managed=true");
+
 let status;
 try {
   status = JSON.parse(
@@ -45,7 +60,25 @@ if (status.count === 0 && text.length < 80) {
 }
 
 if (status.count > 0) {
-  console.log("Bot running (pid count:", status.count + "). Log:", logFile, "(" + text.length + " bytes)");
+  let pm2Managed = false;
+  try {
+    execSync("pm2 describe aave-liquidator-base", { encoding: "utf8", stdio: "ignore" });
+    pm2Managed = true;
+  } catch {
+    pm2Managed = false;
+  }
+  if (expectsPm2 && !pm2Managed) {
+    console.error("PM2 SUPERVISION MISSING — pm2_managed=true in session but pm2 describe failed");
+    process.exit(1);
+  }
+  console.log(
+    "Bot running (pid count:",
+    status.count + ", pm2:",
+    pm2Managed ? "yes" : "no",
+    "). Log:",
+    logFile,
+    "(" + text.length + " bytes)",
+  );
   process.exit(0);
 }
 

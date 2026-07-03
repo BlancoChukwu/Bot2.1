@@ -16,9 +16,6 @@ module.exports = {
       kill_timeout: 15_000,
       env: {
         NODE_ENV: "production",
-        SIMULATION_MODE: "false",
-        SKIP_DEPLOYMENT_SAFETY_GATE: "false",
-        SKIP_COLD_START_FULL_SWEEP: "true",
       },
     },
   ],

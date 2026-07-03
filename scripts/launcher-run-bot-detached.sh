@@ -61,6 +61,7 @@ export USE_START_LIVE="${USE_START_LIVE:-}"
 export BOT_LOGFILE="$ROOT/$LOGFILE"
 export BOT_ERRFILE="$ROOT/$ERRFILE"
 cd "\$BOT_REPO_ROOT"
+export PATH="\$PATH:/usr/local/bin:\$HOME/.local/bin:\$HOME/.npm-global/bin"
 if [[ "\$USE_START_LIVE" == "1" ]]; then
   npm run start:live >> "\$BOT_LOGFILE" 2>> "\$BOT_ERRFILE"
 else
@@ -80,6 +81,7 @@ chmod +x "$SESSION_FILE"
   echo "dotenv=$DOTENV_CONFIG_PATH"
   echo "detached=true"
   echo "pm2_managed=true"
+  echo "git_head=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "simulation_mode=$SIMULATION_MODE"
 } > logs/latest-session.txt
 
