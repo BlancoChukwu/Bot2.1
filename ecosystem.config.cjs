@@ -11,6 +11,9 @@ module.exports = {
       restart_delay: 5_000,
       node_args: "--max-old-space-size=1024 --expose-gc",
       max_memory_restart: "1200M",
+      merge_logs: false,
+      out_file: process.env.BOT_LOGFILE,
+      error_file: process.env.BOT_ERRFILE,
       // Fine while ENABLE_LIVE_TX=false; before live tx, confirm shutdown.addHook chain
       // (checkpoint close, in-flight execution drain) completes within this window.
       kill_timeout: 15_000,

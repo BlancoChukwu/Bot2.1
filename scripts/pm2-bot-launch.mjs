@@ -81,12 +81,14 @@ try {
     runPm2(pm2Bin, `delete ${appName}`);
   }
 
-  const logFlags = [
-    output ? `--output ${JSON.stringify(output)}` : "",
-    error ? `--error ${JSON.stringify(error)}` : "",
-  ].filter(Boolean).join(" ");
+  if (output) {
+    process.env.BOT_LOGFILE = output;
+  }
+  if (error) {
+    process.env.BOT_ERRFILE = error;
+  }
 
-  runPm2(pm2Bin, `start ecosystem.config.cjs ${logFlags} --update-env`.trim());
+  runPm2(pm2Bin, "start ecosystem.config.cjs --update-env");
 
   if (!pm2Describe(pm2Bin)) {
     throw new Error("pm2 describe failed after start");
@@ -97,6 +99,8 @@ try {
     pm2Bin,
     dotenv: process.env.DOTENV_CONFIG_PATH,
     simulationMode: process.env.SIMULATION_MODE,
+    logFile: process.env.BOT_LOGFILE,
+    errFile: process.env.BOT_ERRFILE,
   });
 } catch (launchError) {
   logLaunchEvent("pm2_launch_failed", {
