@@ -42,6 +42,12 @@ resolve_log_file() {
     echo "$LOG_FILE"
     return
   fi
+  local resolved
+  resolved="$(node scripts/resolve-active-session-log.mjs 2>/dev/null || true)"
+  if [[ -n "$resolved" && -f "$resolved" ]]; then
+    echo "$resolved"
+    return
+  fi
   if [[ -f logs/latest-session.txt ]]; then
     local from_meta
     from_meta="$(grep -E '^log=' logs/latest-session.txt | head -1 | cut -d= -f2- || true)"
@@ -72,10 +78,7 @@ print_session_meta() {
     echo "  (no logs/latest-session.txt — pass --log or start via launcher)"
   fi
   local log_path
-  log_path="$(resolve_log_file)"
-  if [[ -n "$log_path" ]]; then
-    echo "  active_log=$log_path"
-  fi
+  echo "  active_log=$(resolve_log_file)"
 }
 
 print_process_status() {

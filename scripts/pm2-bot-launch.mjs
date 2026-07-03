@@ -4,12 +4,13 @@
  * Usage: node scripts/pm2-bot-launch.mjs [--output <log>] [--error <err>]
  */
 import { execSync } from "node:child_process";
-import { appendFileSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const appName = "aave-liquidator-base";
+const sessionEcosystemPath = join(repoRoot, ".runtime", "pm2-session.config.cjs");
 const args = process.argv.slice(2);
 
 function readFlag(flag) {
@@ -64,6 +65,36 @@ function pm2Describe(pm2Bin) {
   }
 }
 
+function writeSessionEcosystem(outFile, errFile) {
+  mkdirSync(dirname(sessionEcosystemPath), { recursive: true });
+  const contents = `module.exports = {
+  apps: [
+    {
+      name: ${JSON.stringify(appName)},
+      script: "dist/src/index.js",
+      cwd: ${JSON.stringify(repoRoot)},
+      instances: 1,
+      exec_mode: "fork",
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: "10s",
+      restart_delay: 5_000,
+      node_args: "--max-old-space-size=1024 --expose-gc",
+      max_memory_restart: "1200M",
+      merge_logs: false,
+      out_file: ${JSON.stringify(outFile)},
+      error_file: ${JSON.stringify(errFile)},
+      kill_timeout: 15_000,
+      env: {
+        NODE_ENV: "production",
+      },
+    },
+  ],
+};
+`;
+  writeFileSync(sessionEcosystemPath, contents, "utf8");
+}
+
 if (!existsSync(join(repoRoot, "dist", "src", "index.js"))) {
   console.error("dist/src/index.js missing — run npm run build first");
   process.exit(1);
@@ -81,14 +112,17 @@ try {
     runPm2(pm2Bin, `delete ${appName}`);
   }
 
-  if (output) {
-    process.env.BOT_LOGFILE = output;
-  }
-  if (error) {
-    process.env.BOT_ERRFILE = error;
+  const outFile = output ? resolve(output) : undefined;
+  const errFile = error ? resolve(error) : outFile;
+  if (outFile === undefined || errFile === undefined) {
+    throw new Error("pm2 launch requires --output and --error session log paths");
   }
 
-  runPm2(pm2Bin, "start ecosystem.config.cjs --update-env");
+  process.env.BOT_LOGFILE = outFile;
+  process.env.BOT_ERRFILE = errFile;
+  writeSessionEcosystem(outFile, errFile);
+
+  runPm2(pm2Bin, `start ${JSON.stringify(sessionEcosystemPath)} --update-env`);
 
   if (!pm2Describe(pm2Bin)) {
     throw new Error("pm2 describe failed after start");
@@ -99,8 +133,8 @@ try {
     pm2Bin,
     dotenv: process.env.DOTENV_CONFIG_PATH,
     simulationMode: process.env.SIMULATION_MODE,
-    logFile: process.env.BOT_LOGFILE,
-    errFile: process.env.BOT_ERRFILE,
+    logFile: outFile,
+    errFile,
   });
 } catch (launchError) {
   logLaunchEvent("pm2_launch_failed", {
