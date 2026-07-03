@@ -103,6 +103,10 @@ export class WsEventLayer {
     this.wsClient = undefined;
   }
 
+  public getActiveSubscriptionCount(): number {
+    return this.wsClient?.getActiveSubscriptionCount() ?? 0;
+  }
+
   private async runBootstrapOrGapFill(): Promise<void> {
     const last = await this.config.checkpoint.loadLastProcessedBlock();
     const head = await this.config.executionClient.getBlockNumber();

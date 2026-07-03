@@ -76,6 +76,11 @@ export class FlashblocksWsClient {
     }
     this.ws?.close();
     this.ws = undefined;
+    this.subscriptions.clear();
+  }
+
+  public getActiveSubscriptionCount(): number {
+    return this.subscriptions.size;
   }
 
   private async connect(
