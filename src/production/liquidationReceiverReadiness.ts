@@ -1,6 +1,9 @@
 import type { Address, PublicClient } from "viem";
 import { getChainConfig, type SupportedChain } from "../config/chains";
 
+/** Must match `RECEIVER_VERSION` in `contracts/LiquidationFlashReceiver.sol`. */
+export const EXPECTED_LIQUIDATION_RECEIVER_VERSION = 2n;
+
 /** Minimal ABI for automated startup checks (must match `contracts/LiquidationFlashReceiver.sol`). */
 export const liquidationFlashReceiverAbi = [
   {
@@ -50,8 +53,10 @@ export async function assertLiquidationReceiverReadiness(
     abi: liquidationFlashReceiverAbi,
     functionName: "receiverVersion",
   });
-  if (version !== 1n) {
-    throw new Error(`Liquidation receiver version mismatch: expected 1, got ${version.toString()}`);
+  if (version !== EXPECTED_LIQUIDATION_RECEIVER_VERSION) {
+    throw new Error(
+      `Liquidation receiver version mismatch: expected ${EXPECTED_LIQUIDATION_RECEIVER_VERSION.toString()}, got ${version.toString()}`,
+    );
   }
 
   const expectedPool = getChainConfig(input.chain).aave.pool;

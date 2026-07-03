@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Address } from "viem";
 import { getChainConfig } from "../../src/config/chains";
-import { assertLiquidationReceiverReadiness, liquidationFlashReceiverAbi } from "../../src/production/liquidationReceiverReadiness";
+import {
+  assertLiquidationReceiverReadiness,
+  EXPECTED_LIQUIDATION_RECEIVER_VERSION,
+  liquidationFlashReceiverAbi,
+} from "../../src/production/liquidationReceiverReadiness";
 
 describe("assertLiquidationReceiverReadiness", () => {
   const receiver = "0x0000000000000000000000000000000000000abc" as Address;
@@ -23,12 +27,12 @@ describe("assertLiquidationReceiverReadiness", () => {
     expect(client.readContract).not.toHaveBeenCalled();
   });
 
-  it("throws when version is not 1", async () => {
+  it("throws when version does not match deployed receiver", async () => {
     const client = {
       getBytecode: vi.fn().mockResolvedValue("0x6000"),
       readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
         if (functionName === "receiverVersion") {
-          return 2n;
+          return 1n;
         }
         throw new Error("unexpected");
       }),
@@ -48,7 +52,7 @@ describe("assertLiquidationReceiverReadiness", () => {
       getBytecode: vi.fn().mockResolvedValue("0x6000"),
       readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
         if (functionName === "receiverVersion") {
-          return 1n;
+          return EXPECTED_LIQUIDATION_RECEIVER_VERSION;
         }
         if (functionName === "aavePool") {
           return wrongPool;
@@ -71,7 +75,7 @@ describe("assertLiquidationReceiverReadiness", () => {
       getBytecode: vi.fn().mockResolvedValue("0x6000"),
       readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
         if (functionName === "receiverVersion") {
-          return 1n;
+          return EXPECTED_LIQUIDATION_RECEIVER_VERSION;
         }
         if (functionName === "aavePool") {
           return basePool;
@@ -96,7 +100,7 @@ describe("assertLiquidationReceiverReadiness", () => {
       getBytecode: vi.fn().mockResolvedValue("0x6000"),
       readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
         if (functionName === "receiverVersion") {
-          return 1n;
+          return EXPECTED_LIQUIDATION_RECEIVER_VERSION;
         }
         if (functionName === "aavePool") {
           return basePool;
