@@ -22,6 +22,7 @@
     "replay:liquidation-block": "ts-node scripts/replay-liquidation-block.ts",
     "probe:multicall-base": "ts-node scripts/multicall-batch-probe-base.ts",
     "verify:pre-soak-phase0": "ts-node scripts/verify-pre-soak-phase0.ts",
+    "verify:liquidation-receiver": "ts-node scripts/verify-liquidation-receiver.ts",
     "debug:hf-sweep-base": "ts-node scripts/debug-hf-sweep-base.ts",
     "test:chaos": "vitest run --pool=forks --no-file-parallelism --testNamePattern=chaos",
     "rust:build": "cd rust-hotpath && cargo build --release",

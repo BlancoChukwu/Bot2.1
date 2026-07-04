@@ -3,11 +3,52 @@ import type { Address } from "viem";
 import { getChainConfig } from "../../src/config/chains";
 import {
   assertLiquidationReceiverReadiness,
-  EXPECTED_LIQUIDATION_RECEIVER_VERSION,
+  DEFAULT_LIQUIDATION_RECEIVER_VERSION,
+  fetchOnChainLiquidationReceiverVersion,
   liquidationFlashReceiverAbi,
+  parseExpectedLiquidationReceiverVersion,
+  verifyLiquidationReceiverReadiness,
 } from "../../src/production/liquidationReceiverReadiness";
 
-describe("assertLiquidationReceiverReadiness", () => {
+describe("parseExpectedLiquidationReceiverVersion", () => {
+  it("defaults when env is unset", () => {
+    expect(parseExpectedLiquidationReceiverVersion(undefined)).toBe(DEFAULT_LIQUIDATION_RECEIVER_VERSION);
+  });
+
+  it("parses explicit version from env", () => {
+    expect(parseExpectedLiquidationReceiverVersion("1")).toBe(1n);
+    expect(parseExpectedLiquidationReceiverVersion("2")).toBe(2n);
+  });
+
+  it("rejects invalid values", () => {
+    expect(() => parseExpectedLiquidationReceiverVersion("abc")).toThrow(/non-negative integer/);
+    expect(() => parseExpectedLiquidationReceiverVersion("0")).toThrow(/>= 1/);
+  });
+});
+
+describe("fetchOnChainLiquidationReceiverVersion", () => {
+  const receiver = "0x0000000000000000000000000000000000000abc" as Address;
+
+  it("reads receiverVersion() first", async () => {
+    const client = {
+      readContract: vi.fn().mockResolvedValue(2n),
+    };
+    await expect(fetchOnChainLiquidationReceiverVersion(client, receiver)).resolves.toBe(2n);
+    expect(client.readContract).toHaveBeenCalledWith(expect.objectContaining({ functionName: "receiverVersion" }));
+  });
+
+  it("falls back to RECEIVER_VERSION when getter is absent", async () => {
+    const client = {
+      readContract: vi.fn()
+        .mockRejectedValueOnce(new Error("no getter"))
+        .mockResolvedValueOnce(1n),
+    };
+    await expect(fetchOnChainLiquidationReceiverVersion(client, receiver)).resolves.toBe(1n);
+    expect(client.readContract).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("verifyLiquidationReceiverReadiness", () => {
   const receiver = "0x0000000000000000000000000000000000000abc" as Address;
   const expectedRouter = "0x2626664c2603336E57B271c5C0b26F421741e481" as Address;
   const basePool = getChainConfig("base").aave.pool;
@@ -18,7 +59,7 @@ describe("assertLiquidationReceiverReadiness", () => {
       readContract: vi.fn(),
     };
     await expect(
-      assertLiquidationReceiverReadiness(client, {
+      verifyLiquidationReceiverReadiness(client, {
         chain: "base",
         receiver,
         expectedSwapRouter: expectedRouter,
@@ -27,7 +68,7 @@ describe("assertLiquidationReceiverReadiness", () => {
     expect(client.readContract).not.toHaveBeenCalled();
   });
 
-  it("throws when version does not match deployed receiver", async () => {
+  it("throws when on-chain version does not match configured expectation", async () => {
     const client = {
       getBytecode: vi.fn().mockResolvedValue("0x6000"),
       readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
@@ -38,12 +79,13 @@ describe("assertLiquidationReceiverReadiness", () => {
       }),
     };
     await expect(
-      assertLiquidationReceiverReadiness(client, {
+      verifyLiquidationReceiverReadiness(client, {
         chain: "base",
         receiver,
         expectedSwapRouter: expectedRouter,
+        expectedVersion: 2n,
       }),
-    ).rejects.toThrow(/version mismatch/);
+    ).rejects.toThrow(/version mismatch at .* expected 2 .* on-chain 1/);
   });
 
   it("throws when pool binding mismatches chain config", async () => {
@@ -52,7 +94,7 @@ describe("assertLiquidationReceiverReadiness", () => {
       getBytecode: vi.fn().mockResolvedValue("0x6000"),
       readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
         if (functionName === "receiverVersion") {
-          return EXPECTED_LIQUIDATION_RECEIVER_VERSION;
+          return DEFAULT_LIQUIDATION_RECEIVER_VERSION;
         }
         if (functionName === "aavePool") {
           return wrongPool;
@@ -61,7 +103,7 @@ describe("assertLiquidationReceiverReadiness", () => {
       }),
     };
     await expect(
-      assertLiquidationReceiverReadiness(client, {
+      verifyLiquidationReceiverReadiness(client, {
         chain: "base",
         receiver,
         expectedSwapRouter: expectedRouter,
@@ -75,7 +117,7 @@ describe("assertLiquidationReceiverReadiness", () => {
       getBytecode: vi.fn().mockResolvedValue("0x6000"),
       readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
         if (functionName === "receiverVersion") {
-          return EXPECTED_LIQUIDATION_RECEIVER_VERSION;
+          return DEFAULT_LIQUIDATION_RECEIVER_VERSION;
         }
         if (functionName === "aavePool") {
           return basePool;
@@ -87,7 +129,7 @@ describe("assertLiquidationReceiverReadiness", () => {
       }),
     };
     await expect(
-      assertLiquidationReceiverReadiness(client, {
+      verifyLiquidationReceiverReadiness(client, {
         chain: "base",
         receiver,
         expectedSwapRouter: expectedRouter,
@@ -95,12 +137,12 @@ describe("assertLiquidationReceiverReadiness", () => {
     ).rejects.toThrow(/swap router mismatch/);
   });
 
-  it("resolves when all checks pass", async () => {
+  it("returns on-chain values when all checks pass", async () => {
     const client = {
       getBytecode: vi.fn().mockResolvedValue("0x6000"),
       readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
         if (functionName === "receiverVersion") {
-          return EXPECTED_LIQUIDATION_RECEIVER_VERSION;
+          return DEFAULT_LIQUIDATION_RECEIVER_VERSION;
         }
         if (functionName === "aavePool") {
           return basePool;
@@ -112,18 +154,61 @@ describe("assertLiquidationReceiverReadiness", () => {
       }),
     };
     await expect(
-      assertLiquidationReceiverReadiness(client, {
+      verifyLiquidationReceiverReadiness(client, {
         chain: "base",
         receiver,
         expectedSwapRouter: expectedRouter,
+        expectedVersion: DEFAULT_LIQUIDATION_RECEIVER_VERSION,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({
+      chain: "base",
+      receiver,
+      onChainVersion: DEFAULT_LIQUIDATION_RECEIVER_VERSION,
+      expectedVersion: DEFAULT_LIQUIDATION_RECEIVER_VERSION,
+      boundPool: basePool,
+      boundRouter: expectedRouter,
+    });
+  });
+});
+
+describe("assertLiquidationReceiverReadiness", () => {
+  const receiver = "0x0000000000000000000000000000000000000abc" as Address;
+  const expectedRouter = "0x2626664c2603336E57B271c5C0b26F421741e481" as Address;
+  const basePool = getChainConfig("base").aave.pool;
+
+  it("delegates to verify and returns the readiness result", async () => {
+    const client = {
+      getBytecode: vi.fn().mockResolvedValue("0x6000"),
+      readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
+        if (functionName === "receiverVersion") {
+          return DEFAULT_LIQUIDATION_RECEIVER_VERSION;
+        }
+        if (functionName === "aavePool") {
+          return basePool;
+        }
+        if (functionName === "swapRouter") {
+          return expectedRouter;
+        }
+        throw new Error("unexpected");
+      }),
+    };
+    const result = await assertLiquidationReceiverReadiness(client, {
+      chain: "base",
+      receiver,
+      expectedSwapRouter: expectedRouter,
+    });
+    expect(result.onChainVersion).toBe(DEFAULT_LIQUIDATION_RECEIVER_VERSION);
   });
 });
 
 describe("liquidationFlashReceiverAbi", () => {
-  it("declares receiverVersion, aavePool, swapRouter", () => {
+  it("declares receiverVersion, RECEIVER_VERSION, aavePool, swapRouter", () => {
     const names = liquidationFlashReceiverAbi.map((e) => e.name);
-    expect(names).toEqual(expect.arrayContaining(["receiverVersion", "aavePool", "swapRouter"]));
+    expect(names).toEqual(expect.arrayContaining([
+      "receiverVersion",
+      "RECEIVER_VERSION",
+      "aavePool",
+      "swapRouter",
+    ]));
   });
 });

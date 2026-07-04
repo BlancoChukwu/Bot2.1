@@ -120,7 +120,10 @@ import {
 } from "./indexing/providers";
 import { evaluateDustFilter } from "./protocols/liquidationCandidateFilter";
 import { sendDailyPnlSummary, sendLiquidationAlert } from "./utils/telegramAlert";
-import { assertLiquidationReceiverReadiness } from "./production/liquidationReceiverReadiness";
+import {
+  assertLiquidationReceiverReadiness,
+  parseExpectedLiquidationReceiverVersion,
+} from "./production/liquidationReceiverReadiness";
 import {
   DeploymentSafetyGate,
   GracefulShutdownCoordinator,
@@ -1202,6 +1205,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   const liquidationReceiverExpectedSwapRouter = parseAddress(
     process.env.LIQUIDATION_RECEIVER_EXPECTED_SWAP_ROUTER?.trim(),
   );
+  const liquidationReceiverExpectedVersion = parseExpectedLiquidationReceiverVersion(
+    process.env.LIQUIDATION_RECEIVER_EXPECTED_VERSION,
+  );
   const validateLiquidationReceiverRpc =
     liquidationReceiver !== undefined
     && parseBoolean(process.env.VALIDATE_LIQUIDATION_RECEIVER_RPC, !config.simulationMode);
@@ -1319,16 +1325,22 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
           "Liquidation receiver RPC validation needs a swap router: set LIQUIDATION_RECEIVER_EXPECTED_SWAP_ROUTER or add UniswapV3 to dexRegistry for this chain",
         );
       }
-      await assertLiquidationReceiverReadiness(publicClient, {
+      const receiverReadiness = await assertLiquidationReceiverReadiness(publicClient, {
         chain: config.chain,
         receiver: liquidationReceiver,
         expectedSwapRouter,
+        expectedVersion: liquidationReceiverExpectedVersion,
       });
       logger.info("liquidation_receiver_startup_verified", {
         chain: config.chain,
         receiver: liquidationReceiver,
+        onChainVersion: receiverReadiness.onChainVersion.toString(),
+        expectedVersion: receiverReadiness.expectedVersion.toString(),
+        boundPool: receiverReadiness.boundPool,
         swapRouter: expectedSwapRouter,
+        boundRouter: receiverReadiness.boundRouter,
         swapRouterSource: liquidationReceiverExpectedSwapRouter !== undefined ? "env" : "dex_registry",
+        versionSource: process.env.LIQUIDATION_RECEIVER_EXPECTED_VERSION !== undefined ? "env" : "default",
       });
     }
     if (priceOracleCache !== undefined && config.eventPurity.enableArbitrage) {
