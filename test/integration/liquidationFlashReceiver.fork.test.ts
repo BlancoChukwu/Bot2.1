@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import { getChainConfig } from "../../src/config/chains";
 import { DEFAULT_LIQUIDATION_RECEIVER_VERSION, liquidationFlashReceiverAbi } from "../../src/production/liquidationReceiverReadiness";
@@ -20,6 +21,14 @@ import {
 } from "./helpers/liquidationReceiverForkHarness";
 
 const forkSourceRpc = resolveForkSourceRpc();
+if (forkSourceRpc === undefined) {
+  // eslint-disable-next-line no-console
+  console.warn(JSON.stringify({
+    event: "receiver_fork_tests_skipped",
+    reason: "missing_fork_rpc",
+    hint: "Run via npm run test:receiver-fork with DOTENV_CONFIG_PATH pointing at a profile that sets RPC_URL",
+  }));
+}
 const describeFork = forkSourceRpc === undefined ? describe.skip : describe;
 
 describeFork("LiquidationFlashReceiver v2 HF guard (Base anvil fork)", () => {
