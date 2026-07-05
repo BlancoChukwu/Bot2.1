@@ -133,7 +133,7 @@ async function main(): Promise<void> {
   const addressOut = join(runtimeDir, "receiver-addresses.json");
   writeFileSync(addressOut, JSON.stringify({
     chain: "base",
-    liquidationFlashReceiverV1: deployed,
+    liquidationFlashReceiverV2: deployed,
     multiProtocolFlashReceiverV2: v2Deployed,
     deployedAt: new Date().toISOString(),
   }, null, 2));
