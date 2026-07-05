@@ -14,11 +14,14 @@ import {
   encodeExecuteOperationParams,
   extractRevertMessage,
   findHealthyBorrower,
-  findRecentLiquidationCase,
+  findHistoricalLiquidationCase,
+  isUnderwaterHealthFactor,
   loadLiquidationFlashReceiverArtifact,
   readHealthFactor,
   simulateExecuteOperation,
 } from "./helpers/liquidationReceiverForkHarness";
+
+const WAD = 1_000_000_000_000_000_000n;
 
 const forkSourceRpc = resolveForkSourceRpc();
 if (forkSourceRpc === undefined) {
@@ -89,19 +92,19 @@ describeFork("LiquidationFlashReceiver v2 HF guard (Base anvil fork)", () => {
   }, 60_000);
 
   it("passes the HF guard for a historically liquidatable position (fork block - 1)", async () => {
-    const liquidationCase = await findRecentLiquidationCase(latestClient, pool);
-    expect(liquidationCase.healthFactor).toBeLessThan(1_000_000_000_000_000_000n);
+    const liquidationCase = await findHistoricalLiquidationCase(forkSourceRpc!, pool);
+    expect(liquidationCase.healthFactor).toBeLessThan(WAD);
 
     const historicalFork = await createManagedAnvilFork({
       forkUrl: forkSourceRpc!,
       port: Number(process.env.ANVIL_PORT ?? "8545") + 1,
-      blockNumber: liquidationCase.blockNumber > 0n ? liquidationCase.blockNumber - 1n : 0n,
+      blockNumber: liquidationCase.snapshotBlock,
     });
     try {
       const historicalClient = createForkPublicClient(historicalFork.rpcUrl);
       const historicalReceiver = await deployLiquidationFlashReceiver(historicalFork.rpcUrl, artifact);
       const hfAtFork = await readHealthFactor(historicalClient, pool, liquidationCase.user);
-      expect(hfAtFork).toBeLessThan(1_000_000_000_000_000_000n);
+      expect(isUnderwaterHealthFactor(hfAtFork)).toBe(true);
 
       const params = encodeExecuteOperationParams({
         collateralAsset: liquidationCase.collateralAsset,

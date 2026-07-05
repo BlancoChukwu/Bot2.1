@@ -18,8 +18,11 @@ import { getChainConfig } from "../../../src/config/chains";
 import { getDexesForChain } from "../../../src/config/dexRegistry";
 import { aavePoolAbi } from "../../../src/protocols/aaveV3";
 import { liquidationFlashReceiverAbi } from "../../../src/production/liquidationReceiverReadiness";
+import { createManagedAnvilFork } from "./baseAnvilFork";
 
 const WAD = 1_000_000_000_000_000_000n;
+/** Aave returns type(uint256).max when the account has no debt (infinite HF). */
+const MAX_AAVE_HEALTH_FACTOR = 115792089237316195423570985008687907853269984665640564039457584007913129639935n;
 const HF_PROBE_ACCOUNTS = [
   "0xf109945302561dcbf6bede6a33f36602ae9537c0",
   "0xa7ac810c71781482427ebd7d98255acb0e0375d6",
@@ -54,6 +57,8 @@ export interface LiquidationForkCase {
   readonly debtToCover: bigint;
   readonly receiveAToken: boolean;
   readonly blockNumber: bigint;
+  /** Block where HF was verified < 1e18 (at or before liquidation block). */
+  readonly snapshotBlock: bigint;
   readonly healthFactor: bigint;
 }
 
@@ -116,47 +121,94 @@ export async function findHealthyBorrower(
   throw new Error("No healthy Aave borrower found in probe set — expand HF_PROBE_ACCOUNTS");
 }
 
+export function isUnderwaterHealthFactor(healthFactor: bigint): boolean {
+  return healthFactor > 0n && healthFactor < WAD && healthFactor < MAX_AAVE_HEALTH_FACTOR;
+}
+
+export async function findHistoricalLiquidationCase(
+  forkUrl: string,
+  pool: Address,
+  lookbackBlocks = 2_000_000n,
+): Promise<LiquidationForkCase> {
+  const discoveryPort = Number(process.env.ANVIL_DISCOVERY_PORT ?? String(Number(process.env.ANVIL_PORT ?? "8545") + 3));
+  const discoveryFork = await createManagedAnvilFork({ forkUrl, port: discoveryPort });
+  try {
+    const client = createForkPublicClient(discoveryFork.rpcUrl);
+    const head = await client.getBlockNumber();
+    const fromBlock = head > lookbackBlocks ? head - lookbackBlocks : 0n;
+    const logs = await client.getLogs({
+      address: pool,
+      event: liquidationCallEvent,
+      fromBlock,
+      toBlock: head,
+    });
+    if (logs.length === 0) {
+      throw new Error(`No LiquidationCall events found in last ${lookbackBlocks.toString()} blocks`);
+    }
+
+    for (let index = logs.length - 1; index >= 0; index -= 1) {
+      const log = logs[index];
+      if (log === undefined) {
+        continue;
+      }
+      if (log.args.user === undefined || log.args.collateralAsset === undefined || log.args.debtAsset === undefined) {
+        continue;
+      }
+      if (log.args.debtToCover === undefined || log.args.debtToCover === 0n) {
+        continue;
+      }
+      let matchedHealthFactor: bigint | undefined;
+      let matchedSnapshotBlock: bigint | undefined;
+      const maxLookback = 10n;
+      for (let offset = 1n; offset <= maxLookback; offset += 1n) {
+        if (log.blockNumber < offset) {
+          continue;
+        }
+        const forkBlock = log.blockNumber - offset;
+        await discoveryFork.reset(forkBlock);
+        const healthFactor = await readHealthFactor(client, pool, log.args.user);
+        if (isUnderwaterHealthFactor(healthFactor)) {
+          matchedHealthFactor = healthFactor;
+          matchedSnapshotBlock = forkBlock;
+          break;
+        }
+      }
+      if (matchedHealthFactor === undefined || matchedSnapshotBlock === undefined) {
+        continue;
+      }
+      return {
+        user: log.args.user,
+        collateralAsset: log.args.collateralAsset,
+        debtAsset: log.args.debtAsset,
+        debtToCover: log.args.debtToCover,
+        receiveAToken: log.args.receiveAToken ?? false,
+        blockNumber: log.blockNumber,
+        snapshotBlock: matchedSnapshotBlock,
+        healthFactor: matchedHealthFactor,
+      };
+    }
+
+    throw new Error("No LiquidationCall case with HF < 1e18 at block-1 found in lookback window");
+  } finally {
+    await discoveryFork.stop();
+  }
+}
+
+/** @deprecated Use findHistoricalLiquidationCase — head HF is meaningless after liquidation. */
 export async function findRecentLiquidationCase(
   client: Pick<PublicClient, "getBlockNumber" | "getLogs" | "readContract">,
   pool: Address,
   lookbackBlocks = 2_000_000n,
 ): Promise<LiquidationForkCase> {
-  const head = await client.getBlockNumber();
-  const fromBlock = head > lookbackBlocks ? head - lookbackBlocks : 0n;
-  const logs = await client.getLogs({
-    address: pool,
-    event: liquidationCallEvent,
-    fromBlock,
-    toBlock: head,
-  });
-  if (logs.length === 0) {
-    throw new Error(`No LiquidationCall events found in last ${lookbackBlocks.toString()} blocks`);
+  const forkUrl = process.env.BASE_FORK_RPC_URL
+    ?? process.env.FORK_RPC_URL
+    ?? process.env.EXECUTION_RPC_URL_PRIMARY
+    ?? process.env.RPC_URL
+    ?? process.env.DEPLOY_RECEIVER_RPC_URL;
+  if (forkUrl === undefined || forkUrl.trim() === "") {
+    throw new Error("findRecentLiquidationCase requires fork RPC env — use findHistoricalLiquidationCase");
   }
-
-  for (let index = logs.length - 1; index >= 0; index -= 1) {
-    const log = logs[index];
-    if (log === undefined) {
-      continue;
-    }
-    if (log.args.user === undefined || log.args.collateralAsset === undefined || log.args.debtAsset === undefined) {
-      continue;
-    }
-    if (log.args.debtToCover === undefined || log.args.debtToCover === 0n) {
-      continue;
-    }
-    const healthFactor = await readHealthFactor(client, pool, log.args.user);
-    return {
-      user: log.args.user,
-      collateralAsset: log.args.collateralAsset,
-      debtAsset: log.args.debtAsset,
-      debtToCover: log.args.debtToCover,
-      receiveAToken: log.args.receiveAToken ?? false,
-      blockNumber: log.blockNumber,
-      healthFactor,
-    };
-  }
-
-  throw new Error("No recent liquidatable LiquidationCall case found for fork test");
+  return findHistoricalLiquidationCase(forkUrl.trim(), pool, lookbackBlocks);
 }
 
 export function encodeExecuteOperationParams(input: {
