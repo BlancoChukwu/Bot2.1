@@ -18,6 +18,9 @@ describe("parseExpectedLiquidationReceiverVersion", () => {
   it("parses explicit version from env", () => {
     expect(parseExpectedLiquidationReceiverVersion("1")).toBe(1n);
     expect(parseExpectedLiquidationReceiverVersion("2")).toBe(2n);
+    expect(parseExpectedLiquidationReceiverVersion("3")).toBe(3n);
+    expect(parseExpectedLiquidationReceiverVersion("4")).toBe(4n);
+    expect(parseExpectedLiquidationReceiverVersion("5")).toBe(5n);
   });
 
   it("rejects invalid values", () => {
@@ -138,6 +141,7 @@ describe("verifyLiquidationReceiverReadiness", () => {
   });
 
   it("returns on-chain values when all checks pass", async () => {
+    const initiator = "0x3333333333333333333333333333333333333333" as Address;
     const client = {
       getBytecode: vi.fn().mockResolvedValue("0x6000"),
       readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
@@ -150,6 +154,12 @@ describe("verifyLiquidationReceiverReadiness", () => {
         if (functionName === "swapRouter") {
           return expectedRouter;
         }
+        if (functionName === "authorizedInitiator") {
+          return initiator;
+        }
+        if (functionName === "swapSlippageBps") {
+          return 200n;
+        }
         throw new Error("unexpected");
       }),
     };
@@ -159,6 +169,8 @@ describe("verifyLiquidationReceiverReadiness", () => {
         receiver,
         expectedSwapRouter: expectedRouter,
         expectedVersion: DEFAULT_LIQUIDATION_RECEIVER_VERSION,
+        expectedAuthorizedInitiator: initiator,
+        expectedSwapSlippageBps: 200n,
       }),
     ).resolves.toEqual({
       chain: "base",
@@ -167,7 +179,73 @@ describe("verifyLiquidationReceiverReadiness", () => {
       expectedVersion: DEFAULT_LIQUIDATION_RECEIVER_VERSION,
       boundPool: basePool,
       boundRouter: expectedRouter,
+      boundAuthorizedInitiator: initiator,
+      boundSwapSlippageBps: 200n,
     });
+  });
+
+  it("throws when authorizedInitiator mismatches", async () => {
+    const client = {
+      getBytecode: vi.fn().mockResolvedValue("0x6000"),
+      readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
+        if (functionName === "receiverVersion") {
+          return DEFAULT_LIQUIDATION_RECEIVER_VERSION;
+        }
+        if (functionName === "aavePool") {
+          return basePool;
+        }
+        if (functionName === "swapRouter") {
+          return expectedRouter;
+        }
+        if (functionName === "authorizedInitiator") {
+          return "0x3333333333333333333333333333333333333333" as Address;
+        }
+        if (functionName === "swapSlippageBps") {
+          return 200n;
+        }
+        throw new Error("unexpected");
+      }),
+    };
+    await expect(
+      verifyLiquidationReceiverReadiness(client, {
+        chain: "base",
+        receiver,
+        expectedSwapRouter: expectedRouter,
+        expectedAuthorizedInitiator: "0x4444444444444444444444444444444444444444" as Address,
+      }),
+    ).rejects.toThrow(/authorizedInitiator mismatch/);
+  });
+
+  it("throws when swapSlippageBps mismatches", async () => {
+    const client = {
+      getBytecode: vi.fn().mockResolvedValue("0x6000"),
+      readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
+        if (functionName === "receiverVersion") {
+          return DEFAULT_LIQUIDATION_RECEIVER_VERSION;
+        }
+        if (functionName === "aavePool") {
+          return basePool;
+        }
+        if (functionName === "swapRouter") {
+          return expectedRouter;
+        }
+        if (functionName === "authorizedInitiator") {
+          return "0x3333333333333333333333333333333333333333" as Address;
+        }
+        if (functionName === "swapSlippageBps") {
+          return 200n;
+        }
+        throw new Error("unexpected");
+      }),
+    };
+    await expect(
+      verifyLiquidationReceiverReadiness(client, {
+        chain: "base",
+        receiver,
+        expectedSwapRouter: expectedRouter,
+        expectedSwapSlippageBps: 50n,
+      }),
+    ).rejects.toThrow(/swapSlippageBps mismatch/);
   });
 });
 
@@ -189,6 +267,12 @@ describe("assertLiquidationReceiverReadiness", () => {
         if (functionName === "swapRouter") {
           return expectedRouter;
         }
+        if (functionName === "authorizedInitiator") {
+          return "0x3333333333333333333333333333333333333333" as Address;
+        }
+        if (functionName === "swapSlippageBps") {
+          return 200n;
+        }
         throw new Error("unexpected");
       }),
     };
@@ -198,17 +282,23 @@ describe("assertLiquidationReceiverReadiness", () => {
       expectedSwapRouter: expectedRouter,
     });
     expect(result.onChainVersion).toBe(DEFAULT_LIQUIDATION_RECEIVER_VERSION);
+    expect(result.boundSwapSlippageBps).toBe(200n);
   });
 });
 
 describe("liquidationFlashReceiverAbi", () => {
-  it("declares receiverVersion, RECEIVER_VERSION, aavePool, swapRouter", () => {
+  it("declares receiverVersion, owner, RECEIVER_VERSION, aavePool, swapRouter, authorizedInitiator, swapSlippageBps, oracleMinDebtOut, decodeRouteParams", () => {
     const names = liquidationFlashReceiverAbi.map((e) => e.name);
     expect(names).toEqual(expect.arrayContaining([
       "receiverVersion",
+      "owner",
       "RECEIVER_VERSION",
       "aavePool",
       "swapRouter",
+      "authorizedInitiator",
+      "swapSlippageBps",
+      "oracleMinDebtOut",
+      "decodeRouteParams",
     ]));
   });
 });

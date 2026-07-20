@@ -68,14 +68,15 @@ contract MultiProtocolFlashReceiver {
             address debtAsset,
             address user,
             uint256 debtToCover,
-            uint256 minCollateralOut,
-            bool receiveAToken
-        ) = abi.decode(params, (uint8, address, address, address, uint256, uint256, bool));
+            uint256 minDebtOut,
+            bool receiveAToken,
+            uint24 fee
+        ) = abi.decode(params, (uint8, address, address, address, uint256, uint256, bool, uint24));
 
         RouteType routeType = RouteType(routeTypeRaw);
         if (routeType == RouteType.AaveV3) {
             POOL.liquidationCall(collateralAsset, debtAsset, user, debtToCover, receiveAToken);
-            _swapCollateralForDebt(collateralAsset, asset, minCollateralOut);
+            _swapCollateralForDebt(collateralAsset, asset, minDebtOut, fee);
         } else {
             revert UnsupportedRouteType();
         }
@@ -86,14 +87,19 @@ contract MultiProtocolFlashReceiver {
         return true;
     }
 
-    function _swapCollateralForDebt(address collateralAsset, address debtAsset, uint256 minDebtOut) internal {
+    function _swapCollateralForDebt(
+        address collateralAsset,
+        address debtAsset,
+        uint256 minDebtOut,
+        uint24 fee
+    ) internal {
         uint256 collateralBal = IERC20V2(collateralAsset).balanceOf(address(this));
         require(collateralBal > 0, "no collateral");
         require(IERC20V2(collateralAsset).approve(address(SWAP_ROUTER), collateralBal), "approve router");
         ISwapRouter02V2.ExactInputSingleParams memory p = ISwapRouter02V2.ExactInputSingleParams({
             tokenIn: collateralAsset,
             tokenOut: debtAsset,
-            fee: swapFee,
+            fee: fee,
             recipient: address(this),
             amountIn: collateralBal,
             amountOutMinimum: minDebtOut,

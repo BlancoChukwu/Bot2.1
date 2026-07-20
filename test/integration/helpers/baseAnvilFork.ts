@@ -1,9 +1,43 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { createPublicClient, http } from "viem";
 import { base } from "viem/chains";
 
 const ANVIL_HOST = process.env.ANVIL_HOST ?? "127.0.0.1";
 const ANVIL_PORT = Number(process.env.ANVIL_PORT ?? "8545");
+
+function resolveAnvilBinary(): string {
+  if (process.env.ANVIL_BIN !== undefined && process.env.ANVIL_BIN.trim() !== "") {
+    return process.env.ANVIL_BIN.trim();
+  }
+  const which = spawnSync(
+    process.platform === "win32" ? "where.exe" : "command",
+    process.platform === "win32" ? ["anvil"] : ["-v", "anvil"],
+    { encoding: "utf8" },
+  );
+  if (which.status === 0) {
+    const first = (which.stdout ?? "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+    if (first !== undefined) {
+      return first;
+    }
+  }
+  const vendored = join(
+    process.cwd(),
+    ".tools",
+    "foundry",
+    process.platform === "win32" ? "anvil.exe" : "anvil",
+  );
+  if (existsSync(vendored)) {
+    return vendored;
+  }
+  throw new Error(
+    "anvil not found in PATH or .tools/foundry — install Foundry (https://book.getfoundry.sh/getting-started/installation)",
+  );
+}
 
 export function resolveForkSourceRpc(): string | undefined {
   const candidates = [
@@ -66,21 +100,22 @@ export async function anvilReset(
 }
 
 export function startAnvilProcess(forkUrl: string, port = ANVIL_PORT): ChildProcess {
-  return spawn("anvil", ["--fork-url", forkUrl, "--port", String(port), "--silent"], {
+  const anvilBin = resolveAnvilBinary();
+  return spawn(anvilBin, ["--fork-url", forkUrl, "--port", String(port), "--silent"], {
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
 
-export async function stopAnvilProcess(process: ChildProcess | undefined): Promise<void> {
-  if (process === undefined || process.killed) {
+export async function stopAnvilProcess(child: ChildProcess | undefined): Promise<void> {
+  if (child === undefined || child.killed) {
     return;
   }
-  process.kill("SIGTERM");
+  child.kill("SIGTERM");
   await new Promise<void>((resolve) => {
-    process.once("exit", () => resolve());
+    child.once("exit", () => resolve());
     setTimeout(() => {
-      if (!process.killed) {
-        process.kill("SIGKILL");
+      if (!child.killed) {
+        child.kill("SIGKILL");
       }
       resolve();
     }, 5_000);
@@ -101,10 +136,10 @@ export async function createManagedAnvilFork(input: {
 }): Promise<ManagedAnvilFork> {
   const port = input.port ?? ANVIL_PORT;
   const rpcUrl = anvilRpcUrl(port);
-  const process = startAnvilProcess(input.forkUrl, port);
-  process.on("error", (error) => {
+  const child = startAnvilProcess(input.forkUrl, port);
+  child.on("error", (error) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new Error("anvil not found in PATH — install Foundry (https://book.getfoundry.sh/getting-started/installation)");
+      throw new Error("anvil not found in PATH or .tools/foundry — install Foundry (https://book.getfoundry.sh/getting-started/installation)");
     }
     throw error;
   });
@@ -112,8 +147,8 @@ export async function createManagedAnvilFork(input: {
   await anvilReset(rpcUrl, input.forkUrl, input.blockNumber);
   return {
     rpcUrl,
-    process,
+    process: child,
     reset: async (blockNumber?: bigint) => anvilReset(rpcUrl, input.forkUrl, blockNumber),
-    stop: async () => stopAnvilProcess(process),
+    stop: async () => stopAnvilProcess(child),
   };
 }

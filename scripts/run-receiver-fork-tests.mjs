@@ -6,6 +6,8 @@
  *   DOTENV_CONFIG_PATH=.env.event-purity-production npm run test:receiver-fork
  */
 import { execSync, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import { config } from "dotenv";
 import { assertDotenvPathExists } from "./env-profile-path.mjs";
 
@@ -28,8 +30,19 @@ function resolveForkRpc() {
 
 function requireCommand(command, installHint) {
   try {
-    execSync(`command -v ${command}`, { stdio: "ignore" });
+    if (process.platform === "win32") {
+      execSync(`where.exe ${command}`, { stdio: "ignore" });
+    } else {
+      execSync(`command -v ${command}`, { stdio: "ignore" });
+    }
   } catch {
+    // Fall back to vendored Foundry under .tools/foundry (Windows CI / local Mini PC).
+    const vendored = join(process.cwd(), ".tools", "foundry", process.platform === "win32" ? `${command}.exe` : command);
+    if (existsSync(vendored)) {
+      const foundryBin = join(process.cwd(), ".tools", "foundry");
+      process.env.PATH = `${foundryBin}${delimiter}${process.env.PATH ?? ""}`;
+      return;
+    }
     console.error(JSON.stringify({
       event: "receiver_fork_prereq_missing",
       command,
@@ -64,10 +77,15 @@ console.log(JSON.stringify({
   rpcHost: new URL(forkRpc).host,
 }, null, 2));
 
+const nodeOptions = [process.env.NODE_OPTIONS, "--use-system-ca"].filter(Boolean).join(" ");
 const result = spawnSync(
   process.platform === "win32" ? "npx.cmd" : "npx",
-  ["vitest", "run", "test/integration/liquidationFlashReceiver.fork.test.ts"],
-  { stdio: "inherit", env: process.env },
+  ["vitest", "run", "test/integration/liquidationFlashReceiver.fork.test.ts", "--reporter=verbose"],
+  {
+    stdio: "inherit",
+    env: { ...process.env, NODE_OPTIONS: nodeOptions },
+    shell: process.platform === "win32",
+  },
 );
 
 process.exit(result.status ?? 1);

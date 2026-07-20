@@ -32,7 +32,11 @@ import { createChainRegistry } from "./config/chainRegistry";
 import type { FlashLoanProviderId } from "./config/chainRegistry";
 import { createLiquidationActions, LiquidationExecutor } from "./executors/liquidationExecutor";
 import { buildArbitrageExecutionRequest } from "./executors/arbitrageExecutorAdapter";
-import { buildLiquidationExecutionRequest } from "./executors/liquidationExecutionAdapter";
+import { buildLiquidationExecutionRequest, estimateMinimumDebtOut } from "./executors/liquidationExecutionAdapter";
+import {
+  assertUniswapV3FeeTier,
+  type UniswapV3FeeTier,
+} from "./protocols/liquidationFlashLoanReceiver";
 import { LocalNonceManager } from "./executors/nonceManager";
 import { PrivateSubmissionClient, type PrivateTxMode } from "./executors/PrivateSubmissionClient";
 import { SafeTransactionExecutor } from "./executors/safeTransactionExecutor";
@@ -181,6 +185,8 @@ export interface RuntimeConfig {
   readonly usePipelineOrchestrator: boolean;
   readonly arbitrageReceiverAddress: Address | undefined;
   readonly liquidationReceiverAddress: Address | undefined;
+  /** Uniswap V3 fee tier for liquidation route field 8 (enum 100/500/3000/10000). */
+  readonly liquidationSwapFee: 100 | 500 | 3_000 | 10_000;
   readonly dailyPnlCsvPath: string | undefined;
   readonly arbitrageMinProfitUsd: number;
   readonly priceFeedRegistry: OracleFeedRegistry | undefined;
@@ -295,6 +301,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     usePipelineOrchestrator,
     arbitrageReceiverAddress: parseAddress(optionalEnv(parsedEnv, "ARBITRAGE_RECEIVER_ADDRESS")),
     liquidationReceiverAddress: parseAddress(optionalEnv(parsedEnv, "LIQUIDATION_RECEIVER_ADDRESS")),
+    liquidationSwapFee: parseLiquidationSwapFee(optionalEnv(parsedEnv, "LIQUIDATION_SWAP_POOL_FEE")),
     dailyPnlCsvPath: optionalEnv(parsedEnv, "DAILY_PNL_CSV_PATH"),
     arbitrageMinProfitUsd: parseMinNumber(parsedEnv.ARBITRAGE_MIN_PROFIT_USD, 0.15, 0, "ARBITRAGE_MIN_PROFIT_USD"),
     priceFeedRegistry,
@@ -1248,17 +1255,26 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
           logger.info("oracle_poll_tick", {
             blockNumber: latestKnownBlock.toString(),
           });
-          void eventPurityStack.refreshFeedFreshness(latestKnownBlock).catch((error) => {
-            logger.warn("feed_freshness_poll_failed", { error: String(error) });
-          });
-          void eventPurityStack.refreshGapFillPrices().catch((error) => {
-            logger.warn("gap_fill_refresh_poll_failed", { error: String(error) });
-          });
+          // Serialize freshness then gap-fill: parallel void races can interleave
+          // applyFeedPriceUpdate (chainlink) with registerAavePrice (aave) on shared maps.
+          void (async () => {
+            try {
+              await eventPurityStack.refreshFeedFreshness(latestKnownBlock);
+            } catch (error) {
+              logger.warn("feed_freshness_poll_failed", { error: String(error) });
+            }
+            try {
+              await eventPurityStack.refreshGapFillPrices();
+            } catch (error) {
+              logger.warn("gap_fill_refresh_poll_failed", { error: String(error) });
+            }
+          })();
         }, config.oraclePollIntervalMs);
         logger.info("oracle_poll_timer_started", {
           intervalMs: config.oraclePollIntervalMs,
           chain: config.chain,
           tasks: ["feed_freshness", "gap_fill_refresh"],
+          executionOrder: "serial_freshness_then_gap_fill",
         });
         shutdown.addHook("event_purity_feed_freshness_poll_stop", async () => {
           clearInterval(feedFreshnessPollTimer);
@@ -1494,8 +1510,36 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         });
       },
     },
-    buildExecutionRequest: async (candidate) =>
-      buildLiquidationExecutionRequest(config.chain, candidate, {
+    buildExecutionRequest: async (candidate) => {
+      const uniswap = getDexesForChain(config.chain).find((dex) => dex.name === "UniswapV3");
+      let advisoryMinDebtOut = 0n;
+      if (uniswap !== undefined && candidate.collateralReceivedWei !== undefined) {
+        try {
+          advisoryMinDebtOut = await estimateMinimumDebtOut({
+            candidate,
+            slippageBps: Math.max(config.slippageBps, config.flashLoanSlippageFloorBps),
+            fee: config.liquidationSwapFee,
+            quoteEngine,
+            client: publicClient,
+            dex: uniswap,
+          });
+          logger.info("liquidation_advisory_min_debt_out", {
+            user: candidate.account,
+            collateralAsset: candidate.collateralAsset,
+            debtAsset: candidate.debtAsset,
+            collateralReceivedWei: candidate.collateralReceivedWei.toString(),
+            fee: config.liquidationSwapFee,
+            advisoryMinDebtOut: advisoryMinDebtOut.toString(),
+            note: "Quote-based advisory only; on-chain amountOutMinimum is Aave-oracle floor",
+          });
+        } catch (error) {
+          logger.warn("liquidation_advisory_min_debt_out_failed", {
+            user: candidate.account,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      return buildLiquidationExecutionRequest(config.chain, candidate, {
         account: account.address,
         minProfitUsd: config.minProfitUsd,
         gasCostUsd: await resolveDynamicGasCostUsd(),
@@ -1505,10 +1549,29 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         slippageBufferFloorBps: config.flashLoanSlippageFloorBps,
         requireFlashLoanWrapper: true,
         poolAddress: activePoolAddress,
+        advisoryMinDebtOut,
+        swapFee: config.liquidationSwapFee,
         ...(config.liquidationReceiverAddress === undefined ? {} : { flashLoanReceiverAddress: config.liquidationReceiverAddress }),
-      }),
+      });
+    },
     buildExecutionRequestForOpportunity: async (opportunity: Opportunity) => {
       if (opportunity.kind === "liquidation") {
+        const uniswap = getDexesForChain(config.chain).find((dex) => dex.name === "UniswapV3");
+        let advisoryMinDebtOut = 0n;
+        if (uniswap !== undefined && opportunity.candidate.collateralReceivedWei !== undefined) {
+          try {
+            advisoryMinDebtOut = await estimateMinimumDebtOut({
+              candidate: opportunity.candidate,
+              slippageBps: Math.max(config.slippageBps, config.flashLoanSlippageFloorBps),
+              fee: config.liquidationSwapFee,
+              quoteEngine,
+              client: publicClient,
+              dex: uniswap,
+            });
+          } catch {
+            // advisory only
+          }
+        }
         return buildLiquidationExecutionRequest(config.chain, opportunity.candidate, {
           account: account.address,
           minProfitUsd: config.minProfitUsd,
@@ -1519,6 +1582,8 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
           slippageBufferFloorBps: config.flashLoanSlippageFloorBps,
           requireFlashLoanWrapper: true,
           poolAddress: activePoolAddress,
+          advisoryMinDebtOut,
+          swapFee: config.liquidationSwapFee,
           ...(config.liquidationReceiverAddress === undefined ? {} : { flashLoanReceiverAddress: config.liquidationReceiverAddress }),
         });
       }
@@ -1868,6 +1933,7 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
       flashFeeBps: resolvedFlashLoanFeeBps,
       slippageBufferFloorBps: config.flashLoanSlippageFloorBps,
       requireFlashLoanWrapper: true,
+      swapFee: config.liquidationSwapFee,
       ...(config.liquidationReceiverAddress === undefined ? {} : { flashLoanReceiverAddress: config.liquidationReceiverAddress }),
     });
     const result = await dryRunExecutor.execute(request);
@@ -2260,6 +2326,16 @@ function parsePrivateTxMode(value: string | undefined): PrivateTxMode {
     return value;
   }
   throw new Error("PRIVATE_TX_MODE must be one of provider_private, sequencer_direct, auto");
+}
+
+function parseLiquidationSwapFee(value: string | undefined): UniswapV3FeeTier {
+  const raw = value === undefined || value.trim() === "" ? "3000" : value.trim();
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`LIQUIDATION_SWAP_POOL_FEE must be an integer fee tier, got "${raw}"`);
+  }
+  const fee = Number(raw);
+  assertUniswapV3FeeTier(fee);
+  return fee;
 }
 
 function parseMinNumber(value: string | undefined, fallback: number, min: number, name: string): number {

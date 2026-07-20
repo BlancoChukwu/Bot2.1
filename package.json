@@ -29,6 +29,7 @@
     "rust:build": "cd rust-hotpath && cargo build --release",
     "compile:contracts": "node scripts/compile-liquidation-receiver.mjs",
     "deploy:liquidation-receiver:base": "ts-node scripts/deploy-liquidation-receiver-base.ts",
+    "deploy:liquidation-receiver:base-sepolia": "ts-node scripts/deploy-liquidation-receiver-base-sepolia.ts",
     "redis:ensure": "node scripts/ensure-redis.mjs",
     "env:merge-example": "node scripts/merge-env-from-example.mjs",
     "env:bootstrap": "node scripts/bootstrap-env-profiles.mjs",

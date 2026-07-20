@@ -5,7 +5,7 @@ import { getChainConfig, type SupportedChain } from "../config/chains";
  * Default when `LIQUIDATION_RECEIVER_EXPECTED_VERSION` is unset.
  * Must match `RECEIVER_VERSION` in `contracts/LiquidationFlashReceiver.sol` at deploy time.
  */
-export const DEFAULT_LIQUIDATION_RECEIVER_VERSION = 2n;
+export const DEFAULT_LIQUIDATION_RECEIVER_VERSION = 5n;
 
 /** @deprecated Use DEFAULT_LIQUIDATION_RECEIVER_VERSION */
 export const EXPECTED_LIQUIDATION_RECEIVER_VERSION = DEFAULT_LIQUIDATION_RECEIVER_VERSION;
@@ -18,6 +18,13 @@ export const liquidationFlashReceiverAbi = [
     stateMutability: "pure",
     inputs: [],
     outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "owner",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "address" }],
   },
   {
     type: "function",
@@ -40,6 +47,47 @@ export const liquidationFlashReceiverAbi = [
     inputs: [],
     outputs: [{ name: "", type: "address" }],
   },
+  {
+    type: "function",
+    name: "authorizedInitiator",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "address" }],
+  },
+  {
+    type: "function",
+    name: "swapSlippageBps",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "oracleMinDebtOut",
+    stateMutability: "view",
+    inputs: [
+      { name: "collateralAsset", type: "address" },
+      { name: "debtAsset", type: "address" },
+      { name: "collateralAmount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "decodeRouteParams",
+    stateMutability: "pure",
+    inputs: [{ name: "params", type: "bytes" }],
+    outputs: [
+      { name: "routeType", type: "uint8" },
+      { name: "collateralAsset", type: "address" },
+      { name: "debtAsset", type: "address" },
+      { name: "user", type: "address" },
+      { name: "debtToCover", type: "uint256" },
+      { name: "minDebtOut", type: "uint256" },
+      { name: "receiveAToken", type: "bool" },
+      { name: "fee", type: "uint24" },
+    ],
+  },
 ] as const;
 
 export interface LiquidationReceiverReadinessInput {
@@ -48,6 +96,10 @@ export interface LiquidationReceiverReadinessInput {
   readonly expectedSwapRouter: Address;
   /** Configured expectation (`LIQUIDATION_RECEIVER_EXPECTED_VERSION`); defaults to compile-time default. */
   readonly expectedVersion?: bigint;
+  /** When set, on-chain `authorizedInitiator` must match (case-insensitive). */
+  readonly expectedAuthorizedInitiator?: Address;
+  /** When set, on-chain `swapSlippageBps` must match. */
+  readonly expectedSwapSlippageBps?: bigint;
 }
 
 export interface LiquidationReceiverReadinessResult {
@@ -57,6 +109,8 @@ export interface LiquidationReceiverReadinessResult {
   readonly expectedVersion: bigint;
   readonly boundPool: Address;
   readonly boundRouter: Address;
+  readonly boundAuthorizedInitiator: Address;
+  readonly boundSwapSlippageBps: bigint;
 }
 
 export function parseExpectedLiquidationReceiverVersion(
@@ -154,6 +208,36 @@ export async function verifyLiquidationReceiverReadiness(
     );
   }
 
+  const boundAuthorizedInitiator = await client.readContract({
+    address: input.receiver,
+    abi: liquidationFlashReceiverAbi,
+    functionName: "authorizedInitiator",
+  });
+  if (
+    input.expectedAuthorizedInitiator !== undefined
+    && boundAuthorizedInitiator.toLowerCase() !== input.expectedAuthorizedInitiator.toLowerCase()
+  ) {
+    throw new Error(
+      `Liquidation receiver authorizedInitiator mismatch on ${input.chain} at ${input.receiver}: `
+      + `expected ${input.expectedAuthorizedInitiator}, got ${boundAuthorizedInitiator}`,
+    );
+  }
+
+  const boundSwapSlippageBps = await client.readContract({
+    address: input.receiver,
+    abi: liquidationFlashReceiverAbi,
+    functionName: "swapSlippageBps",
+  });
+  if (
+    input.expectedSwapSlippageBps !== undefined
+    && boundSwapSlippageBps !== input.expectedSwapSlippageBps
+  ) {
+    throw new Error(
+      `Liquidation receiver swapSlippageBps mismatch on ${input.chain} at ${input.receiver}: `
+      + `expected ${input.expectedSwapSlippageBps.toString()}, got ${boundSwapSlippageBps.toString()}`,
+    );
+  }
+
   return {
     chain: input.chain,
     receiver: input.receiver,
@@ -161,6 +245,8 @@ export async function verifyLiquidationReceiverReadiness(
     expectedVersion,
     boundPool,
     boundRouter,
+    boundAuthorizedInitiator,
+    boundSwapSlippageBps,
   };
 }
 

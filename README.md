@@ -206,7 +206,67 @@ EXECUTION_RPC_URL_FALLBACKS=https://<base-exec-http-fallback-1>,https://<base-ex
 PRIVATE_TX_MODE=auto
 FLASH_LOAN_PROVIDERS=aaveV3,balancer
 LIQUIDATION_RECEIVER_ADDRESS=0x...
+LIQUIDATION_AUTHORIZED_INITIATOR=0x...   # bot operator wallet (PRIVATE_KEY account)
+LIQUIDATION_RECEIVER_EXPECTED_VERSION=5
+LIQUIDATION_SWAP_POOL_FEE=3000           # enum: 100 | 500 | 3000 | 10000
 MIN_PROFIT_MARGIN_BPS=50
+```
+
+### LiquidationFlashReceiver v5 (Base)
+
+Deploy **v5 only** — retire v1–v4 addresses from runtime env; do not dual-point `LIQUIDATION_RECEIVER_ADDRESS` at legacy bytecode.
+
+**Testnet gate (required before mainnet):** deploy to Base Sepolia first, then run verify against the live testnet address.
+
+```bash
+npm run compile:contracts
+# Fund deployer with Base Sepolia ETH (faucet), then:
+DEPLOY_RECEIVER_RPC_URL=https://base-sepolia.g.alchemy.com/v2/<key> \
+LIQUIDATION_AUTHORIZED_INITIATOR=0x<operator-hot-key> \
+LIQUIDATION_SWAP_POOL_FEE=3000 \
+LIQUIDATION_SWAP_SLIPPAGE_BPS=200 \
+npm run deploy:liquidation-receiver:base-sepolia
+
+VERIFY_CHAIN=base-sepolia \
+DEPLOY_RECEIVER_RPC_URL=https://base-sepolia.g.alchemy.com/v2/<key> \
+LIQUIDATION_RECEIVER_ADDRESS=0x<sepolia-deploy> \
+LIQUIDATION_AUTHORIZED_INITIATOR=0x<operator-hot-key> \
+LIQUIDATION_SWAP_SLIPPAGE_BPS=200 \
+LIQUIDATION_RECEIVER_EXPECTED_VERSION=5 \
+LIQUIDATION_RECEIVER_EXPECTED_OWNER=0x<deployer-owner> \
+npm run verify:liquidation-receiver
+```
+
+Expect `event: "liquidation_receiver_verified"` with matching version / owner / initiator / slippage / pool / router.
+
+**Owner key hygiene:** `_owner` is immutable `msg.sender` at deploy (exposed via `owner()`). It gates `rescue`, `setAuthorizedInitiator`, and `setSwapSlippageBps`. Prefer a cold EOA or multisig distinct from the hot `authorizedInitiator`. There is no `transferOwnership` — rotating owner requires redeploy.
+
+**Route params schema** (production `encodeLiquidationRoute`, 8 fields):
+
+```
+uint8 routeType          — must be 0 (Aave V3); others revert UnsupportedRouteType
+address collateralAsset
+address debtAsset
+address user
+uint256 debtToCover
+uint256 minDebtOut       — advisory / EV preview only (quote-based estimateMinimumDebtOut); NOT amountOutMinimum
+bool receiveAToken
+uint24 fee               — Uniswap V3 fee enum {100, 500, 3000, 10000}; InvalidSwapFee otherwise
+```
+
+**On-chain swap floor (Option B / B1):** after `liquidationCall`, `amountOutMinimum` is computed from the **actual** `collateralBal` via live `POOL.ADDRESSES_PROVIDER().getPriceOracle().getAssetPrice(...)` (no immutable oracle cache), converted to debt-asset wei with live `decimals()`, then haircut by owner-settable `swapSlippageBps` (default 200). Never `min(floor, need)`.
+
+**Off-chain estimator:** `estimateMinimumDebtOut` calls `QuoteEngine.quoteExactInputSingle` (debt-asset denominated quote haircut). Advisory only — never wired into Uniswap `amountOutMinimum`.
+
+**Initiator gate:** only `LIQUIDATION_AUTHORIZED_INITIATOR` may initiate the flash loan. Owner may rotate via `setAuthorizedInitiator` / `setSwapSlippageBps` without redeploying.
+
+```bash
+npm run compile:contracts
+LIQUIDATION_AUTHORIZED_INITIATOR=0x<operator> npm run deploy:liquidation-receiver:base
+# Set LIQUIDATION_RECEIVER_ADDRESS and LIQUIDATION_RECEIVER_EXPECTED_VERSION=5
+# Retire any prior v1–v4 address from .env / .runtime
+npm run verify:liquidation-receiver
+npm run test:receiver-fork
 ```
 
 ### WSS provider checklist
@@ -263,12 +323,34 @@ Session launchers pass `--output` / `--error` to PM2 so soak logs still land in 
 
 **Gap-fill price refresh (oracle poll)**
 
-On Base event-purity mode, the existing `ORACLE_POLL_INTERVAL_MS` timer (default 60s) runs both Chainlink feed freshness and unconditional gap-fill refresh. Grep soak logs for:
+On Base event-purity mode, the existing `ORACLE_POLL_INTERVAL_MS` timer (default 60s) runs both Chainlink feed freshness and unconditional gap-fill refresh **serially** (freshness first, then gap-fill) to avoid an execution-order race on shared `prices` / `feedStates` maps. After gap-fill writes, the stack recomputes tiers for positions touching refreshed assets so HF is not left on a stale cache until the next unrelated event.
 
+Grep soak logs for:
+
+- `oracle_poll_timer_started` — `executionOrder: "serial_freshness_then_gap_fill"`
 - `oracle_gap_fill_refresh_complete` — per-cycle detail (`refreshed`, `failedCount`, `targetCount`)
-- `gap_fill_refresh_poll_result` — one-line poll wrapper summary (`refreshed`, `failedCount`)
+- `gap_fill_refresh_poll_result` — one-line poll wrapper summary (`refreshed`, `failedCount`, `refreshedAssetCount`)
+- `hf_skip_price_stale` — should **not** storm on `source=aave` / `source=peg` assets; Chainlink-only assets still use heartbeat × 1.5
 
 After bootstrap, expect `refreshed > 0` on cycles where held positions have gap-fill assets registered in `reserveConfig`.
+
+### Parallel tracks (Track A) — neither blocks the other; both block `ENABLE_LIVE_TX`
+
+| Track | Gate | Status signal |
+|-------|------|-----------------|
+| **Receiver v4** | Base Sepolia deploy → `verify:liquidation-receiver` → three-address hygiene → mainnet redeploy | Paste `liquidation_receiver_verified` JSON |
+| **HF skip storm** | Serial oracle poll + gap-fill write (`prices`+`feedStates`+`source`) + post-refresh tier recompute | Unit evidence + soak: no `hf_skip_price_stale` storm on gap-fill assets |
+| **Incomplete-position reconcile** | `position_first_touch_reconcile_skipped` | Still open |
+| **Oracle sanity (mandatory)** | Live-tx gate | Still open |
+| **`kill_timeout` drain** | PM2 stop under load | Still open |
+
+Receiver mainnet redeploy may proceed once Sepolia verify + three-address checklist pass. That closes the **receiver sub-track only** — it does **not** clear Track A or allow `ENABLE_LIVE_TX=true`.
+
+**Three-address pre-deploy checklist (mainnet)**
+
+1. **Owner** — cold EOA or multisig; immutable `msg.sender` at deploy; gates `rescue` / `setAuthorizedInitiator` / `setSwapSlippageBps`
+2. **Authorized initiator** — hot operator key used as flash-loan initiator; **must differ** from owner
+3. **Deployer** — one-time key that becomes owner if it is `msg.sender`; prefer deploying *from* the owner key (or accept owner=deployer only for testnet)
 
 **Platform notes**
 

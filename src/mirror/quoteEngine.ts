@@ -81,6 +81,21 @@ export class QuoteEngine {
     tokenOut: Address,
     amountIn: bigint,
   ): Promise<bigint> {
+    return this.quoteExactInputSingle(client, dex, tokenIn, tokenOut, amountIn, dex.quoterPoolFee ?? 3_000);
+  }
+
+  /**
+   * Uniswap V3 QuoterV2 `quoteExactInputSingle` (or mirror / getAmountsOut fallback).
+   * Returns tokenOut wei for `amountIn` of tokenIn at the given fee tier.
+   */
+  public async quoteExactInputSingle(
+    client: ReadOnlyClient,
+    dex: DexConfig,
+    tokenIn: Address,
+    tokenOut: Address,
+    amountIn: bigint,
+    fee: number,
+  ): Promise<bigint> {
     const mirror = getAmmMirror();
     const diagnostics = await this.buildDiagnostics(mirror.size(), mirror.getLastSwapTimestamp(), mirror.getEventsReceived());
     this.config.logger.info("quote_engine_entry", {
@@ -92,6 +107,7 @@ export class QuoteEngine {
       tokenIn,
       tokenOut,
       amountIn: amountIn.toString(),
+      fee,
     });
 
     if (this.config.useLocalMirror && !diagnostics.forceRpcFallback && mirror.isWarm()) {
@@ -101,7 +117,7 @@ export class QuoteEngine {
       }
     }
 
-    return this.quoteViaRpc(client, dex, tokenIn, tokenOut, amountIn);
+    return this.quoteViaRpc(client, { ...dex, quoterPoolFee: fee }, tokenIn, tokenOut, amountIn);
   }
 
   /** Batch quote helper — returns empty only when every probe amount fails. */
