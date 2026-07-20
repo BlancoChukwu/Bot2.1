@@ -720,6 +720,185 @@ describeFork("LiquidationFlashReceiver v5 (Base anvil fork)", () => {
       await e2eFork.stop();
     }
   }, 420_000);
+
+  it("happy-path: flashLoanSimple completes liquidation+swap above oracle floor with clean residual", async () => {
+    if (uniswap === undefined || uniswap.quoterV2 === undefined) {
+      throw new Error("UniswapV3 (with quoterV2) missing from dex registry for base");
+    }
+    // Production path: authorizedInitiator → flashLoanSimple → executeOperation →
+    // liquidationCall → oracle-floor swap (fee field 8) → repay amount+premium.
+    // Prefer historical WETH→USDC 500-fee pool (deepest Base Uniswap V3 liquid pair).
+    const swapFee = 500 as const;
+    const minDebtToCover = 50_000_000_000n; // 50_000 USDC — large enough to clear dust + show margin
+
+    const liquidationCase = await findHistoricalLiquidationCase(forkSourceRpc!, pool, 5_000_000n, {
+      collateralAsset: WETH,
+      debtAsset: USDC,
+      minDebtToCover,
+    });
+
+    const happyFork = await createManagedAnvilFork({
+      forkUrl: forkSourceRpc!,
+      port: Number(process.env.ANVIL_PORT ?? "8545") + 5,
+      blockNumber: liquidationCase.snapshotBlock,
+    });
+    try {
+      const publicClient = createForkPublicClient(happyFork.rpcUrl);
+      const testClient = createForkTestClient(happyFork.rpcUrl);
+      const happyReceiver = await deployLiquidationFlashReceiver(happyFork.rpcUrl, artifact, {
+        swapFee,
+        swapSlippageBps: 200n,
+      });
+
+      const hfAtFork = await readHealthFactor(publicClient, pool, liquidationCase.user);
+      expect(isUnderwaterHealthFactor(hfAtFork)).toBe(true);
+
+      const sized = await sizeLiquidationDebtToCover({
+        client: publicClient,
+        pool,
+        user: liquidationCase.user,
+        debtAsset: USDC,
+        healthFactor: hfAtFork,
+      });
+      const debtToCover = liquidationCase.debtToCover > 0n
+        ? liquidationCase.debtToCover
+        : sized.debtToCover;
+      expect(debtToCover).toBeGreaterThanOrEqual(minDebtToCover / 2n);
+
+      const flashPremiumTotal = await publicClient.readContract({
+        address: pool,
+        abi: [
+          {
+            type: "function",
+            name: "FLASHLOAN_PREMIUM_TOTAL",
+            stateMutability: "view",
+            inputs: [],
+            outputs: [{ type: "uint128" }],
+          },
+        ] as const,
+        functionName: "FLASHLOAN_PREMIUM_TOTAL",
+      });
+      const premium = (debtToCover * BigInt(flashPremiumTotal)) / 10_000n;
+      const owe = debtToCover + premium;
+
+      const params = encodeLiquidationRoute({
+        collateralAsset: liquidationCase.collateralAsset,
+        debtAsset: liquidationCase.debtAsset,
+        user: liquidationCase.user,
+        debtToCover,
+        minDebtOut: 0n,
+        receiveAToken: false,
+        fee: swapFee,
+      });
+      const decoded = await readDecodedRouteParams(publicClient, happyReceiver, params);
+      expect(decoded[0]).toBe(0);
+      expect(decoded[1].toLowerCase()).toBe(liquidationCase.collateralAsset.toLowerCase());
+      expect(decoded[2].toLowerCase()).toBe(liquidationCase.debtAsset.toLowerCase());
+      expect(decoded[3].toLowerCase()).toBe(liquidationCase.user.toLowerCase());
+      expect(decoded[4]).toBe(debtToCover);
+      expect(decoded[5]).toBe(0n);
+      expect(decoded[6]).toBe(false);
+      expect(decoded[7]).toBe(swapFee);
+
+      // eslint-disable-next-line no-console
+      console.info("e2e_happy_path_provenance", {
+        user: liquidationCase.user,
+        snapshotBlock: liquidationCase.snapshotBlock.toString(),
+        healthFactor: hfAtFork.toString(),
+        collateralAsset: liquidationCase.collateralAsset,
+        debtAsset: liquidationCase.debtAsset,
+        debtToCover: debtToCover.toString(),
+        flashPremiumTotal: flashPremiumTotal.toString(),
+        premium: premium.toString(),
+        owe: owe.toString(),
+        fee: swapFee,
+        swapSlippageBps: 200,
+        note: "Production 8-field encoding; authorizedInitiator flashLoanSimple happy path",
+      });
+
+      const balWethBefore = await readErc20Balance(publicClient, WETH, happyReceiver);
+      const balUsdcBefore = await readErc20Balance(publicClient, USDC, happyReceiver);
+      expect(balWethBefore).toBe(0n);
+      expect(balUsdcBefore).toBe(0n);
+
+      // Preflight simulate — must succeed (floor cleared by healthy Uniswap price).
+      await simulateFlashLoanSimple({
+        client: publicClient,
+        rpcUrl: happyFork.rpcUrl,
+        pool,
+        receiver: happyReceiver,
+        debtAsset: USDC,
+        amount: debtToCover,
+        params,
+      });
+
+      const hash = await testClient.writeContract({
+        address: pool,
+        abi: [
+          {
+            type: "function",
+            name: "flashLoanSimple",
+            stateMutability: "nonpayable",
+            inputs: [
+              { name: "receiverAddress", type: "address" },
+              { name: "asset", type: "address" },
+              { name: "amount", type: "uint256" },
+              { name: "params", type: "bytes" },
+              { name: "referralCode", type: "uint16" },
+            ],
+            outputs: [],
+          },
+        ] as const,
+        functionName: "flashLoanSimple",
+        args: [happyReceiver, USDC, debtToCover, params, 0],
+        account: DEFAULT_FORK_AUTHORIZED_INITIATOR,
+        gas: 8_000_000n,
+      });
+      const receipt = await testClient.waitForTransactionReceipt({ hash });
+      expect(receipt.status).toBe("success");
+
+      const balWethAfter = await readErc20Balance(publicClient, WETH, happyReceiver);
+      const balUsdcAfter = await readErc20Balance(publicClient, USDC, happyReceiver);
+      // Collateral must be fully swapped; leftover debt asset is liquidation bonus (profit).
+      const profitMarginUsdc = balUsdcAfter;
+      expect(balWethAfter).toBe(0n);
+      expect(profitMarginUsdc).toBeGreaterThan(0n);
+
+      // eslint-disable-next-line no-console
+      console.info("e2e_happy_path_profit", {
+        minedStatus: receipt.status,
+        txHash: hash,
+        balWethAfter: balWethAfter.toString(),
+        balUsdcAfter: balUsdcAfter.toString(),
+        owe: owe.toString(),
+        profitMarginUsdcRaw: profitMarginUsdc.toString(),
+        profitMarginUsdc: Number(profitMarginUsdc) / 1e6,
+        note: "Swap cleared oracle floor; Aave pulled owe; leftover USDC = bonus − premium − impact",
+      });
+
+      // Sweep profit via owner rescue so receiver ends with zero residual of either asset.
+      const rescueHash = await testClient.writeContract({
+        address: happyReceiver,
+        abi: artifact.abi,
+        functionName: "rescue",
+        args: [USDC, DEFAULT_FORK_AUTHORIZED_INITIATOR, profitMarginUsdc],
+        account: DEFAULT_FORK_AUTHORIZED_INITIATOR,
+      });
+      await testClient.waitForTransactionReceipt({ hash: rescueHash });
+      const balWethFinal = await readErc20Balance(publicClient, WETH, happyReceiver);
+      const balUsdcFinal = await readErc20Balance(publicClient, USDC, happyReceiver);
+      // eslint-disable-next-line no-console
+      console.info("e2e_happy_path_clean", {
+        balWethFinal: balWethFinal.toString(),
+        balUsdcFinal: balUsdcFinal.toString(),
+        note: "After rescue: no stuck collateral or debt residue on receiver",
+      });
+      expect(balWethFinal).toBe(0n);
+      expect(balUsdcFinal).toBe(0n);
+    } finally {
+      await happyFork.stop();
+    }
+  }, 420_000);
 });
 
 function isSlippageFloorRevert(message: string): boolean {
