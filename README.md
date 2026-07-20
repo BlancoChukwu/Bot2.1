@@ -338,9 +338,9 @@ After bootstrap, expect `refreshed > 0` on cycles where held positions have gap-
 
 | Track | Gate | Status signal |
 |-------|------|-----------------|
-| **Receiver v4** | Base Sepolia deploy → `verify:liquidation-receiver` → three-address hygiene → mainnet redeploy | Paste `liquidation_receiver_verified` JSON |
-| **HF skip storm** | Serial oracle poll + gap-fill write (`prices`+`feedStates`+`source`) + post-refresh tier recompute | Unit evidence + soak: no `hf_skip_price_stale` storm on gap-fill assets |
-| **Incomplete-position reconcile** | `position_first_touch_reconcile_skipped` | Still open |
+| **Receiver v5** | Base Sepolia deploy → `verify:liquidation-receiver` → three-address hygiene → mainnet redeploy | Fork E2E (adversarial + happy-path) evidenced; Sepolia/mainnet verify still open |
+| **HF skip storm** | Serial oracle poll + gap-fill write (`prices`+`feedStates`+`source`) + post-refresh tier recompute | Unit evidence + soak: no `hf_skip_price_stale` storm on gap-fill assets — soak still outstanding |
+| **Incomplete-position reconcile** | `position_first_touch_reconcile_skipped` / first-touch leave-behind | RCA open (await review) — not started as a fix |
 | **Oracle sanity (mandatory)** | Live-tx gate | Still open |
 | **`kill_timeout` drain** | PM2 stop under load | Still open |
 
