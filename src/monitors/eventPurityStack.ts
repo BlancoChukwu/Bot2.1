@@ -26,6 +26,10 @@ import { createBootstrapLogClients } from "./bootstrapRpcClients";
 import { setBootstrapRuntimeStatus } from "../runtime/bootstrapRuntimeStatus";
 import { pollLocalFeedFreshness } from "./localFeedFreshnessPoll";
 import { reconcileAndSeedPosition } from "./positionOnChainReconcile";
+import {
+  reconcileFirstTouchWithRetry,
+  type NeedsManualReconcileEntry,
+} from "./firstTouchReconcile";
 import { bootstrapAaveOracleGapFill, refreshGapFillPrices } from "../oracle/aaveOraclePrice";
 import { aavePoolAbi } from "../protocols/aaveV3";
 import { poolEmodeAbi } from "./aaveEmode";
@@ -213,6 +217,7 @@ function registerFeedIfWarm(input: {
     updatedAt,
     feedAddress: feedAddr,
     asset: assetAddr,
+    source: "chainlink",
   });
   bootstrappedPrices.set(assetAddr, { feed: feedAddr, price: normalizedPrice, decimals });
 
@@ -240,6 +245,8 @@ export interface EventPurityStackConfig {
     readonly confirmed: ConfirmResult;
   }) => void | Promise<void>;
   readonly onBlockObserved?: (blockNumber: bigint) => void;
+  /** Test seam for first-touch reconcile backoff. */
+  readonly sleepMs?: (ms: number) => Promise<void>;
 }
 
 export class EventPurityStack {
@@ -254,9 +261,15 @@ export class EventPurityStack {
   private bootstrapCoveragePct: number | undefined;
   private bootstrapStatus: PartialBootstrapCoverage | undefined;
   private pricesBootstrapped = false;
+  private readonly needsManualReconcile = new Map<string, NeedsManualReconcileEntry>();
 
   public isPricesBootstrapped(): boolean {
     return this.pricesBootstrapped;
+  }
+
+  /** Dead-lettered first-touch accounts awaiting manual / later reconcile. */
+  public getNeedsManualReconcile(): ReadonlyMap<string, NeedsManualReconcileEntry> {
+    return this.needsManualReconcile;
   }
 
   public constructor(private readonly config: EventPurityStackConfig) {
@@ -418,6 +431,7 @@ export class EventPurityStack {
       refreshed: result.refreshed,
       failedCount: result.failed.length,
       targetCount: result.targetCount,
+      refreshedAssetCount: result.refreshedAssets.length,
     });
     if (result.failed.length > 0) {
       this.config.logger.warn("oracle_gap_fill_refresh_partial", {
@@ -425,6 +439,13 @@ export class EventPurityStack {
         failedCount: result.failed.length,
         failed: result.failed,
       });
+    }
+    // Close the write-gap: prices/feedStates were updated by registerAavePrice, but tiers
+    // only recompute on TierChange. Force HF recompute for positions touching refreshed assets.
+    if (result.refreshedAssets.length > 0) {
+      const changes = this.model.recomputeTiersForAssets(result.refreshedAssets);
+      const head = await this.config.executionClient.getBlockNumber().catch(() => 0n);
+      await this.handleTierChanges(changes, head);
     }
   }
 
@@ -469,36 +490,37 @@ export class EventPurityStack {
 
   private async reconcileFirstTouch(account: Address, blockNumber: bigint): Promise<void> {
     const chainConfig = getChainConfig(this.config.chain);
-    const seeded = await reconcileAndSeedPosition({
-      client: this.config.executionClient,
-      model: this.model,
-      poolAddress: this.config.poolAddress,
-      poolAddressesProvider: chainConfig.aave.poolAddressesProvider,
-      uiPoolDataProvider: chainConfig.aave.uiPoolDataProvider,
+    const terminal = await reconcileFirstTouchWithRetry({
+      chain: this.config.chain,
       account,
       blockNumber,
       logger: this.config.logger,
-      ...(this.config.reserveAllowlist === undefined
-        ? {}
-        : { reserveAllowlist: this.config.reserveAllowlist }),
-    });
-    if (seeded) {
-      this.config.logger.info("position_first_touch_reconciled", {
-        chain: this.config.chain,
+      needsManualReconcile: this.needsManualReconcile,
+      removePartialPosition: () => {
+        this.model.removePosition(account);
+      },
+      attemptReconcile: () => reconcileAndSeedPosition({
+        client: this.config.executionClient,
+        model: this.model,
+        poolAddress: this.config.poolAddress,
+        poolAddressesProvider: chainConfig.aave.poolAddressesProvider,
+        uiPoolDataProvider: chainConfig.aave.uiPoolDataProvider,
         account,
-        blockNumber: Number(blockNumber),
-      });
+        blockNumber,
+        logger: this.config.logger,
+        ...(this.config.reserveAllowlist === undefined
+          ? {}
+          : { reserveAllowlist: this.config.reserveAllowlist }),
+      }),
+      ...(this.config.sleepMs === undefined ? {} : { sleepMs: this.config.sleepMs }),
+    });
+
+    if (terminal.status === "seeded") {
       const change = this.model.tierChangeForAccount(account, true);
       if (change !== undefined && this.model.isPricesBootstrapped()) {
         await this.handleTierChanges([change], blockNumber);
       }
-      return;
     }
-    this.config.logger.info("position_first_touch_reconcile_skipped", {
-      chain: this.config.chain,
-      account,
-      blockNumber: Number(blockNumber),
-    });
   }
 
   private async handleTierChanges(

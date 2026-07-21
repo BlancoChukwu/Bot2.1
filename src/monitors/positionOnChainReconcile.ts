@@ -21,6 +21,11 @@ export interface ParsedOnChainAccountSnapshot {
   readonly reserves: readonly OnChainReserveRow[];
 }
 
+export type ReconcileSeedOutcome =
+  | { readonly status: "seeded" }
+  | { readonly status: "benign_skip"; readonly reason: "no_debt" | "allowlist_miss" }
+  | { readonly status: "failed"; readonly error: string };
+
 export async function fetchOnChainAccountSnapshot(input: {
   readonly client: PublicClient;
   readonly poolAddress: Address;
@@ -103,6 +108,11 @@ export function seedModelFromAccountSnapshot(
   });
 }
 
+/**
+ * Seed a live position from on-chain snapshot.
+ * Benign skips remove the partial position. Failures leave the model untouched
+ * so the caller can retry / dead-letter.
+ */
 export async function reconcileAndSeedPosition(input: {
   readonly client: PublicClient;
   readonly model: LocalPositionModel;
@@ -113,7 +123,7 @@ export async function reconcileAndSeedPosition(input: {
   readonly blockNumber: bigint;
   readonly reserveAllowlist?: readonly Address[];
   readonly logger: LoggerLike;
-}): Promise<boolean> {
+}): Promise<ReconcileSeedOutcome> {
   try {
     const snapshot = await fetchOnChainAccountSnapshot({
       client: input.client,
@@ -124,21 +134,22 @@ export async function reconcileAndSeedPosition(input: {
     });
     if (snapshot === undefined) {
       input.model.removePosition(input.account);
-      return false;
+      return { status: "benign_skip", reason: "no_debt" };
     }
     if (input.reserveAllowlist !== undefined
       && input.reserveAllowlist.length > 0
       && !reservesTouchAllowlist(snapshot.reserves, input.reserveAllowlist)) {
       input.model.removePosition(input.account);
-      return false;
+      return { status: "benign_skip", reason: "allowlist_miss" };
     }
     seedModelFromAccountSnapshot(input.model, snapshot, input.blockNumber);
-    return true;
+    return { status: "seeded" };
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     input.logger.warn("position_on_chain_reconcile_failed", {
       account: input.account,
-      error: String(error),
+      error: message,
     });
-    return false;
+    return { status: "failed", error: message };
   }
 }
