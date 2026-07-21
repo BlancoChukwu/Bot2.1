@@ -208,13 +208,31 @@ FLASH_LOAN_PROVIDERS=aaveV3,balancer
 LIQUIDATION_RECEIVER_ADDRESS=0x...
 LIQUIDATION_AUTHORIZED_INITIATOR=0x...   # bot operator wallet (PRIVATE_KEY account)
 LIQUIDATION_RECEIVER_EXPECTED_VERSION=5
-LIQUIDATION_SWAP_POOL_FEE=3000           # enum: 100 | 500 | 3000 | 10000
+# Runtime: leave unset to use the production per-pair map. Set only as an
+# explicitly logged debug override (enum: 100 | 500 | 3000 | 10000).
+# LIQUIDATION_SWAP_POOL_FEE=3000
 MIN_PROFIT_MARGIN_BPS=50
 ```
 
 ### LiquidationFlashReceiver v5 (Base)
 
 Deploy **v5 only** — retire v1–v4 addresses from runtime env; do not dual-point `LIQUIDATION_RECEIVER_ADDRESS` at legacy bytecode.
+
+Runtime routes are hard-fail-on-unmapped and live in
+`src/config/uniswapV3LiquidationRoutes.ts`. The snapshot is pinned to Base
+block `48,903,239` / `2026-07-21T01:03:46.817Z`. Pools below $100k TVL are capped
+at 2.5% of snapshot TVL (5% raw ceiling with a 50% drift haircut), converted
+to debt with `maxCollateralSwapUsd / (1 + liquidationBonus)`, then rechecked
+against `MIN_LIQUIDATION_DEBT_USD` and `MIN_PROFIT_USD`. `wstETH→USDC` is
+intentionally unmapped: its ~$24.66 collateral cap implies only ~$23.49 debt,
+below both the production $50 debt floor and the $1.50 net-profit floor.
+
+Refresh the fee ranking and TVL evidence from current Uniswap V3 balances and
+live Base Aave oracle prices before editing the map:
+
+```bash
+BASE_RPC_URL=https://<base-http-primary> npm run refresh:liquidation-routes:base
+```
 
 **Testnet gate (required before mainnet):** deploy to Base Sepolia first, then run verify against the live testnet address.
 
@@ -312,10 +330,10 @@ npm run bot:stop                        # stops PM2 app + stray node PIDs
 | `restart_delay` | `5s` | Pause between auto-restarts |
 | `node_args` | `--max-old-space-size=1024 --expose-gc` | Heap cap + manual GC for soak diagnostics |
 | `max_memory_restart` | `1200M` | PM2-level RSS guard (~6× current soak RSS) |
-| `kill_timeout` | `15s` | SIGINT→SIGKILL window on `pm2 stop` / shutdown |
+| `kill_timeout` | `75s` | SIGINT→SIGKILL window; must exceed in-flight drain bound (60s) |
 | `env` | production defaults | `SIMULATION_MODE=false`, safety gate on, cold-start sweep skipped |
 
-`kill_timeout: 15_000` is sized for `ENABLE_LIVE_TX=false`. Before enabling live tx, confirm the `shutdown.addHook` chain (checkpoint close, in-flight execution drain) finishes within 15s under load, or raise this for the live profile.
+`kill_timeout: 75_000` envelopes the in-flight execution drain (`IN_FLIGHT_DRAIN_MAX_MS=60_000`) plus hook slack. Receipt waits are capped at `EXECUTION_RECEIPT_TIMEOUT_MS=30_000`. A durable recent-attempt ledger (10m TTL, Redis/disk) blocks duplicate submits across restart; known reverts clear the block immediately.
 
 Session launchers pass `--output` / `--error` to PM2 so soak logs still land in `logs/<prefix>-<timestamp>.log` alongside PM2's own log files under `~/.pm2/logs/`.
 
@@ -338,11 +356,11 @@ After bootstrap, expect `refreshed > 0` on cycles where held positions have gap-
 
 | Track | Gate | Status signal |
 |-------|------|-----------------|
-| **Receiver v5** | Base Sepolia deploy → `verify:liquidation-receiver` → three-address hygiene → mainnet redeploy | Fork E2E evidenced; fee-map Option 1 approved; **thin-pair size-cap design awaiting review**; Sepolia/mainnet verify still open |
+| **Receiver v5** | Base Sepolia deploy → `verify:liquidation-receiver` → three-address hygiene → mainnet redeploy | Fork E2E evidenced; per-pair fee map + thin-pair caps implemented with pinned live-liquidity refresh; Sepolia/mainnet verify still open |
 | **HF skip storm** | Serial oracle poll + gap-fill write (`prices`+`feedStates`+`source`) + post-refresh tier recompute | Unit evidence + soak: no `hf_skip_price_stale` storm on gap-fill assets — soak still outstanding |
 | **Incomplete-position reconcile** | Bounded retry → dead-letter; log split benign/retry/dead_lettered | Implementation + forced-failure dead-letter test (this PR) |
-| **Oracle sanity (mandatory)** | Live-tx gate | Still open |
-| **`kill_timeout` drain** | PM2 stop under load | Still open |
+| **Oracle sanity (mandatory)** | Live-tx gate: Chainlink↔Uniswap V3 TWAP (both assets, multi-hop fail-closed) | Implemented; boot refuses `ENABLE_LIVE_TX` without feed registry |
+| **`kill_timeout` drain** | In-flight registry + 60s drain / 75s kill / 30s receipt + durable 10m attempt ledger | Implemented; forced restart duplicate-block + revert-clear tests |
 
 Receiver mainnet redeploy may proceed once Sepolia verify + three-address checklist pass. That closes the **receiver sub-track only** — it does **not** clear Track A or allow `ENABLE_LIVE_TX=true`.
 

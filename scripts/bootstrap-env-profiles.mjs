@@ -40,10 +40,12 @@ base = removeKey(base, "BOT_ENV_PROFILE");
 let production = upsert(base, "BOT_ENV_PROFILE", "production");
 production = upsert(production, "SIMULATION_MODE", "false");
 production = upsert(production, "RPC_BUDGET_MODE", "false");
+production = applyReceiverV5Defaults(production);
 writeFileSync(resolve(root, ".env.production"), production, "utf8");
 
 let productionBudget = upsert(production, "BOT_ENV_PROFILE", "production-budget");
 productionBudget = upsert(productionBudget, "RPC_BUDGET_MODE", "true");
+productionBudget = applyReceiverV5Defaults(productionBudget);
 writeFileSync(resolve(root, ".env.production.budget"), productionBudget, "utf8");
 
 let simulation = upsert(production, "BOT_ENV_PROFILE", "simulation");
@@ -53,6 +55,7 @@ simulation = upsert(simulation, "ENABLE_HEAP_SNAPSHOTS", "true");
 simulation = upsert(simulation, "MEMORY_LOG_EVERY_CYCLES", "300");
 simulation = upsert(simulation, "GATE_SCALE_FACTOR", "2");
 simulation = upsert(simulation, "COMPETITIVE_GAP_MIN_RATIO", "0.35");
+simulation = applyReceiverV5Defaults(simulation);
 for (const key of [
   "POLL_INTERVAL_MS",
   "MULTICALL_BATCH_SIZE",
@@ -64,8 +67,17 @@ for (const key of [
 }
 writeFileSync(resolve(root, ".env.simulation"), simulation, "utf8");
 
-function applyEventPurityStack(content) {
+function applyReceiverV5Defaults(content) {
   let next = content;
+  // Per-pair Uniswap fee map is authoritative; global fee is debug-only.
+  next = removeKey(next, "LIQUIDATION_SWAP_POOL_FEE");
+  next = upsert(next, "LIQUIDATION_RECEIVER_EXPECTED_VERSION", "5");
+  next = upsert(next, "LIQUIDATION_SWAP_SLIPPAGE_BPS", "200");
+  return next;
+}
+
+function applyEventPurityStack(content) {
+  let next = applyReceiverV5Defaults(content);
   const keys = {
     USE_EVENT_WATCHLIST: "true",
     USE_PIPELINE_ORCHESTRATOR: "true",

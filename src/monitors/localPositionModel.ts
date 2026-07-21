@@ -293,12 +293,14 @@ export class LocalPositionModel {
     const assetKey = asset.toLowerCase();
     const normalizedPrice = answer * 10n ** BigInt(18 - decimals);
     this.prices.set(assetKey, normalizedPrice);
+    // Tag Chainlink so gap-fill (source=aave/peg) and feed freshness never collide on source.
     this.feedStates.set(assetKey, {
       answer,
       decimals,
       updatedAt: updatedAtSec,
       feedAddress: feed,
       asset,
+      source: "chainlink",
     });
 
     const pegChanges = this.syncDerivedPegPrices(updatedAtSec, asset);
@@ -596,6 +598,34 @@ export class LocalPositionModel {
     } catch (error) {
       return { status: "error", reason: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  /**
+   * Recompute tiers for positions touching any of `assets` after a gap-fill price write.
+   * `registerBootstrapPrice` / `registerAavePrice` update prices+feedStates but do not emit
+   * TierChanges — without this, gap-fill-only books stay on stale cached HF until the next
+   * Chainlink or Aave event (execution-order / write-gap race with the oracle poll).
+   */
+  public recomputeTiersForAssets(
+    assets: readonly Address[],
+    nowSec: number = Math.floor(Date.now() / 1000),
+  ): TierChange[] {
+    if (assets.length === 0) {
+      return [];
+    }
+    const seen = new Set<string>();
+    const changes: TierChange[] = [];
+    for (const asset of assets) {
+      for (const change of this.recomputeTierChangesForAsset(asset, nowSec)) {
+        const key = change.account.toLowerCase();
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        changes.push(change);
+      }
+    }
+    return changes;
   }
 
   private recomputeTierChangesForAsset(asset: Address, nowSec: number): TierChange[] {

@@ -20,6 +20,8 @@ export interface ViemExecutionClientConfig {
     account?: { address: `0x${string}` };
     sendTransaction(args: Record<string, unknown>): Promise<`0x${string}`>;
   };
+  /** Defaults to 30_000 — must stay ≤ in-flight drain bound. */
+  readonly receiptTimeoutMs?: number;
 }
 
 export class ViemExecutionClient implements ExecutionPreflightClient {
@@ -86,20 +88,31 @@ export class ViemExecutionClient implements ExecutionPreflightClient {
     });
   }
 
-  public async waitForReceipt(hash: `0x${string}`): Promise<{ readonly status: "included" | "reorged" | "reverted" }> {
-    const receipt = await this.config.publicClient.waitForTransactionReceipt({ hash });
-    if (
-      receipt.status === "success"
-      && receipt.blockNumber !== undefined
-      && receipt.blockHash !== undefined
-      && this.config.publicClient.getBlock !== undefined
-    ) {
-      const canonical = await this.config.publicClient.getBlock({ blockNumber: receipt.blockNumber });
-      if (canonical.hash !== receipt.blockHash) {
-        return { status: "reorged" };
+  public async waitForReceipt(hash: `0x${string}`): Promise<{ readonly status: "included" | "reorged" | "reverted" | "timeout" }> {
+    try {
+      const receipt = await this.config.publicClient.waitForTransactionReceipt({
+        hash,
+        timeout: this.config.receiptTimeoutMs ?? 30_000,
+      });
+      if (
+        receipt.status === "success"
+        && receipt.blockNumber !== undefined
+        && receipt.blockHash !== undefined
+        && this.config.publicClient.getBlock !== undefined
+      ) {
+        const canonical = await this.config.publicClient.getBlock({ blockNumber: receipt.blockNumber });
+        if (canonical.hash !== receipt.blockHash) {
+          return { status: "reorged" };
+        }
       }
+      return receipt.status === "success" ? { status: "included" } : { status: "reverted" };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.toLowerCase().includes("timed out") || message.toLowerCase().includes("timeout")) {
+        return { status: "timeout" };
+      }
+      throw error;
     }
-    return receipt.status === "success" ? { status: "included" } : { status: "reverted" };
   }
 
   private requireAccount(): `0x${string}` {

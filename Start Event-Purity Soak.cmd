@@ -13,6 +13,9 @@ echo   Safety gate skipped (shadow soak)
 echo.
 echo First time? Run: npm run env:bootstrap
 echo        then: npm run env:merge-example -- --target .env.event-purity-soak
+echo        then: npm run env:sync-receiver-v5
+echo.
+echo Shadow only — does NOT send live liquidations.
 echo.
 call scripts\launcher-set-dotenv.cmd .env.event-purity-soak
 if errorlevel 1 (

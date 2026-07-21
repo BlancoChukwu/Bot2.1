@@ -194,7 +194,12 @@ describe("refreshGapFillPrices", () => {
       logger: { info: vi.fn(), warn, error: vi.fn() },
     });
 
-    expect(result).toEqual({ refreshed: 0, failed: [BASE_AAVE], targetCount: 1 });
+    expect(result).toEqual({
+      refreshed: 0,
+      failed: [BASE_AAVE],
+      targetCount: 1,
+      refreshedAssets: [],
+    });
     expect(warn).toHaveBeenCalledWith(
       "oracle_gap_fill_refresh_failed",
       expect.objectContaining({ error: "Error: rpc_down" }),

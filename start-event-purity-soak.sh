@@ -5,7 +5,8 @@ cd "$ROOT"
 
 echo "Aave V3 — EVENT-PURITY 48h SOAK (shadow)"
 echo "Profile: .env.event-purity-soak"
-echo "Branch:  revised-live-bot (pull before start — includes oracle validation + USDbC peg fast-path)"
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+echo "Branch:  ${BRANCH} (fast-forward pull before start)"
 if [[ ! -f "$ROOT/.env.event-purity-soak" ]]; then
   echo "Missing .env.event-purity-soak — run: npm run env:bootstrap"
   exit 1
@@ -24,7 +25,14 @@ if ! command -v pm2 >/dev/null 2>&1; then
   echo "pm2 not found — install with: npm i -g pm2"
   exit 1
 fi
-git pull --ff-only origin master
+# Pull the checked-out branch (never hard-code master).
+if [[ "$BRANCH" != "unknown" && "$BRANCH" != "HEAD" ]]; then
+  git pull --ff-only origin "$BRANCH" || {
+    echo "WARN: git pull --ff-only origin ${BRANCH} failed — continuing with local HEAD"
+  }
+else
+  echo "WARN: detached HEAD — skipping git pull"
+fi
 echo "git_head=$(git rev-parse --short HEAD)"
 node scripts/ensure-redis.mjs
 npm run build

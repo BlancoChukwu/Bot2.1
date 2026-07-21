@@ -84,7 +84,7 @@ function writeSessionEcosystem(outFile, errFile) {
       merge_logs: false,
       out_file: ${JSON.stringify(outFile)},
       error_file: ${JSON.stringify(errFile)},
-      kill_timeout: 15_000,
+      kill_timeout: 75_000,
       env: {
         NODE_ENV: "production",
       },

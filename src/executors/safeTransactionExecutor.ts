@@ -6,6 +6,13 @@ import type { RouteSelectionInput, RouteSelectionResult } from "../profitability
 import { resolveLiquidationGasLimit } from "../config/liquidationGasLimits";
 import { logOpportunityTrace } from "../observability/opportunityTrace";
 import type { LocalNonceManager, NonceReservation } from "./nonceManager";
+import type { InFlightExecutionRegistry } from "./inFlightExecutionRegistry";
+import type { RecentLiquidationAttemptLedger } from "./recentLiquidationAttemptLedger";
+
+/** Bounded receipt wait — must be ≤ drain bound so shutdown can finish. */
+export const EXECUTION_RECEIPT_TIMEOUT_MS = 30_000;
+/** Shutdown drain waits at most this long for in-flight executions. */
+export const IN_FLIGHT_DRAIN_MAX_MS = 60_000;
 
 export interface TransactionEnvelope {
   readonly to: Address;
@@ -66,7 +73,8 @@ export type ExecutionReceipt =
   | { readonly status: "included" }
   | { readonly status: "underpriced" }
   | { readonly status: "reorged" }
-  | { readonly status: "reverted"; readonly reason?: string };
+  | { readonly status: "reverted"; readonly reason?: string }
+  | { readonly status: "timeout" };
 
 export interface SafeExecutionRequest {
   readonly chain: SupportedChain;
@@ -88,8 +96,8 @@ export interface SafeExecutionRequest {
 export type SafeExecutionResult =
   | { readonly status: "sent"; readonly txHash: Hash }
   | { readonly status: "simulated" }
-  | { readonly status: "rejected"; readonly reason: "route_rejected" | "route_transaction_mismatch" | "final_simulation_failed" | "execution_circuit_open" | "dust_filtered" | "borrower_cooldown" }
-  | { readonly status: "failed"; readonly reason: "receipt_reorged" | "receipt_reverted" | "send_failed" };
+  | { readonly status: "rejected"; readonly reason: "route_rejected" | "route_transaction_mismatch" | "final_simulation_failed" | "execution_circuit_open" | "dust_filtered" | "borrower_cooldown" | "recent_attempt_inflight" }
+  | { readonly status: "failed"; readonly reason: "receipt_reorged" | "receipt_reverted" | "send_failed" | "receipt_timeout" };
 
 export interface FlashLoanRouteSelector {
   selectBestRoute(input: RouteSelectionInput): Promise<RouteSelectionResult>;
@@ -111,6 +119,8 @@ export interface SafeTransactionExecutorConfig {
   readonly dryRunMode?: boolean;
   readonly rejectBeforePreview?: (request: SafeExecutionRequest) => Promise<string | undefined>;
   readonly rejectBeforeBroadcast?: (request: SafeExecutionRequest) => Promise<string | undefined>;
+  readonly inFlightRegistry?: InFlightExecutionRegistry;
+  readonly recentAttemptLedger?: RecentLiquidationAttemptLedger;
   readonly quoteExecutionGasCap?: (input: { readonly expectedProfitUsd: number; readonly gasLimit: bigint }) => Promise<{
     readonly maxFeePerGas: bigint;
   }>;
@@ -257,6 +267,15 @@ export class SafeTransactionExecutor {
         });
         return { status: "rejected", reason: "final_simulation_failed" };
       }
+      if (await this.isRecentAttemptBlocked(request)) {
+        this.releaseNonce(request, preflight.nonce);
+        this.config.logger.warn("execution_rejected_recent_attempt_inflight", {
+          chain: request.chain,
+          opportunityId: request.opportunityId,
+          account: request.account,
+        });
+        return { status: "rejected", reason: "recent_attempt_inflight" };
+      }
       return await this.submitWithReplacement(request, transaction, overrides);
     } catch (error) {
       this.config.metrics.recordError();
@@ -338,8 +357,10 @@ export class SafeTransactionExecutor {
     if (firstHash === undefined) {
       return { status: "failed", reason: "send_failed" };
     }
+    await this.onSubmitted(request, firstHash);
     const firstReceipt = await this.config.client.waitForReceipt(firstHash);
     if (firstReceipt.status === "included") {
+      await this.onTerminal(request, "included");
       this.recordPipelineLatency(
         "submit_to_inclusion_ms",
         request,
@@ -348,6 +369,10 @@ export class SafeTransactionExecutor {
       );
       return { status: "sent", txHash: firstHash };
     }
+    if (firstReceipt.status === "timeout") {
+      await this.onTerminal(request, "timeout");
+      return { status: "failed", reason: "receipt_timeout" };
+    }
     if (firstReceipt.status === "underpriced") {
       const bumpedOverrides = {
         ...overrides,
@@ -355,10 +380,13 @@ export class SafeTransactionExecutor {
       };
       const replacementHash = await this.sendReplacement(request, transaction, bumpedOverrides);
       if (replacementHash === undefined) {
+        await this.onTerminal(request, "reverted");
         return { status: "failed", reason: "send_failed" };
       }
+      this.config.inFlightRegistry?.trackSubmitted(request.opportunityId, replacementHash);
       const replacementReceipt = await this.config.client.waitForReceipt(replacementHash);
       if (replacementReceipt.status === "included") {
+        await this.onTerminal(request, "included");
         this.recordPipelineLatency(
           "submit_to_inclusion_ms",
           request,
@@ -367,10 +395,71 @@ export class SafeTransactionExecutor {
         );
         return { status: "sent", txHash: replacementHash };
       }
+      if (replacementReceipt.status === "timeout") {
+        await this.onTerminal(request, "timeout");
+        return { status: "failed", reason: "receipt_timeout" };
+      }
+      await this.onTerminal(request, "reverted");
       return toFailedReceipt(replacementReceipt);
     }
 
+    await this.onTerminal(request, "reverted");
     return toFailedReceipt(firstReceipt);
+  }
+
+  private async isRecentAttemptBlocked(request: SafeExecutionRequest): Promise<boolean> {
+    const ledger = this.config.recentAttemptLedger;
+    const hint = request.gasLimitHint;
+    if (ledger === undefined || hint === undefined) {
+      return false;
+    }
+    return ledger.isBlocked({
+      chain: request.chain,
+      account: request.account,
+      collateralAsset: hint.collateralAsset,
+      debtAsset: hint.debtAsset,
+    });
+  }
+
+  private async onSubmitted(request: SafeExecutionRequest, txHash: Hash): Promise<void> {
+    this.config.inFlightRegistry?.trackSubmitted(request.opportunityId, txHash);
+    const ledger = this.config.recentAttemptLedger;
+    const hint = request.gasLimitHint;
+    if (ledger === undefined || hint === undefined) {
+      return;
+    }
+    await ledger.recordSubmitted({
+      chain: request.chain,
+      account: request.account,
+      collateralAsset: hint.collateralAsset,
+      debtAsset: hint.debtAsset,
+      txHash,
+    });
+  }
+
+  private async onTerminal(
+    request: SafeExecutionRequest,
+    outcome: "included" | "reverted" | "timeout",
+  ): Promise<void> {
+    this.config.inFlightRegistry?.complete(request.opportunityId);
+    const ledger = this.config.recentAttemptLedger;
+    const hint = request.gasLimitHint;
+    if (ledger === undefined || hint === undefined) {
+      return;
+    }
+    const key = {
+      chain: request.chain,
+      account: request.account,
+      collateralAsset: hint.collateralAsset,
+      debtAsset: hint.debtAsset,
+    };
+    if (outcome === "included") {
+      await ledger.markIncluded(key);
+      return;
+    }
+    // Revert OR receipt timeout: clear block immediately so a real opportunity
+    // is not held for the full TTL behind a known failure / unknown outcome.
+    await ledger.markReverted(key);
   }
 
   private async sendOrReplaceUnderpriced(
@@ -565,6 +654,9 @@ function toFailedReceipt(receipt: ExecutionReceipt): SafeExecutionResult {
   }
   if (receipt.status === "reverted") {
     return { status: "failed", reason: "receipt_reverted" };
+  }
+  if (receipt.status === "timeout") {
+    return { status: "failed", reason: "receipt_timeout" };
   }
 
   return { status: "failed", reason: "receipt_reverted" };

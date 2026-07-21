@@ -1,0 +1,13 @@
+{
+  "stylesheet": "docs/cheat-sheet-pdf.css",
+  "pdf_options": {
+    "format": "A4",
+    "margin": {
+      "top": "14mm",
+      "bottom": "14mm",
+      "left": "12mm",
+      "right": "12mm"
+    },
+    "printBackground": true
+  }
+}

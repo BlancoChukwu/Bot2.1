@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Aave V3 Liquidator — Command Cheat Sheet</title>
+  <style>
+    @page { size: A4; margin: 12mm; }
+    body { font-family: "Segoe UI", Helvetica, Arial, sans-serif; font-size: 9pt; line-height: 1.35; color: #111; margin: 0; padding: 0; }
+    h1 { font-size: 17pt; border-bottom: 2px solid #2563eb; padding-bottom: 4px; margin: 0 0 8px; }
+    .subtitle { color: #475569; font-size: 9pt; margin-bottom: 14px; }
+    h2 { font-size: 11pt; color: #1e40af; margin: 14px 0 6px; page-break-after: avoid; }
+    h3 { font-size: 9.5pt; margin: 10px 0 4px; page-break-after: avoid; }
+    table { width: 100%; border-collapse: collapse; margin: 6px 0 10px; font-size: 8pt; page-break-inside: avoid; }
+    th { background: #eff6ff; color: #1e3a8a; text-align: left; padding: 4px 5px; border: 1px solid #cbd5e1; }
+    td { padding: 3px 5px; border: 1px solid #e2e8f0; vertical-align: top; }
+    code { font-family: Consolas, monospace; font-size: 7.5pt; background: #f1f5f9; padding: 1px 3px; }
+    ol { margin: 4px 0 8px; padding-left: 18px; }
+    li { margin-bottom: 2px; }
+    .note { font-size: 8pt; color: #64748b; font-style: italic; }
+    .section { margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+
+<h1>Aave V3 Liquidator — Command Cheat Sheet</h1>
+<p class="subtitle">Base · Event-purity stack (Flashblocks WS + oracle bootstrap + shadow validator) · VM quick reference</p>
+
+<h2>Current VM startup sequence (recommended)</h2>
+
+<h3>One-time setup</h3>
+<table>
+  <tr><th>Step</th><th>Command</th></tr>
+  <tr><td>Enter repo</td><td><code>cd ~/optimism-aave-v3-liquidator-ts</code></td></tr>
+  <tr><td>Install deps</td><td><code>npm install</code></td></tr>
+  <tr><td>Create env profiles</td><td><code>npm run env:bootstrap</code></td></tr>
+  <tr><td>Sync template keys</td><td><code>npm run env:merge-example -- --target .env.event-purity-soak</code><br><code>npm run env:merge-example -- --target .env.event-purity-production</code></td></tr>
+  <tr><td>Make executable</td><td><code>chmod +x start-*.sh watch-bot.sh scripts/launcher-run-bot-detached.sh</code></td></tr>
+  <tr><td>Edit secrets</td><td>Edit <code>.env.event-purity-soak</code> and <code>.env.event-purity-production</code></td></tr>
+</table>
+
+<h3>Before first live run</h3>
+<table>
+  <tr><th>Step</th><th>Command</th><th>Notes</th></tr>
+  <tr><td>A</td><td><code>./start-event-purity-soak.sh</code></td><td>48h shadow soak, no live TX</td></tr>
+  <tr><td>B</td><td><code>./watch-bot.sh</code></td><td>Monitor; <code>--once</code> for snapshot</td></tr>
+  <tr><td>C</td><td><code>npm run dry-run:receipt:event-purity-production</code></td><td>Required for safety gate</td></tr>
+  <tr><td>D</td><td><code>./start-event-purity-production.sh</code></td><td>Start live within <strong>15 min</strong> of receipt</td></tr>
+</table>
+
+<h3>What each start script does</h3>
+<ol>
+  <li><code>npm run bot:stop</code></li>
+  <li><code>node scripts/ensure-redis.mjs</code></li>
+  <li><code>npm run build</code></li>
+  <li><code>node scripts/preflight-event-purity-env.mjs</code> (event-purity only)</li>
+  <li><code>scripts/launcher-run-bot-detached.sh</code> — detached <code>nohup</code> bot</li>
+</ol>
+<p class="note">Logs: logs/&lt;prefix&gt;-YYYYMMDD-HHMMSS.log · Pointer: logs/latest-session.txt</p>
+
+<h3>Day-to-day ops</h3>
+<table>
+  <tr><th>Action</th><th>Command</th></tr>
+  <tr><td>Monitor (30s refresh)</td><td><code>./watch-bot.sh</code></td></tr>
+  <tr><td>Single snapshot</td><td><code>./watch-bot.sh --once</code></td></tr>
+  <tr><td>Monitor + audit</td><td><code>./watch-bot.sh --audit</code></td></tr>
+  <tr><td>Tail log</td><td><code>tail -f logs/event-purity-production-*.log</code></td></tr>
+  <tr><td>Process status</td><td><code>npm run bot:status</code></td></tr>
+  <tr><td>Stop</td><td><code>npm run bot:stop</code></td></tr>
+  <tr><td>Health</td><td><code>curl -s http://127.0.0.1:9090/healthz</code></td></tr>
+  <tr><td>Status JSON</td><td><code>curl -s http://127.0.0.1:9090/status</code></td></tr>
+  <tr><td>Metrics</td><td><code>curl -s http://127.0.0.1:9090/metrics</code></td></tr>
+</table>
+
+<h2>VM shell launchers (Ubuntu/Linux)</h2>
+<table>
+  <tr><th>Command</th><th>Env profile</th><th>Mode</th></tr>
+  <tr><td><code>./start-event-purity-soak.sh</code></td><td>.env.event-purity-soak</td><td><strong>Recommended soak</strong></td></tr>
+  <tr><td><code>./start-event-purity-production.sh</code></td><td>.env.event-purity-production</td><td><strong>Recommended live</strong></td></tr>
+  <tr><td><code>./start-simulation.sh</code></td><td>.env.simulation</td><td>Legacy soak</td></tr>
+  <tr><td><code>./start-production.sh</code></td><td>.env.production</td><td>Legacy live</td></tr>
+  <tr><td><code>./start-production-budget.sh</code></td><td>.env.production.budget</td><td>Legacy live (RPC budget)</td></tr>
+  <tr><td><code>./watch-bot.sh [--once|--audit|--interval N]</code></td><td>—</td><td>Live monitor</td></tr>
+</table>
+
+<h2>Windows launchers (.cmd)</h2>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td>Start Event-Purity Soak.cmd</td><td>48h event-purity soak</td></tr>
+  <tr><td>Start Event-Purity Production.cmd</td><td>Event-purity live</td></tr>
+  <tr><td>Start Simulation Bot.cmd</td><td>Legacy simulation</td></tr>
+  <tr><td>Start Production Bot.cmd</td><td>Legacy live</td></tr>
+  <tr><td>Start Production Bot (Budget).cmd</td><td>Legacy live, RPC budget</td></tr>
+  <tr><td>Start Production Bot (No Gate).cmd</td><td>Legacy live, skip safety gate</td></tr>
+  <tr><td>Start Live Bot.cmd</td><td>Foreground ts-node live</td></tr>
+  <tr><td>Stop Bot.cmd</td><td>Stop bot</td></tr>
+  <tr><td>Setup Dry Run Receipt.cmd</td><td>Dry-run receipt helper</td></tr>
+</table>
+
+<h2>npm — bot lifecycle</h2>
+<table>
+  <tr><th>Command</th><th>Purpose</th></tr>
+  <tr><td><code>npm run build</code></td><td>Compile TypeScript</td></tr>
+  <tr><td><code>npm run start</code></td><td>Run compiled bot</td></tr>
+  <tr><td><code>npm run dev</code></td><td>ts-node dev run</td></tr>
+  <tr><td><code>npm run start:sim</code></td><td>Foreground simulation</td></tr>
+  <tr><td><code>npm run start:live</code></td><td>Foreground live</td></tr>
+  <tr><td><code>npm run bot:status</code></td><td>Lock + PID status (JSON)</td></tr>
+  <tr><td><code>npm run bot:stop</code></td><td>Graceful stop</td></tr>
+  <tr><td><code>npm run redis:ensure</code></td><td>Start/verify Redis</td></tr>
+</table>
+
+<h2>npm — environment</h2>
+<table>
+  <tr><th>Command</th><th>Purpose</th></tr>
+  <tr><td><code>npm run env:bootstrap</code></td><td>Create all env profiles</td></tr>
+  <tr><td><code>npm run env:merge-example</code></td><td>Merge .env.example keys</td></tr>
+  <tr><td><code>npm run dry-run:receipt</code></td><td>Receipt for legacy production</td></tr>
+  <tr><td><code>npm run dry-run:receipt:event-purity-production</code></td><td>Receipt for event-purity live</td></tr>
+</table>
+
+<h2>npm — test &amp; validation</h2>
+<table>
+  <tr><th>Command</th><th>Purpose</th></tr>
+  <tr><td><code>npm test</code></td><td>Unit tests (vitest)</td></tr>
+  <tr><td><code>npm run test:watch</code></td><td>Vitest watch</td></tr>
+  <tr><td><code>npm run test:coverage</code></td><td>Coverage</td></tr>
+  <tr><td><code>npm run test:chaos</code></td><td>Chaos tests only</td></tr>
+  <tr><td><code>npm run typecheck</code></td><td>TypeScript check</td></tr>
+  <tr><td><code>npm run test:flashblocks</code></td><td>Flashblocks WS probe</td></tr>
+  <tr><td><code>npm run verify:pre-soak-phase0</code></td><td>Pre-soak phase-0 check</td></tr>
+  <tr><td><code>npm run benchmark:base</code></td><td>Base replay benchmark</td></tr>
+  <tr><td><code>npm run benchmark:rpc</code></td><td>RPC latency benchmark</td></tr>
+  <tr><td><code>npm run check:rpc-gates</code></td><td>RPC SLO gates</td></tr>
+  <tr><td><code>npm run probe:multicall-base</code></td><td>Multicall batch probe</td></tr>
+  <tr><td><code>npm run debug:hf-sweep-base</code></td><td>HF sweep debug</td></tr>
+  <tr><td><code>npm run replay:historical</code></td><td>Historical replay</td></tr>
+  <tr><td><code>npm run replay:liquidation-block</code></td><td>Liquidation block replay</td></tr>
+</table>
+
+<h2>npm — audits &amp; reports</h2>
+<table>
+  <tr><th>Command</th><th>Purpose</th></tr>
+  <tr><td><code>npm run audit:watchlist-base</code></td><td>Watchlist audit</td></tr>
+  <tr><td><code>npm run audit:dex-surface-base</code></td><td>DEX surface audit</td></tr>
+  <tr><td><code>npm run audit:morpho-preliquidation-base</code></td><td>Morpho audit</td></tr>
+  <tr><td><code>npm run report:competitive-gap</code></td><td>Competitive gap (48h)</td></tr>
+  <tr><td><code>npm run review:daily-pipeline</code></td><td>Daily pipeline review</td></tr>
+  <tr><td><code>npm run pairs:top-base</code></td><td>Top Base pairs</td></tr>
+</table>
+
+<h2>npm — build &amp; deploy</h2>
+<table>
+  <tr><th>Command</th><th>Purpose</th></tr>
+  <tr><td><code>npm run compile:contracts</code></td><td>Compile Solidity receiver</td></tr>
+  <tr><td><code>npm run deploy:liquidation-receiver:base</code></td><td>Deploy on Base</td></tr>
+  <tr><td><code>npm run rust:build</code></td><td>Build rust-hotpath</td></tr>
+</table>
+
+<h2>Direct node scripts</h2>
+<table>
+  <tr><th>Command</th><th>Purpose</th></tr>
+  <tr><td><code>node scripts/audit-session.mjs &lt;log&gt;</code></td><td>Full session audit</td></tr>
+  <tr><td><code>node scripts/watch-bot-summary.mjs &lt;log&gt;</code></td><td>Session summary</td></tr>
+  <tr><td><code>node scripts/detect-critical-log-errors.mjs &lt;log&gt;</code></td><td>Critical error scan</td></tr>
+  <tr><td><code>node scripts/preflight-event-purity-env.mjs &lt;env&gt;</code></td><td>Env preflight</td></tr>
+  <tr><td><code>node scripts/verify-bot-launch.mjs &lt;log&gt;</code></td><td>Verify launch in log</td></tr>
+  <tr><td><code>node scripts/soak-production-report.mjs</code></td><td>Soak report</td></tr>
+  <tr><td><code>node scripts/secret-scan.mjs</code></td><td>Secret scan</td></tr>
+</table>
+
+<h2>PM2 (optional alternative)</h2>
+<table>
+  <tr><th>Command</th><th>Purpose</th></tr>
+  <tr><td><code>pm2 start ecosystem.config.cjs</code></td><td>Start via PM2</td></tr>
+  <tr><td><code>pm2 logs aave-liquidator-base</code></td><td>Tail logs</td></tr>
+  <tr><td><code>pm2 stop aave-liquidator-base</code></td><td>Stop</td></tr>
+</table>
+
+<h2>Troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Action</th></tr>
+  <tr><td>Live blocked</td><td>Run dry-run receipt; start within 15 min</td></tr>
+  <tr><td>Missing profile</td><td><code>npm run env:bootstrap</code></td></tr>
+  <tr><td>Multiple bots</td><td><code>npm run bot:status</code> then <code>npm run bot:stop</code></td></tr>
+  <tr><td>Sequencer bootstrap fatal</td><td>Wait for Base sequencer recovery + grace</td></tr>
+</table>
+
+<p class="note">See docs/ENV_PROFILES.md and README.md for full detail.</p>
+</body>
+</html>

@@ -46,6 +46,30 @@ if (truthyValue(env.ENABLE_ARBITRAGE)) {
 if (truthyValue(env.FLASHBLOCKS_PRIMARY_LOOP)) {
   warnings.push("FLASHBLOCKS_PRIMARY_LOOP=true — event-purity stack uses native WS clock");
 }
+if (hasValue(env.LIQUIDATION_SWAP_POOL_FEE)) {
+  warnings.push(
+    "LIQUIDATION_SWAP_POOL_FEE is set — this is a debug override; leave unset for the per-pair Uniswap fee map",
+  );
+}
+if (!hasValue(env.LIQUIDATION_RECEIVER_EXPECTED_VERSION)) {
+  warnings.push(
+    "LIQUIDATION_RECEIVER_EXPECTED_VERSION missing — bot defaults to 5; set explicitly after merging .env.example",
+  );
+} else if (env.LIQUIDATION_RECEIVER_EXPECTED_VERSION.trim() !== "5") {
+  warnings.push(
+    `LIQUIDATION_RECEIVER_EXPECTED_VERSION=${env.LIQUIDATION_RECEIVER_EXPECTED_VERSION} — production path expects 5`,
+  );
+}
+if (!hasValue(env.LIQUIDATION_SWAP_SLIPPAGE_BPS)) {
+  warnings.push(
+    "LIQUIDATION_SWAP_SLIPPAGE_BPS missing — merge from .env.example (default 200 = 2% oracle floor)",
+  );
+}
+if (truthyValue(env.ENABLE_LIVE_TX)) {
+  warnings.push(
+    "ENABLE_LIVE_TX=true — requires deployed v5 LiquidationFlashReceiver + dry-run receipt within 15 minutes",
+  );
+}
 
 const executionHost = hostFromUrl(env.EXECUTION_RPC_URL_PRIMARY ?? env.RPC_URL);
 if (executionHost.includes("alchemy.com")) {

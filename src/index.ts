@@ -37,6 +37,12 @@ import {
   assertUniswapV3FeeTier,
   type UniswapV3FeeTier,
 } from "./protocols/liquidationFlashLoanReceiver";
+import {
+  getMappedRoute,
+  mappedAssetDecimals,
+  planUniswapV3LiquidationRoute,
+} from "./config/uniswapV3LiquidationRoutes";
+import { computeUniswapV3PoolTvlUsd, type PoolTvlReadClient } from "./oracle/uniswapV3PoolTvl";
 import { LocalNonceManager } from "./executors/nonceManager";
 import { PrivateSubmissionClient, type PrivateTxMode } from "./executors/PrivateSubmissionClient";
 import { SafeTransactionExecutor } from "./executors/safeTransactionExecutor";
@@ -72,7 +78,17 @@ import { parseWatchlistReserveAllowlist } from "./config/watchlistReserveAllowli
 import { SimFailureCircuitBreaker } from "./executors/simFailureCircuitBreaker";
 import { resetCycleDiagnosticsCollector } from "./observability/cycleDiagnostics";
 import { CompetitiveGapAnalyzer } from "./observability/competitiveGapAnalyzer";
-import { evaluateOracleSanity, logOracleSanityFailure } from "./oracles/oracleSanityGate";
+import { evaluateLiquidationOracleSanity, createTwapResolver, logLiquidationOracleSanityFailure } from "./oracles/oracleSanityGate";
+import {
+  EXECUTION_RECEIPT_TIMEOUT_MS,
+  IN_FLIGHT_DRAIN_MAX_MS,
+} from "./executors/safeTransactionExecutor";
+import { InFlightExecutionRegistry } from "./executors/inFlightExecutionRegistry";
+import {
+  RecentLiquidationAttemptLedger,
+  RECENT_LIQUIDATION_ATTEMPT_TTL_MS,
+} from "./executors/recentLiquidationAttemptLedger";
+import { ORACLE_SANITY_DEVIATION_THRESHOLD_PCT, ORACLE_SANITY_TWAP_SECONDS } from "./oracle/uniswapV3TwapPrice";
 import {
   createReserveAwareCandidates,
   ReserveAwareBorrowerCache,
@@ -81,7 +97,7 @@ import {
 import { PipelineDetectionAdapter } from "./orchestrator/pipelineDetectionAdapter";
 import { PipelineDeadLetterQueue, PipelineOrchestrator } from "./orchestrator/pipelineOrchestrator";
 import { BayesianHazardModel, NoRegretOpportunityRanker } from "./optimization/hazardPrediction";
-import { buildLiquidationCallParams, ViemAaveV3Protocol } from "./protocols/aaveV3";
+import { buildLiquidationCallParams, ViemAaveV3Protocol, type LiquidationCandidate } from "./protocols/aaveV3";
 import { FlashLoanProviderRouter } from "./profitability/flashLoanProviderRouter";
 import { ProfitabilityEngine } from "./profitability/profitabilityEngine";
 import { ReplayHarness } from "./backtesting/replayHarness";
@@ -185,8 +201,8 @@ export interface RuntimeConfig {
   readonly usePipelineOrchestrator: boolean;
   readonly arbitrageReceiverAddress: Address | undefined;
   readonly liquidationReceiverAddress: Address | undefined;
-  /** Uniswap V3 fee tier for liquidation route field 8 (enum 100/500/3000/10000). */
-  readonly liquidationSwapFee: 100 | 500 | 3_000 | 10_000;
+  /** Explicit debug override; production normally uses the static per-pair map. */
+  readonly liquidationSwapFeeOverride: UniswapV3FeeTier | undefined;
   readonly dailyPnlCsvPath: string | undefined;
   readonly arbitrageMinProfitUsd: number;
   readonly priceFeedRegistry: OracleFeedRegistry | undefined;
@@ -301,7 +317,9 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     usePipelineOrchestrator,
     arbitrageReceiverAddress: parseAddress(optionalEnv(parsedEnv, "ARBITRAGE_RECEIVER_ADDRESS")),
     liquidationReceiverAddress: parseAddress(optionalEnv(parsedEnv, "LIQUIDATION_RECEIVER_ADDRESS")),
-    liquidationSwapFee: parseLiquidationSwapFee(optionalEnv(parsedEnv, "LIQUIDATION_SWAP_POOL_FEE")),
+    liquidationSwapFeeOverride: parseLiquidationSwapFeeOverride(
+      optionalEnv(parsedEnv, "LIQUIDATION_SWAP_POOL_FEE"),
+    ),
     dailyPnlCsvPath: optionalEnv(parsedEnv, "DAILY_PNL_CSV_PATH"),
     arbitrageMinProfitUsd: parseMinNumber(parsedEnv.ARBITRAGE_MIN_PROFIT_USD, 0.15, 0, "ARBITRAGE_MIN_PROFIT_USD"),
     priceFeedRegistry,
@@ -324,6 +342,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     eventPurity: parseEventPurityConfig(parsedEnv),
   };
   assertPipelineFlashLiquidationReadiness(config);
+  assertLiveTxOracleSanityReadiness(config);
   if (config.eventPurity.enableArbitrage) {
     assertArbitragePriceFeedCoverage(config);
   }
@@ -454,6 +473,7 @@ function buildExecutionPreflightClient(input: {
     return new ViemExecutionClient({
       publicClient: input.publicClient,
       walletClient: input.walletClient,
+      receiptTimeoutMs: EXECUTION_RECEIPT_TIMEOUT_MS,
     });
   }
 
@@ -469,9 +489,61 @@ function buildExecutionPreflightClient(input: {
       fallbackRpcUrls: [],
       privateKey: input.privateKey,
     }),
+    receiptTimeoutMs: EXECUTION_RECEIPT_TIMEOUT_MS,
   }));
   input.logger.info("parallel_broadcast_enabled", { endpoints: rpcUrls.length });
   return new ParallelBroadcastClient({ clients, logger: input.logger });
+}
+
+/**
+ * Execution-time live pool TVL (USD) for thin mapped pairs, so the size cap is
+ * sized against current on-chain liquidity rather than the static snapshot.
+ * Returns undefined for non-thin/unmapped pairs, non-Base chains, or on probe
+ * failure — the planner then falls back to the snapshot (the on-chain oracle
+ * floor and final tx simulation remain as revert backstops).
+ */
+async function resolveThinPoolLiveTvlUsd(
+  chain: SupportedChain,
+  candidate: LiquidationCandidate,
+  publicClient: PoolTvlReadClient,
+  oracle: Address,
+  logger: LoggerLike,
+): Promise<number | undefined> {
+  if (chain !== "base") {
+    return undefined;
+  }
+  const route = getMappedRoute(candidate.collateralAsset, candidate.debtAsset);
+  if (route === undefined || !route.thin) {
+    return undefined;
+  }
+  const collateralDecimals = mappedAssetDecimals(candidate.collateralAsset);
+  const debtDecimals = mappedAssetDecimals(candidate.debtAsset);
+  if (collateralDecimals === undefined || debtDecimals === undefined) {
+    return undefined;
+  }
+  try {
+    const { tvlUsd } = await computeUniswapV3PoolTvlUsd(publicClient, {
+      tokenA: { address: candidate.collateralAsset, decimals: collateralDecimals },
+      tokenB: { address: candidate.debtAsset, decimals: debtDecimals },
+      fee: route.fee,
+      oracle,
+    });
+    logger.info("liquidation_thin_pair_live_tvl_probe", {
+      collateralAsset: candidate.collateralAsset,
+      debtAsset: candidate.debtAsset,
+      fee: route.fee,
+      snapshotTvlUsd: route.snapshotTvlUsd,
+      liveTvlUsd: tvlUsd,
+    });
+    return tvlUsd;
+  } catch (error) {
+    logger.warn("liquidation_thin_pair_live_tvl_probe_failed", {
+      collateralAsset: candidate.collateralAsset,
+      debtAsset: candidate.debtAsset,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
 }
 
 function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner {
@@ -620,32 +692,29 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     ...(priceOracleCache === undefined ? {} : { priceOracle: priceOracleCache }),
     oracleSanityCheck: async ({ chain, account, debtAsset, collateralAsset }) => {
       if (priceOracleCache === undefined) {
-        return { pass: true, deviationPct: 0 };
+        // Fail closed when live: boot gate must prevent ENABLE_LIVE_TX without cache.
+        // Soak/sim may still construct the gate; treat missing cache as fail.
+        return { pass: false, deviationPct: Number.POSITIVE_INFINITY };
       }
-      const chainlink = await priceOracleCache.forceRefreshUsdPrices([debtAsset]);
-      // Slipstream TWAP integration point: replace with pool TWAP read when wired.
-      const twap = await priceOracleCache.forceRefreshUsdPrices([debtAsset]);
-      const result = evaluateOracleSanity({
+      const resolveTwap = createTwapResolver(publicClient);
+      const result = await evaluateLiquidationOracleSanity({
         chain,
         account,
         debtAsset,
         collateralAsset,
-        chainlinkPriceRaw: chainlink[debtAsset] ?? 0n,
-        twapPriceRaw: twap[debtAsset] ?? 0n,
-        thresholdPct: 2,
+        thresholdPct: ORACLE_SANITY_DEVIATION_THRESHOLD_PCT,
+        primaryUsd8: async (asset) => {
+          const prices = await priceOracleCache.forceRefreshUsdPrices([asset]);
+          return prices[asset] ?? 0n;
+        },
+        resolveTwap,
       });
       if (!result.pass) {
-        logOracleSanityFailure(logger, {
-          chain,
-          account,
-          debtAsset,
-          collateralAsset,
-          chainlinkPriceRaw: chainlink[debtAsset] ?? 0n,
-          twapPriceRaw: twap[debtAsset] ?? 0n,
-          thresholdPct: 2,
-        }, result);
+        logLiquidationOracleSanityFailure(logger, chain, account, result);
       }
-      return result;
+      // Gate currently consumes pass + a single deviationPct; surface the worse of the two.
+      const deviationPct = Math.max(result.debt.deviationPct, result.collateral.deviationPct);
+      return { pass: result.pass, deviationPct };
     },
     borrowerCooldown,
     logger,
@@ -712,6 +781,14 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     ...(providerPrivateWalletClient === undefined ? {} : { providerPrivateWalletClient }),
     ...(sequencerWalletClient === undefined ? {} : { sequencerWalletClient }),
   });
+  const inFlightRegistry = new InFlightExecutionRegistry();
+  const recentAttemptLedger = new RecentLiquidationAttemptLedger({
+    store: RecentLiquidationAttemptLedger.createDiskStore(
+      `.cache/liq-attempts-${config.chain}.json`,
+    ),
+    ttlMs: RECENT_LIQUIDATION_ATTEMPT_TTL_MS,
+    logger,
+  });
   const executionPreflightClient = buildExecutionPreflightClient({
     config,
     privateKey: config.privateKey,
@@ -727,6 +804,8 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
     logger,
     metrics,
     dryRunMode: config.simulationMode || !config.eventPurity.enableLiveTx,
+    inFlightRegistry,
+    recentAttemptLedger,
     quoteExecutionGasCap: async ({ expectedProfitUsd, gasLimit }) => quoteBaseExecutionGas({
       client: publicClient as never,
       expectedProfitUsd,
@@ -1511,6 +1590,64 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       },
     },
     buildExecutionRequest: async (candidate) => {
+      const gasCostUsd = await resolveDynamicGasCostUsd();
+      const flashFeeBps = await resolveFlashLoanFeeBps();
+      const livePoolTvlUsd = await resolveThinPoolLiveTvlUsd(
+        config.chain,
+        candidate,
+        publicClient,
+        baseAaveOracleAddress,
+        logger,
+      );
+      const plan = planUniswapV3LiquidationRoute({
+        candidate,
+        minDebtUsd: config.minLiquidationDebtUsd,
+        minProfitUsd: config.minProfitUsd,
+        gasCostUsd,
+        flashFeeBps,
+        slippageBps: Math.max(config.slippageBps, config.flashLoanSlippageFloorBps),
+        ...(livePoolTvlUsd === undefined ? {} : { livePoolTvlUsd }),
+        ...(config.liquidationSwapFeeOverride === undefined
+          ? {}
+          : { feeOverride: config.liquidationSwapFeeOverride }),
+      });
+      if (plan.status === "rejected") {
+        logger.warn(
+          plan.reason === "unmapped_pair"
+            ? "liquidation_swap_fee_unmapped_pair"
+            : "liquidation_thin_pair_skipped_unprofitable_at_cap",
+          {
+            account: candidate.account,
+            collateralAsset: candidate.collateralAsset,
+            debtAsset: candidate.debtAsset,
+            ...plan,
+          },
+        );
+        return undefined;
+      }
+      if (config.liquidationSwapFeeOverride !== undefined) {
+        logger.warn("liquidation_swap_fee_debug_override", {
+          collateralAsset: candidate.collateralAsset,
+          debtAsset: candidate.debtAsset,
+          mappedOrCappedFee: plan.fee,
+          overrideFee: config.liquidationSwapFeeOverride,
+        });
+      }
+      if (plan.capped) {
+        logger.info("liquidation_thin_pair_size_capped", {
+          account: candidate.account,
+          collateralAsset: candidate.collateralAsset,
+          debtAsset: candidate.debtAsset,
+          originalDebtToCover: candidate.debtToCover.toString(),
+          cappedDebtToCover: plan.candidate.debtToCover.toString(),
+          cappedRepayValueUsd: plan.candidate.repayValueUsd,
+          maxCollateralSwapUsd: plan.maxCollateralSwapUsd,
+          expectedProfitUsd: plan.expectedProfitUsd,
+          capBasis: plan.capBasis,
+          effectiveTvlUsd: plan.effectiveTvlUsd,
+        });
+      }
+      candidate = plan.candidate;
       const uniswap = getDexesForChain(config.chain).find((dex) => dex.name === "UniswapV3");
       let advisoryMinDebtOut = 0n;
       if (uniswap !== undefined && candidate.collateralReceivedWei !== undefined) {
@@ -1518,7 +1655,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
           advisoryMinDebtOut = await estimateMinimumDebtOut({
             candidate,
             slippageBps: Math.max(config.slippageBps, config.flashLoanSlippageFloorBps),
-            fee: config.liquidationSwapFee,
+            fee: plan.fee,
             quoteEngine,
             client: publicClient,
             dex: uniswap,
@@ -1528,7 +1665,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
             collateralAsset: candidate.collateralAsset,
             debtAsset: candidate.debtAsset,
             collateralReceivedWei: candidate.collateralReceivedWei.toString(),
-            fee: config.liquidationSwapFee,
+            fee: plan.fee,
             advisoryMinDebtOut: advisoryMinDebtOut.toString(),
             note: "Quote-based advisory only; on-chain amountOutMinimum is Aave-oracle floor",
           });
@@ -1542,28 +1679,85 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       return buildLiquidationExecutionRequest(config.chain, candidate, {
         account: account.address,
         minProfitUsd: config.minProfitUsd,
-        gasCostUsd: await resolveDynamicGasCostUsd(),
+        gasCostUsd,
         slippageBps: config.slippageBps,
         minimumMarginBps: config.minProfitMarginBps,
-        flashFeeBps: await resolveFlashLoanFeeBps(),
+        flashFeeBps,
         slippageBufferFloorBps: config.flashLoanSlippageFloorBps,
         requireFlashLoanWrapper: true,
         poolAddress: activePoolAddress,
         advisoryMinDebtOut,
-        swapFee: config.liquidationSwapFee,
+        swapFee: plan.fee,
         ...(config.liquidationReceiverAddress === undefined ? {} : { flashLoanReceiverAddress: config.liquidationReceiverAddress }),
       });
     },
     buildExecutionRequestForOpportunity: async (opportunity: Opportunity) => {
       if (opportunity.kind === "liquidation") {
+        const gasCostUsd = await resolveDynamicGasCostUsd();
+        const flashFeeBps = await resolveFlashLoanFeeBps();
+        const livePoolTvlUsd = await resolveThinPoolLiveTvlUsd(
+          config.chain,
+          opportunity.candidate,
+          publicClient,
+          baseAaveOracleAddress,
+          logger,
+        );
+        const plan = planUniswapV3LiquidationRoute({
+          candidate: opportunity.candidate,
+          minDebtUsd: config.minLiquidationDebtUsd,
+          minProfitUsd: config.minProfitUsd,
+          gasCostUsd,
+          flashFeeBps,
+          slippageBps: Math.max(config.slippageBps, config.flashLoanSlippageFloorBps),
+          ...(livePoolTvlUsd === undefined ? {} : { livePoolTvlUsd }),
+          ...(config.liquidationSwapFeeOverride === undefined
+            ? {}
+            : { feeOverride: config.liquidationSwapFeeOverride }),
+        });
+        if (plan.status === "rejected") {
+          logger.warn(
+            plan.reason === "unmapped_pair"
+              ? "liquidation_swap_fee_unmapped_pair"
+              : "liquidation_thin_pair_skipped_unprofitable_at_cap",
+            {
+              account: opportunity.candidate.account,
+              collateralAsset: opportunity.candidate.collateralAsset,
+              debtAsset: opportunity.candidate.debtAsset,
+              ...plan,
+            },
+          );
+          return undefined;
+        }
+        if (config.liquidationSwapFeeOverride !== undefined) {
+          logger.warn("liquidation_swap_fee_debug_override", {
+            collateralAsset: opportunity.candidate.collateralAsset,
+            debtAsset: opportunity.candidate.debtAsset,
+            overrideFee: config.liquidationSwapFeeOverride,
+          });
+        }
+        if (plan.capped) {
+          logger.info("liquidation_thin_pair_size_capped", {
+            account: opportunity.candidate.account,
+            collateralAsset: opportunity.candidate.collateralAsset,
+            debtAsset: opportunity.candidate.debtAsset,
+            originalDebtToCover: opportunity.candidate.debtToCover.toString(),
+            cappedDebtToCover: plan.candidate.debtToCover.toString(),
+            cappedRepayValueUsd: plan.candidate.repayValueUsd,
+            maxCollateralSwapUsd: plan.maxCollateralSwapUsd,
+            expectedProfitUsd: plan.expectedProfitUsd,
+            capBasis: plan.capBasis,
+            effectiveTvlUsd: plan.effectiveTvlUsd,
+          });
+        }
+        const candidate = plan.candidate;
         const uniswap = getDexesForChain(config.chain).find((dex) => dex.name === "UniswapV3");
         let advisoryMinDebtOut = 0n;
-        if (uniswap !== undefined && opportunity.candidate.collateralReceivedWei !== undefined) {
+        if (uniswap !== undefined && candidate.collateralReceivedWei !== undefined) {
           try {
             advisoryMinDebtOut = await estimateMinimumDebtOut({
-              candidate: opportunity.candidate,
+              candidate,
               slippageBps: Math.max(config.slippageBps, config.flashLoanSlippageFloorBps),
-              fee: config.liquidationSwapFee,
+              fee: plan.fee,
               quoteEngine,
               client: publicClient,
               dex: uniswap,
@@ -1572,18 +1766,18 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
             // advisory only
           }
         }
-        return buildLiquidationExecutionRequest(config.chain, opportunity.candidate, {
+        return buildLiquidationExecutionRequest(config.chain, candidate, {
           account: account.address,
           minProfitUsd: config.minProfitUsd,
-          gasCostUsd: await resolveDynamicGasCostUsd(),
+          gasCostUsd,
           slippageBps: config.slippageBps,
           minimumMarginBps: config.minProfitMarginBps,
-          flashFeeBps: await resolveFlashLoanFeeBps(),
+          flashFeeBps,
           slippageBufferFloorBps: config.flashLoanSlippageFloorBps,
           requireFlashLoanWrapper: true,
           poolAddress: activePoolAddress,
           advisoryMinDebtOut,
-          swapFee: config.liquidationSwapFee,
+          swapFee: plan.fee,
           ...(config.liquidationReceiverAddress === undefined ? {} : { flashLoanReceiverAddress: config.liquidationReceiverAddress }),
         });
       }
@@ -1626,7 +1820,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   const shutdown = new GracefulShutdownCoordinator({
     logger,
     metrics,
-    timeoutMs: 15_000,
+    timeoutMs: 75_000,
   });
   shutdown.addHook("watchlist_rescanner_stop", async () => watchlistRescanner?.stop());
   shutdown.addHook("event_purity_stack_stop", async () => eventPurityStack?.stop());
@@ -1635,6 +1829,21 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   shutdown.addHook("near_liq_accelerated_stop", async () => nearLiqAcceleratedPoller?.stop());
   shutdown.addHook("watchlist_coordinator_stop", async () => watchlistCoordinator?.stop());
   shutdown.addHook("hybrid_detection_drain", async () => hybridDetection.drain());
+  shutdown.addHook("in_flight_execution_drain", async () => {
+    const result = await inFlightRegistry.waitUntilEmpty(IN_FLIGHT_DRAIN_MAX_MS);
+    logger.info("in_flight_execution_drain_complete", {
+      drained: result.drained,
+      remaining: result.remaining,
+      waitedMs: result.waitedMs,
+      maxWaitMs: IN_FLIGHT_DRAIN_MAX_MS,
+    });
+    if (!result.drained) {
+      logger.warn("in_flight_drain_timeout", {
+        remaining: result.remaining,
+        waitedMs: result.waitedMs,
+      });
+    }
+  });
   shutdown.addHook("memory_monitor_stop", async () => memoryMonitor.stop());
   shutdown.addHook("rpc_health_monitor_stop", async () => {
     if (rpcHealthTimer !== undefined) {
@@ -1924,7 +2133,21 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
   const gasCostUsd = replayGasCostUsd;
   let simulated = 0;
   for (const candidate of candidates.slice(0, 25)) {
-    const request = buildLiquidationExecutionRequest(config.chain, candidate, {
+    const plan = planUniswapV3LiquidationRoute({
+      candidate,
+      minDebtUsd: config.minLiquidationDebtUsd,
+      minProfitUsd: config.minProfitUsd,
+      gasCostUsd,
+      flashFeeBps: resolvedFlashLoanFeeBps,
+      slippageBps: Math.max(config.slippageBps, config.flashLoanSlippageFloorBps),
+      ...(config.liquidationSwapFeeOverride === undefined
+        ? {}
+        : { feeOverride: config.liquidationSwapFeeOverride }),
+    });
+    if (plan.status === "rejected") {
+      continue;
+    }
+    const request = buildLiquidationExecutionRequest(config.chain, plan.candidate, {
       account: account.address,
       minProfitUsd: config.minProfitUsd,
       gasCostUsd,
@@ -1933,7 +2156,7 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
       flashFeeBps: resolvedFlashLoanFeeBps,
       slippageBufferFloorBps: config.flashLoanSlippageFloorBps,
       requireFlashLoanWrapper: true,
-      swapFee: config.liquidationSwapFee,
+      swapFee: plan.fee,
       ...(config.liquidationReceiverAddress === undefined ? {} : { flashLoanReceiverAddress: config.liquidationReceiverAddress }),
     });
     const result = await dryRunExecutor.execute(request);
@@ -2261,6 +2484,23 @@ function assertPipelineFlashLiquidationReadiness(config: RuntimeConfig): void {
   }
 }
 
+/** Refuse ENABLE_LIVE_TX when oracle sanity cannot run a real Chainlink↔TWAP check. */
+function assertLiveTxOracleSanityReadiness(config: RuntimeConfig): void {
+  if (!config.eventPurity.enableLiveTx) {
+    return;
+  }
+  if (config.priceFeedRegistry === undefined) {
+    throw new Error(
+      "ENABLE_LIVE_TX=true requires PRICE_FEED_REGISTRY / default Base feed registry for Chainlink primary prices",
+    );
+  }
+  if (config.chain === "base") {
+    assertBaseFeedRegistry(config.priceFeedRegistry);
+  }
+  // TWAP path table must cover at least USDC+WETH anchors used by multi-hop compounding.
+  void ORACLE_SANITY_TWAP_SECONDS;
+}
+
 export async function assertArbitrageOracleReadiness(
   config: RuntimeConfig,
   priceOracleCache: Pick<PriceOracleCache, "batchGetUsdPrices">,
@@ -2328,8 +2568,13 @@ function parsePrivateTxMode(value: string | undefined): PrivateTxMode {
   throw new Error("PRIVATE_TX_MODE must be one of provider_private, sequencer_direct, auto");
 }
 
-function parseLiquidationSwapFee(value: string | undefined): UniswapV3FeeTier {
-  const raw = value === undefined || value.trim() === "" ? "3000" : value.trim();
+function parseLiquidationSwapFeeOverride(
+  value: string | undefined,
+): UniswapV3FeeTier | undefined {
+  if (value === undefined || value.trim() === "") {
+    return undefined;
+  }
+  const raw = value.trim();
   if (!/^\d+$/.test(raw)) {
     throw new Error(`LIQUIDATION_SWAP_POOL_FEE must be an integer fee tier, got "${raw}"`);
   }
