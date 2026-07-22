@@ -4,6 +4,7 @@
  */
 import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { rssGrowthMbPerHour, rssGrowthMbPerHourFullWindow } from "./rssGrowth.mjs";
 
 const logPath = resolve(process.argv[2] ?? "");
 const jsonOut = process.argv.includes("--json");
@@ -21,15 +22,6 @@ function readLogLines(path) {
     ? "utf16le"
     : "utf8";
   return buffer.toString(encoding).split(/\r?\n/).filter((line) => line.trim().length > 0);
-}
-
-function rssGrowthMbPerHour(samples) {
-  if (samples.length < 2) return 0;
-  const first = samples[0];
-  const last = samples[samples.length - 1];
-  const elapsedHours = (last.timeMs - first.timeMs) / 3_600_000;
-  if (!Number.isFinite(elapsedHours) || elapsedHours <= 0) return 0;
-  return (last.rssMb - first.rssMb) / elapsedHours;
 }
 
 function formatDuration(ms) {
@@ -132,6 +124,10 @@ for (const rawLine of readLogLines(logPath)) {
         time: row.time,
         positionCacheSize: row.position_cache_size,
         bootstrapCoveragePct: row.bootstrap_coverage_pct,
+        livePositionCoveragePct: row.live_position_coverage_pct,
+        bootstrapDebtorCoveragePctAtBoot: row.bootstrap_debtor_coverage_pct_at_boot,
+        positionCacheHardCap: row.position_cache_hard_cap,
+        positionCacheAtHardCap: row.position_cache_at_hard_cap,
         bootstrapSource: row.bootstrapSource,
         usersSeeded: row.usersSeeded,
         shadowFalseNegativeTotal: row.shadow_false_negative_total,
@@ -178,13 +174,16 @@ for (const rawLine of readLogLines(logPath)) {
 }
 
 const windowMs = firstTs && lastTs ? Date.parse(lastTs) - Date.parse(firstTs) : undefined;
+const rssPostWarmup = Number(rssGrowthMbPerHour(rssSamples).toFixed(2));
+const rssFullWindow = Number(rssGrowthMbPerHourFullWindow(rssSamples).toFixed(2));
 const summary = {
   logPath,
   logSizeMb: Number((logSizeBytes / 1024 / 1024).toFixed(2)),
   window: { firstTs, lastTs, duration: windowMs === undefined ? undefined : formatDuration(windowMs) },
   wsEventLayerStarted: wsStarted,
   counts,
-  rssGrowthMbPerHour: Number(rssGrowthMbPerHour(rssSamples).toFixed(2)),
+  rssGrowthMbPerHour: rssPostWarmup,
+  rssGrowthMbPerHourFullWindow: rssFullWindow,
   lastMemory,
   lastRuntimeSnapshot,
   lastShadowAggregate,
@@ -208,14 +207,17 @@ if (summary.window.firstTs) {
 }
 console.log(`  WS layer:     ${wsStarted ? "started" : "not seen in log yet"}`);
 if (lastRuntimeSnapshot) {
-  console.log(`  Bootstrap:    source=${lastRuntimeSnapshot.bootstrapSource ?? "?"} seeded=${lastRuntimeSnapshot.usersSeeded ?? "?"} cache=${lastRuntimeSnapshot.positionCacheSize ?? "?"} coverage=${lastRuntimeSnapshot.bootstrapCoveragePct?.toFixed?.(1) ?? "?"}% block=${lastRuntimeSnapshot.blockNumber ?? "?"}`);
+  const liveCov = lastRuntimeSnapshot.livePositionCoveragePct
+    ?? lastRuntimeSnapshot.bootstrapCoveragePct;
+  const bootCov = lastRuntimeSnapshot.bootstrapDebtorCoveragePctAtBoot;
+  console.log(`  Bootstrap:    source=${lastRuntimeSnapshot.bootstrapSource ?? "?"} seeded=${lastRuntimeSnapshot.usersSeeded ?? "?"} cache=${lastRuntimeSnapshot.positionCacheSize ?? "?"} liveCoverage=${liveCov?.toFixed?.(1) ?? "?"}% bootDebtorCov=${bootCov?.toFixed?.(1) ?? "n/a"}% atCap=${lastRuntimeSnapshot.positionCacheAtHardCap ?? "?"} block=${lastRuntimeSnapshot.blockNumber ?? "?"}`);
   console.log(`  Shadow FN:    ${lastRuntimeSnapshot.shadowFalseNegativeTotal ?? 0}`);
 }
 if (lastShadowAggregate) {
   console.log(`  Shadow agg:   samples=${lastShadowAggregate.totalSamples ?? 0} drift=${lastShadowAggregate.shadowDriftNonEModeBps ?? 0}bps fnRate=${lastShadowAggregate.shadowFnRateNonEModePct ?? 0}%`);
 }
 if (lastMemory) {
-  console.log(`  Memory:       heap=${lastMemory.heapUsedMb ?? "?"}MB rss=${lastMemory.rssMb ?? "?"}MB watchlist=${lastMemory.watchlistSize ?? "?"} (rss slope ${summary.rssGrowthMbPerHour} MB/h)`);
+  console.log(`  Memory:       heap=${lastMemory.heapUsedMb ?? "?"}MB rss=${lastMemory.rssMb ?? "?"}MB watchlist=${lastMemory.watchlistSize ?? "?"} (rss slope post-warmup ${summary.rssGrowthMbPerHour} MB/h; full-window ${summary.rssGrowthMbPerHourFullWindow} MB/h)`);
 }
 console.log(`  Reconcile:    ok=${counts.position_first_touch_reconciled} skipped=${counts.position_first_touch_reconcile_skipped} failed=${counts.position_on_chain_reconcile_failed}`);
 console.log(`  Candidates:   ${counts.event_purity_liquidatable_candidate} liquidatable | bootstrap retries=${counts.partial_bootstrap_getlogs_retry}`);

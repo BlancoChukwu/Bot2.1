@@ -255,6 +255,7 @@ export class ShadowValidator {
       isEMode,
       eModeCategoryId,
     };
+    const sampleAssets = position === undefined ? [] : collectPositionAssets(position);
     this.config.logger.info("shadow_validation_sample", {
       account: result.account,
       localHf: Number(localHfWad) / 1e18,
@@ -265,6 +266,8 @@ export class ShadowValidator {
       blockNumber: Number(blockNumber),
       isEMode: result.isEMode,
       eModeCategoryId: result.eModeCategoryId,
+      // Asset list enables post-hoc correlation of max-drift spikes across pairs.
+      assets: sampleAssets,
     });
 
     if (bucket.sampleCount % 25 === 0) {
@@ -322,6 +325,9 @@ export class ShadowValidator {
       non_eMode_within_fn_target: snapshot.nonEMode.withinFnRateTarget,
       drift_tolerance_bps: snapshot.driftToleranceBps,
       fn_rate_target_pct: snapshot.fnRateTargetPct,
+      // Per-asset sampleCount is NOT totalSamples: each shadow sample credits
+      // every unique collateral+debt asset in that position (multi-count).
+      shadow_drift_by_asset_counting: "per_sample_unique_assets",
       shadow_drift_by_asset: snapshot.driftByAsset,
     });
   }

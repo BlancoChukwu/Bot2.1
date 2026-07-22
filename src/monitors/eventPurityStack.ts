@@ -22,6 +22,7 @@ import { TieredConfirmQueue, type ConfirmResult } from "./tieredConfirmQueue";
 import { WsEventLayer } from "./wsEventLayer";
 import type { ParsedIngestionEvent } from "./aaveEventParser";
 import { runPartialBootstrapSweep, type PartialBootstrapCoverage } from "./partialBootstrapSweep";
+import { computeLivePositionCoveragePct } from "./livePositionCoverage";
 import { createBootstrapLogClients } from "./bootstrapRpcClients";
 import { setBootstrapRuntimeStatus } from "../runtime/bootstrapRuntimeStatus";
 import { pollLocalFeedFreshness } from "./localFeedFreshnessPoll";
@@ -585,11 +586,24 @@ export class EventPurityStack {
     this.flashblockTickCount += 1n;
     if (this.flashblockTickCount % 1_800n === 0n) {
       this.shadow.logMetricsSnapshot("flashblock_interval");
+      const positionCacheSize = this.model.size();
+      const usersSeeded = this.bootstrapStatus?.usersSeeded ?? 0;
+      const hardCap = this.config.purity.positionCacheHardCap;
+      const livePositionCoveragePct = computeLivePositionCoveragePct(
+        positionCacheSize,
+        usersSeeded,
+      );
       this.config.logger.info("event_purity_runtime_snapshot", {
-        position_cache_size: this.model.size(),
-        bootstrap_coverage_pct: this.bootstrapCoveragePct,
+        position_cache_size: positionCacheSize,
+        // Historical bootstrap debtor ratio (withDebt/discovered) — frozen at boot.
+        bootstrap_debtor_coverage_pct_at_boot: this.bootstrapCoveragePct,
+        // Live gauge: recomputed every snapshot from cache size / usersSeeded.
+        bootstrap_coverage_pct: livePositionCoveragePct,
+        live_position_coverage_pct: livePositionCoveragePct,
+        position_cache_hard_cap: hardCap,
+        position_cache_at_hard_cap: positionCacheSize >= hardCap,
         bootstrapSource: this.bootstrapStatus?.discoverySource,
-        usersSeeded: this.bootstrapStatus?.usersSeeded,
+        usersSeeded,
         shadow_false_negative_total: this.shadow.getFalseNegativeTotal(),
         blockNumber: Number(blockNumber),
       });
