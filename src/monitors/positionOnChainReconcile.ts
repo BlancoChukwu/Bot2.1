@@ -32,19 +32,23 @@ export async function fetchOnChainAccountSnapshot(input: {
   readonly poolAddressesProvider: Address;
   readonly uiPoolDataProvider: Address;
   readonly account: Address;
+  readonly blockNumber?: bigint;
 }): Promise<ParsedOnChainAccountSnapshot | undefined> {
+  const blockOpt = input.blockNumber === undefined ? {} : { blockNumber: input.blockNumber };
   const [accountResult, reserveResult] = await Promise.all([
     input.client.readContract({
       address: input.poolAddress,
       abi: aavePoolAbi,
       functionName: "getUserAccountData",
       args: [input.account],
+      ...blockOpt,
     }),
     input.client.readContract({
       address: input.uiPoolDataProvider,
       abi: uiPoolDataProviderAbi,
       functionName: "getUserReservesData",
       args: [input.poolAddressesProvider, input.account],
+      ...blockOpt,
     }),
   ]);
 
@@ -125,12 +129,16 @@ export async function reconcileAndSeedPosition(input: {
   readonly logger: LoggerLike;
 }): Promise<ReconcileSeedOutcome> {
   try {
+    // Pin eth_call to a fresh head so seededAtBlock matches snapshot state
+    // (do not use the triggering event block — call reads latest otherwise).
+    const seedBlock = await input.client.getBlockNumber();
     const snapshot = await fetchOnChainAccountSnapshot({
       client: input.client,
       poolAddress: input.poolAddress,
       poolAddressesProvider: input.poolAddressesProvider,
       uiPoolDataProvider: input.uiPoolDataProvider,
       account: input.account,
+      blockNumber: seedBlock,
     });
     if (snapshot === undefined) {
       input.model.removePosition(input.account);
@@ -142,7 +150,7 @@ export async function reconcileAndSeedPosition(input: {
       input.model.removePosition(input.account);
       return { status: "benign_skip", reason: "allowlist_miss" };
     }
-    seedModelFromAccountSnapshot(input.model, snapshot, input.blockNumber);
+    seedModelFromAccountSnapshot(input.model, snapshot, seedBlock);
     return { status: "seeded" };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

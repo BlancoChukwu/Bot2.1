@@ -417,6 +417,9 @@ async function seedModelFromOnChain(input: {
 
   for (let i = 0; i < input.accounts.length; i += input.batchSize) {
     const batch = input.accounts.slice(i, i + input.batchSize);
+    // Per-batch pin: eth_call state and seededAtBlock must match. A single global
+    // head from sweep start under-watermarks users seeded later in a long pass.
+    const batchBlock = await input.client.getBlockNumber();
     const accountResults = await input.client.multicall({
       contracts: batch.map((address) => ({
         address: input.poolAddress,
@@ -425,6 +428,7 @@ async function seedModelFromOnChain(input: {
         args: [address],
       })),
       allowFailure: true,
+      blockNumber: batchBlock,
     });
     const reserveResults = await input.client.multicall({
       contracts: batch.map((address) => ({
@@ -434,6 +438,7 @@ async function seedModelFromOnChain(input: {
         args: [input.poolAddressesProvider, address],
       })),
       allowFailure: true,
+      blockNumber: batchBlock,
     });
 
     for (let j = 0; j < batch.length; j += 1) {
@@ -493,7 +498,7 @@ async function seedModelFromOnChain(input: {
           totalDebtBase,
           liquidationThreshold: accountData[3],
           reserves,
-        }, input.blockNumber);
+        }, batchBlock);
         seeded += 1;
       } catch (error) {
         errors += 1;

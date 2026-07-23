@@ -68,6 +68,12 @@ export interface UserPosition {
   confidence: PositionConfidence;
   isFullySeeded: boolean;
   lastConfirmedBlock: bigint;
+  /**
+   * Block of the on-chain snapshot used to seed this position.
+   * Balance-mutating pool events with meta.blockNumber <= seededAtBlock are
+   * already reflected in the Maps and must not be re-applied (gap-fill replay).
+   */
+  seededAtBlock: bigint;
   lastActivityBlock: bigint;
   eModeCategoryId: number;
   lastTotalCollateralBase?: bigint;
@@ -204,6 +210,7 @@ export class LocalPositionModel {
   }
 
   public applyAaveEvent(event: ParsedAavePoolEvent): AaveEventApplyResult {
+    // Index-only: always apply, including historical gap-fill (no balance mutation).
     if (event.name === "ReserveDataUpdated") {
       this.registerReserve(event.reserve);
       this.applyReserveIndexUpdate(event);
@@ -224,6 +231,18 @@ export class LocalPositionModel {
     this.registerReserve(event.reserve);
     const isNew = existing === undefined;
     const position = this.getOrCreate(account, event.meta.blockNumber);
+
+    // Fully-seeded snapshot already includes balance effects through seededAtBlock.
+    // Replaying Supply/Borrow/Repay/... at or before that block double-counts.
+    // Apply only strictly later events: event.block > seededAtBlock.
+    if (
+      position.isFullySeeded
+      && isBalanceMutatingPoolEvent(event.name)
+      && event.meta.blockNumber <= position.seededAtBlock
+    ) {
+      return { changes: [] };
+    }
+
     position.lastActivityBlock = event.meta.blockNumber;
 
     switch (event.name) {
@@ -445,6 +464,7 @@ export class LocalPositionModel {
     position.confidence = "high";
     position.isFullySeeded = true;
     position.lastConfirmedBlock = input.blockNumber;
+    position.seededAtBlock = input.blockNumber;
     position.lastActivityBlock = input.blockNumber;
     position.lastTotalCollateralBase = input.totalCollateralBase;
     position.lastTotalDebtBase = input.totalDebtBase;
@@ -734,6 +754,7 @@ export class LocalPositionModel {
       confidence: "low",
       isFullySeeded: false,
       lastConfirmedBlock: 0n,
+      seededAtBlock: 0n,
       lastActivityBlock: blockNumber,
       eModeCategoryId: 0,
     };
@@ -994,6 +1015,23 @@ function resolveUserAddress(event: ParsedAavePoolEvent): Address | undefined {
     return undefined;
   }
   return raw;
+}
+
+function isBalanceMutatingPoolEvent(name: ParsedAavePoolEvent["name"]): boolean {
+  switch (name) {
+    case "Supply":
+    case "Withdraw":
+    case "Borrow":
+    case "Repay":
+    case "LiquidationCall":
+      return true;
+    case "ReserveDataUpdated":
+      return false;
+    default: {
+      const _exhaustive: never = name;
+      return _exhaustive;
+    }
+  }
 }
 
 function positionTouchesAsset(position: UserPosition, asset: Address): boolean {

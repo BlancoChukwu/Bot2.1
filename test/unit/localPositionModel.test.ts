@@ -342,6 +342,93 @@ describe("localPositionModel event handling", () => {
     const change = model.tierChangeForAccount(user, false);
     expect(change?.localHfWad).not.toBe(MAX_UINT256);
   });
+
+  it("skips Borrow at seededAtBlock boundary (event.block <= seededAtBlock)", () => {
+    model.seedFromOnChainSnapshot({
+      account: user,
+      blockNumber: 100n,
+      eModeCategoryId: 0,
+      healthFactorWad: 1_200_000_000_000_000_000n,
+      totalCollateralBase: 1_000n,
+      totalDebtBase: 100n,
+      liquidationThreshold: 8_500n,
+      reserves: [{ asset: usdc, scaledCollateral: 0n, scaledDebt: 100n }],
+    });
+    const before = model.positions.get(user.toLowerCase())!.debt.get(usdc.toLowerCase());
+    model.applyAaveEvent(makeBorrow(user, usdc, 50n, 100n));
+    expect(model.positions.get(user.toLowerCase())!.debt.get(usdc.toLowerCase())).toBe(before);
+    model.applyAaveEvent(makeBorrow(user, usdc, 50n, 101n));
+    expect(model.positions.get(user.toLowerCase())!.debt.get(usdc.toLowerCase())).toBe(
+      (before ?? 0n) + 50n,
+    );
+  });
+
+  it("skips historical Borrow before seededAtBlock (gap-fill double-count case)", () => {
+    model.seedFromOnChainSnapshot({
+      account: user,
+      blockNumber: 1000n,
+      eModeCategoryId: 0,
+      healthFactorWad: 1_200_000_000_000_000_000n,
+      totalCollateralBase: 1_000n,
+      totalDebtBase: 100n,
+      liquidationThreshold: 8_500n,
+      reserves: [{ asset: usdc, scaledCollateral: 0n, scaledDebt: 100n }],
+    });
+    const before = model.positions.get(user.toLowerCase())!.debt.get(usdc.toLowerCase());
+    model.applyAaveEvent(makeBorrow(user, usdc, 999n, 0n)); // N-1000 style
+    expect(model.positions.get(user.toLowerCase())!.debt.get(usdc.toLowerCase())).toBe(before);
+  });
+
+  it("applies Borrow after seededAtBlock (positive control)", () => {
+    model.seedFromOnChainSnapshot({
+      account: user,
+      blockNumber: 100n,
+      eModeCategoryId: 0,
+      healthFactorWad: 1_200_000_000_000_000_000n,
+      totalCollateralBase: 1_000n,
+      totalDebtBase: 100n,
+      liquidationThreshold: 8_500n,
+      reserves: [{ asset: usdc, scaledCollateral: 0n, scaledDebt: 100n }],
+    });
+    const before = model.positions.get(user.toLowerCase())!.debt.get(usdc.toLowerCase()) ?? 0n;
+    model.applyAaveEvent(makeBorrow(user, usdc, 25n, 1100n));
+    expect(model.positions.get(user.toLowerCase())!.debt.get(usdc.toLowerCase())).toBe(before + 25n);
+  });
+
+  it("still applies ReserveDataUpdated before seededAtBlock", () => {
+    model.seedFromOnChainSnapshot({
+      account: user,
+      blockNumber: 1000n,
+      eModeCategoryId: 0,
+      healthFactorWad: 1_200_000_000_000_000_000n,
+      totalCollateralBase: 1_000n,
+      totalDebtBase: 100n,
+      liquidationThreshold: 8_500n,
+      reserves: [{ asset: usdc, scaledCollateral: 0n, scaledDebt: 100n }],
+    });
+    const newIndex = 1_100_000_000_000_000_000_000_000_000n;
+    const result = model.applyAaveEvent({
+      kind: "aave_pool",
+      name: "ReserveDataUpdated",
+      reserve: usdc,
+      liquidityIndex: newIndex,
+      variableBorrowIndex: newIndex,
+      meta: { blockNumber: 1n, txHash: "0x3", logIndex: 0, source: "gap-fill" },
+    });
+    expect(result.changes).toHaveLength(0);
+    expect(model.positions.get(user.toLowerCase())!.debt.get(usdc.toLowerCase())).toBe(100n);
+    const reserve = (
+      model as unknown as { reserveConfig: Map<string, { variableBorrowIndex: bigint }> }
+    ).reserveConfig.get(usdc.toLowerCase());
+    expect(reserve?.variableBorrowIndex).toBe(newIndex);
+  });
+
+  it("replays Borrow for partially-seeded users (first-touch path unchanged)", () => {
+    const result = model.applyAaveEvent(makeBorrow(user, usdc, 40n, 50n));
+    expect(result.firstTouchReconcile).toBe(user);
+    expect(model.isFullySeeded(user)).toBe(false);
+    expect(model.positions.get(user.toLowerCase())!.debt.get(usdc.toLowerCase())).toBe(40n);
+  });
 });
 
 function makeBorrow(userAddr: Address, asset: Address, amount: bigint, block: bigint): ParsedAavePoolEvent {
