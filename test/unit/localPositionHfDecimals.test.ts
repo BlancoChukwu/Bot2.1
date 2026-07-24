@@ -1,5 +1,6 @@
 import type { Address } from "viem";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { LoggerLike } from "../../src/bot";
 import { parseEventPurityConfig, hfThresholdToWad } from "../../src/config/eventPurityConfig";
 import { LocalPositionModel } from "../../src/monitors/localPositionModel";
 
@@ -22,10 +23,22 @@ const CBBTC_PX = 60_000n * WAD;
 describe("local HF decimals normalization", () => {
   const purity = parseEventPurityConfig({ POSITION_CACHE_HARD_CAP: "50" });
   let model: LocalPositionModel;
-  let logger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
+  let logger: LoggerLike & {
+    info: ReturnType<typeof vi.fn>;
+    warn: ReturnType<typeof vi.fn>;
+    error: ReturnType<typeof vi.fn>;
+  };
 
   beforeEach(() => {
-    logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    } as LoggerLike & {
+      info: ReturnType<typeof vi.fn>;
+      warn: ReturnType<typeof vi.fn>;
+      error: ReturnType<typeof vi.fn>;
+    };
     model = new LocalPositionModel({
       purity,
       urgentHfWad: hfThresholdToWad(purity.localHfUrgent),
