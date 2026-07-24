@@ -1,0 +1,15 @@
+{
+  "chain": "base",
+  "pool": "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+  "user": "0x4118BB35A8068732da2c4fb49b12AbA59D39Adec",
+  "collateralAsset": "0x4200000000000000000000000000000000000006",
+  "debtAsset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "debtToCover": "136290821072",
+  "liquidatedCollateralAmount": "86150352582475091340",
+  "receiveAToken": false,
+  "blockNumber": "46925615",
+  "snapshotBlock": "46925614",
+  "healthFactor": "999216492323089409",
+  "pinnedAt": "2026-07-24T21:59:55.872Z",
+  "note": "Pinned historical underwater Base Aave liquidation for production-encoding fork E2E"
+}

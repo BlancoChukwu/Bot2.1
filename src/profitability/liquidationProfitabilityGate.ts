@@ -3,6 +3,10 @@ const defaultLiquidationGasUnits = 420_000;
 const defaultBonusBps = 500;
 const defaultGasBufferMultiplier = 1.5;
 const bpsScale = 10_000;
+/** First-live conservative net profit floor (USD). */
+export const DEFAULT_MIN_NET_PROFIT_USD = 45;
+/** Require net profit ≥ this multiple of estimated gas USD. */
+export const DEFAULT_MIN_NET_PROFIT_GAS_MULTIPLE = 2;
 
 export interface LiquidationProfitabilityInput {
   readonly debtUsd: number;
@@ -11,6 +15,10 @@ export interface LiquidationProfitabilityInput {
   readonly flashFeeBps: number;
   readonly hardFloorUsd: number;
   readonly safetyBufferMultiplier?: number;
+  /** Minimum acceptable net profit after gas + flash fee (default 45). */
+  readonly minNetProfitUsd?: number;
+  /** Net must also be ≥ this × gasCostUsd (default 2). */
+  readonly minNetProfitGasMultiple?: number;
 }
 
 export interface LiquidationProfitabilityResult {
@@ -22,6 +30,9 @@ export interface LiquidationProfitabilityResult {
   readonly flashFeeUsd: number;
   readonly bonusRate: number;
   readonly netProfitUsd: number;
+  readonly minNetProfitUsd: number;
+  readonly netProfitFloorUsd: number;
+  readonly netProfitPass: boolean;
 }
 
 export function estimateLiquidationGasCostUsd(
@@ -50,9 +61,14 @@ export function evaluateLiquidationProfitability(
   const effectiveFloor = Math.max(dynamicFloor, hardFloor);
   const estimatedBonus = input.debtUsd * effectiveBonusRate;
   const netProfitUsd = estimatedBonus - input.gasCostUsd - flashFeeUsd;
+  const minNetProfitUsd = input.minNetProfitUsd ?? DEFAULT_MIN_NET_PROFIT_USD;
+  const gasMultiple = input.minNetProfitGasMultiple ?? DEFAULT_MIN_NET_PROFIT_GAS_MULTIPLE;
+  const netProfitFloorUsd = Math.max(minNetProfitUsd, gasMultiple * input.gasCostUsd);
+  const debtPass = input.debtUsd >= effectiveFloor;
+  const netProfitPass = netProfitUsd >= netProfitFloorUsd;
 
   return {
-    pass: input.debtUsd >= effectiveFloor,
+    pass: debtPass && netProfitPass,
     dynamicFloor,
     hardFloor,
     effectiveFloor,
@@ -60,5 +76,8 @@ export function evaluateLiquidationProfitability(
     flashFeeUsd,
     bonusRate: effectiveBonusRate,
     netProfitUsd,
+    minNetProfitUsd,
+    netProfitFloorUsd,
+    netProfitPass,
   };
 }

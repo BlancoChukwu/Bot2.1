@@ -286,7 +286,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     pollIntervalMs: parseMinNumber(parsedEnv.POLL_INTERVAL_MS, 400, 100, "POLL_INTERVAL_MS"),
     candidateCooldownMs: parseMinNumber(parsedEnv.CANDIDATE_COOLDOWN_MS, 30_000, 0, "CANDIDATE_COOLDOWN_MS"),
     minProfitWei: parseEthThreshold(parsedEnv.MIN_PROFIT_THRESHOLD_ETH),
-    minProfitUsd: parseMinNumber(parsedEnv.MIN_PROFIT_USD, 10, 0, "MIN_PROFIT_USD"),
+    minProfitUsd: parseMinNumber(parsedEnv.MIN_PROFIT_USD, 45, 0, "MIN_PROFIT_USD"),
     gasCostUsd: parseMinNumber(parsedEnv.GAS_COST_USD, 0, 0, "GAS_COST_USD"),
     slippageBps: parseMinNumber(parsedEnv.SLIPPAGE_BPS, 50, 0, "SLIPPAGE_BPS"),
     minProfitMarginBps: parseMinNumber(
@@ -687,6 +687,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   });
   const liquidationGate = new LiquidationCandidateGate({
     minDebtUsd: config.minLiquidationDebtUsd,
+    minProfitUsd: config.minProfitUsd,
     resolveGasCostUsd: resolveDynamicGasCostUsd,
     resolveFlashFeeBps: resolveFlashLoanFeeBps,
     ...(priceOracleCache === undefined ? {} : { priceOracle: priceOracleCache }),
@@ -2062,6 +2063,7 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
     })();
   const replayGate = new LiquidationCandidateGate({
     minDebtUsd: config.minLiquidationDebtUsd,
+    minProfitUsd: config.minProfitUsd,
     resolveGasCostUsd: async () => replayGasCostUsd,
     resolveFlashFeeBps: async () => config.flashLoanFeeBps,
     ...(priceOracleForReplay === undefined ? {} : { priceOracle: priceOracleForReplay }),
@@ -2677,7 +2679,7 @@ function runtimeConfigHash(
     pollIntervalMs: env.POLL_INTERVAL_MS ?? "400",
     candidateCooldownMs: env.CANDIDATE_COOLDOWN_MS ?? "30000",
     minProfitThresholdEth: env.MIN_PROFIT_THRESHOLD_ETH ?? "0.01",
-    minProfitUsd: env.MIN_PROFIT_USD ?? "10",
+    minProfitUsd: env.MIN_PROFIT_USD ?? "45",
     arbitrageMinProfitUsd: env.ARBITRAGE_MIN_PROFIT_USD ?? "0.15",
     gasCostUsd: env.GAS_COST_USD ?? "0",
     slippageBps: env.SLIPPAGE_BPS ?? "50",

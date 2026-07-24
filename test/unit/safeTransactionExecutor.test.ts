@@ -3,6 +3,7 @@ import { createAsset, createAssetAmount } from "../../src/utils/typedAssetMath";
 import { createBotMetrics, createLogger } from "../../src/bot";
 import { createChainRegistry } from "../../src/config/chainRegistry";
 import { LocalNonceManager } from "../../src/executors/nonceManager";
+import { InFlightExecutionRegistry } from "../../src/executors/inFlightExecutionRegistry";
 import {
   SafeTransactionExecutor,
   type ExecutionPreflightClient,
@@ -150,6 +151,30 @@ describe("SafeTransactionExecutor", () => {
 
     expect(result).toEqual({ status: "rejected", reason: "final_simulation_failed" });
     expect(sends).toBe(0);
+  });
+
+  it("rejects when another liquidation is already in flight (single-opportunity)", async () => {
+    const inFlight = new InFlightExecutionRegistry();
+    inFlight.trackSubmitted("other-op", "0xdead");
+    const executor = new SafeTransactionExecutor({
+      registry: registry(),
+      router: { selectBestRoute: async () => routeSelected() },
+      nonceManager: new LocalNonceManager(),
+      client: {
+        estimateGas: async () => 900_000n,
+        getGasPrice: async () => 1_000_000_000n,
+        getPendingNonce: async () => 3,
+        simulateContract: async () => ({ success: true }),
+        send: async () => "0xabc",
+        waitForReceipt: async () => ({ status: "included" }),
+      },
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      inFlightRegistry: inFlight,
+    });
+
+    const result = await executor.execute(request());
+    expect(result).toEqual({ status: "rejected", reason: "single_opportunity_busy" });
   });
 
   it("runs flash-loan preview simulation before final simulation when provided", async () => {

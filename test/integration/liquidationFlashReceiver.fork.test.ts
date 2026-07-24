@@ -31,7 +31,10 @@ import {
   simulateExecuteOperation,
   simulateFlashLoanSimple,
   sizeLiquidationDebtToCover,
+  type LiquidationForkCase,
 } from "./helpers/liquidationReceiverForkHarness";
+import { loadPinnedHistoricalLiquidationCase } from "./helpers/pinnedHistoricalLiquidation";
+import { evaluateLiquidationProfitability } from "../../src/profitability/liquidationProfitabilityGate";
 
 const WAD = 1_000_000_000_000_000_000n;
 const WETH = "0x4200000000000000000000000000000000000006" as Address;
@@ -727,15 +730,25 @@ describeFork("LiquidationFlashReceiver v5 (Base anvil fork)", () => {
     }
     // Production path: authorizedInitiator → flashLoanSimple → executeOperation →
     // liquidationCall → oracle-floor swap (fee field 8) → repay amount+premium.
-    // Prefer historical WETH→USDC 500-fee pool (deepest Base Uniswap V3 liquid pair).
+    // Prefer pinned historical fixture for reproducible evidence.
     const swapFee = 500 as const;
     const minDebtToCover = 50_000_000_000n; // 50_000 USDC — large enough to clear dust + show margin
 
-    const liquidationCase = await findHistoricalLiquidationCase(forkSourceRpc!, pool, 5_000_000n, {
-      collateralAsset: WETH,
-      debtAsset: USDC,
-      minDebtToCover,
-    });
+    const pinned = loadPinnedHistoricalLiquidationCase();
+    let liquidationCase: LiquidationForkCase;
+    const pinnedUsable = pinned !== undefined
+      && pinned.collateralAsset.toLowerCase() === WETH.toLowerCase()
+      && pinned.debtAsset.toLowerCase() === USDC.toLowerCase()
+      && pinned.debtToCover >= minDebtToCover / 2n;
+    if (pinnedUsable) {
+      liquidationCase = pinned!;
+    } else {
+      liquidationCase = await findHistoricalLiquidationCase(forkSourceRpc!, pool, 5_000_000n, {
+        collateralAsset: WETH,
+        debtAsset: USDC,
+        minDebtToCover,
+      });
+    }
 
     const happyFork = await createManagedAnvilFork({
       forkUrl: forkSourceRpc!,
@@ -763,7 +776,11 @@ describeFork("LiquidationFlashReceiver v5 (Base anvil fork)", () => {
       const debtToCover = liquidationCase.debtToCover > 0n
         ? liquidationCase.debtToCover
         : sized.debtToCover;
-      expect(debtToCover).toBeGreaterThanOrEqual(minDebtToCover / 2n);
+      if (!pinnedUsable) {
+        expect(debtToCover).toBeGreaterThanOrEqual(minDebtToCover / 2n);
+      } else {
+        expect(debtToCover).toBeGreaterThan(0n);
+      }
 
       const flashPremiumTotal = await publicClient.readContract({
         address: pool,
@@ -864,6 +881,23 @@ describeFork("LiquidationFlashReceiver v5 (Base anvil fork)", () => {
       expect(balWethAfter).toBe(0n);
       expect(profitMarginUsdc).toBeGreaterThan(0n);
 
+      const gasCostUsd = 5;
+      const debtUsd = Number(debtToCover) / 1e6;
+      const observedProfitUsd = Number(profitMarginUsdc) / 1e6;
+      const profitability = evaluateLiquidationProfitability({
+        debtUsd,
+        liquidationBonusBps: 500,
+        gasCostUsd,
+        flashFeeBps: Number(flashPremiumTotal),
+        hardFloorUsd: 1,
+        minNetProfitUsd: 0,
+        minNetProfitGasMultiple: 0,
+      });
+      // Off-chain EV sign must match realized residual (both non-negative for a successful path).
+      expect(profitability.netProfitUsd).toBeGreaterThanOrEqual(0);
+      expect(observedProfitUsd).toBeGreaterThan(0);
+      expect(Math.sign(profitability.netProfitUsd)).toBe(Math.sign(observedProfitUsd));
+
       // eslint-disable-next-line no-console
       console.info("e2e_happy_path_profit", {
         minedStatus: receipt.status,
@@ -872,7 +906,10 @@ describeFork("LiquidationFlashReceiver v5 (Base anvil fork)", () => {
         balUsdcAfter: balUsdcAfter.toString(),
         owe: owe.toString(),
         profitMarginUsdcRaw: profitMarginUsdc.toString(),
-        profitMarginUsdc: Number(profitMarginUsdc) / 1e6,
+        profitMarginUsdc: observedProfitUsd,
+        estimatedNetProfitUsd: profitability.netProfitUsd,
+        pinnedUser: liquidationCase.user,
+        pinnedSnapshotBlock: liquidationCase.snapshotBlock.toString(),
         note: "Swap cleared oracle floor; Aave pulled owe; leftover USDC = bonus − premium − impact",
       });
 

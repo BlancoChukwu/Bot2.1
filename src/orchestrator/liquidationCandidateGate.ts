@@ -19,6 +19,7 @@ import {
   type BorrowerSnapshot,
 } from "../monitors/reserveAwareBorrowerCache";
 import { getCycleDiagnosticsCollector } from "../observability/cycleDiagnostics";
+import { logFirstAttempt } from "../observability/opportunityTrace";
 
 const baseUsdcDecimals = 6;
 const baseWethDecimals = 18;
@@ -26,6 +27,8 @@ const defaultErc20Decimals = 18;
 
 export interface LiquidationCandidateGateConfig {
   readonly minDebtUsd: number;
+  /** Minimum net profit after gas + flash fee (first-live default 45 via profitability gate). */
+  readonly minProfitUsd?: number;
   readonly resolveGasCostUsd: () => Promise<number>;
   readonly resolveFlashFeeBps: () => Promise<number>;
   readonly priceOracle?: PriceOracleCache;
@@ -90,6 +93,9 @@ export class LiquidationCandidateGate {
         gasCostUsd,
         flashFeeBps,
         hardFloorUsd: this.config.minDebtUsd,
+        ...(this.config.minProfitUsd === undefined
+          ? {}
+          : { minNetProfitUsd: this.config.minProfitUsd }),
       });
       const gatePass = resolved.trusted && profitability.pass;
       let sanityPass = true;
@@ -112,6 +118,15 @@ export class LiquidationCandidateGate {
         }
       }
       const finalPass = gatePass && sanityPass;
+      if (finalPass) {
+        logFirstAttempt(this.config.logger, {
+          opportunityId: `${chain}:${candidate.account}:${stage}`,
+          chain,
+          account: candidate.account,
+          phase: "opportunity_seen",
+          estProfitAfterFeeGasUsd: profitability.netProfitUsd,
+        });
+      }
       this.config.logger.info("liquidation_evaluated", {
         chain,
         account: candidate.account,

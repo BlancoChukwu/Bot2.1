@@ -19,13 +19,16 @@ import {
   resolveEffectiveAssetPriceWad18,
   type PegReferenceHealthInput,
 } from "../oracle/healthyPegAsset";
+import type { EModeCategoryConfig } from "./aaveEmode";
+import { isReserveEnabledOnBitmap } from "./reserveConfiguration";
 
 export type PositionConfidence = "high" | "low";
 export type PositionTier = "healthy" | "watch" | "urgent" | "liquidatable";
 
 const WAD = 1_000_000_000_000_000_000n;
 const BPS = 10_000n;
-const BASE_LT_BPS = 8500n;
+/** Fallback only until PDP/config hydration; never treat as protocol truth. */
+export const BASE_LT_BPS = 8500n;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const DEFAULT_FEED_DECIMALS = 8;
 
@@ -56,6 +59,8 @@ export interface ReserveConfig {
   variableBorrowIndex: bigint;
   indexUpdatedAtBlock: bigint;
   liquidationBonus: bigint | null;
+  /** Pool reserve id (bit index into eMode collateral bitmap). */
+  reserveId?: number;
   /**
    * ERC20 decimals from on-chain `decimals()`. Required before HF.
    * Never invent a default (especially not 18) — missing means fail loud.
@@ -126,6 +131,7 @@ export class LocalPositionModel {
   readonly prices = new Map<string, bigint>();
   readonly feedStates = new Map<string, FeedState>();
   readonly reserveConfig = new Map<string, ReserveConfig>();
+  readonly eModeCategories = new Map<number, EModeCategoryConfig>();
   private readonly allowlistSet: ReadonlySet<string> | undefined;
   private flashblockTickCount = 0n;
   private evictionTotal = 0;
@@ -179,9 +185,34 @@ export class LocalPositionModel {
     this.reserveConfig.set(key, { ...reserve, liquidationBonus: bonus });
   }
 
+  public setReserveLiquidationThreshold(asset: Address, liquidationThresholdBps: bigint): void {
+    this.registerReserve(asset, liquidationThresholdBps);
+  }
+
+  public setReserveId(asset: Address, reserveId: number): void {
+    const key = asset.toLowerCase();
+    const existing = this.reserveConfig.get(key);
+    if (existing === undefined) {
+      this.registerReserve(asset);
+    }
+    const reserve = this.reserveConfig.get(key);
+    if (reserve === undefined) {
+      return;
+    }
+    this.reserveConfig.set(key, { ...reserve, reserveId });
+  }
+
+  public setEModeCategory(category: EModeCategoryConfig): void {
+    this.eModeCategories.set(category.categoryId, category);
+  }
+
+  /**
+   * Register or update a reserve. When `liquidationThresholdBps` is omitted on an
+   * existing reserve, the previously hydrated LT is preserved (do not overwrite with 8500).
+   */
   public registerReserve(
     asset: Address,
-    liquidationThresholdBps = BASE_LT_BPS,
+    liquidationThresholdBps?: bigint,
     decimals?: number,
   ): void {
     const key = asset.toLowerCase();
@@ -189,7 +220,7 @@ export class LocalPositionModel {
     if (existing === undefined) {
       this.reserveConfig.set(key, {
         asset,
-        liquidationThresholdBps,
+        liquidationThresholdBps: liquidationThresholdBps ?? BASE_LT_BPS,
         liquidityIndex: WAD,
         variableBorrowIndex: WAD,
         indexUpdatedAtBlock: 0n,
@@ -198,12 +229,16 @@ export class LocalPositionModel {
       });
       return;
     }
-    if (decimals !== undefined && existing.decimals === undefined) {
-      this.reserveConfig.set(key, {
-        ...existing,
-        decimals: assertReserveDecimals(decimals, asset),
-      });
-    }
+    const next: ReserveConfig = {
+      ...existing,
+      ...(liquidationThresholdBps === undefined
+        ? {}
+        : { liquidationThresholdBps }),
+      ...(decimals === undefined || existing.decimals !== undefined
+        ? {}
+        : { decimals: assertReserveDecimals(decimals, asset) }),
+    };
+    this.reserveConfig.set(key, next);
   }
 
   /** Cache on-chain ERC20 decimals. Throws on invalid or conflicting values — never defaults to 18. */
@@ -645,9 +680,9 @@ export class LocalPositionModel {
         const decimals = requireReserveDecimals(reserve);
         const scale = 10n ** BigInt(decimals);
         const scaled = this.scaleCollateralAmount(position, assetKey, amount, reserve);
+        const ltBps = this.resolveCollateralLtBps(position, reserve);
         // Multiply first, divide last — truncating `scaled / 10^decimals` zeros dust legs.
-        weightedCollateral += (scaled * price * reserve.liquidationThresholdBps)
-          / (BPS * scale);
+        weightedCollateral += (scaled * price * ltBps) / (BPS * scale);
       }
 
       for (const [assetKey, amount] of position.debt) {
@@ -789,6 +824,25 @@ export class LocalPositionModel {
       return true;
     }
     return this.allowlistSet.has(reserve.toLowerCase());
+  }
+
+  /**
+   * Per-asset LT for local HF: eMode category LT when user is in eMode and the
+   * reserve is set in that category's collateral bitmap; otherwise base reserve LT.
+   */
+  private resolveCollateralLtBps(position: UserPosition, reserve: ReserveConfig): bigint {
+    const categoryId = position.eModeCategoryId;
+    if (categoryId === 0) {
+      return reserve.liquidationThresholdBps;
+    }
+    const category = this.eModeCategories.get(categoryId);
+    if (category === undefined || reserve.reserveId === undefined) {
+      return reserve.liquidationThresholdBps;
+    }
+    if (!isReserveEnabledOnBitmap(category.collateralBitmap, reserve.reserveId)) {
+      return reserve.liquidationThresholdBps;
+    }
+    return category.liquidationThresholdBps;
   }
 
   private getOrCreate(account: Address, blockNumber: bigint): UserPosition {

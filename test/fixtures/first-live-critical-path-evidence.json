@@ -1,0 +1,44 @@
+{
+  "event": "first_live_critical_path_evidence",
+  "recordedAt": "2026-07-24T22:00:00.000Z",
+  "ltDiff": {
+    "USDC": { "pdpLt": 7800, "configBitsLt": 7800 },
+    "cbBTC": { "pdpLt": 7800, "configBitsLt": 7800 },
+    "WETH": { "pdpLt": 8300, "configBitsLt": 8300 },
+    "eModeCategory1": { "asset": "WETH", "eModeLt": 9300, "collateralBitmap": "43" },
+    "protocolDataProvider": "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A"
+  },
+  "receiver": {
+    "address": "0x3757aBCbb52E5d930EC1cBc01dEFC9E5ee89B85E",
+    "version": 5,
+    "authorizedInitiator": "0x922BfCcb570C0847001A3E6746c2980EE0053842",
+    "pool": "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+    "swapRouter": "0x2626664c2603336E57B271c5C0b26F421741e481",
+    "swapSlippageBps": 200,
+    "verifyStatus": "ok"
+  },
+  "historicalE2E": {
+    "user": "0x4118BB35A8068732da2c4fb49b12AbA59D39Adec",
+    "snapshotBlock": "46925614",
+    "blockNumber": "46925615",
+    "healthFactor": "999216492323089409",
+    "collateralAsset": "0x4200000000000000000000000000000000000006",
+    "debtAsset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "debtToCover": "136290821072",
+    "txHash": "0x3a214610abfe363aa661c3347ebbeff5bc0a7f68d21e211a4772709d2e16d7cc",
+    "minedStatus": "success",
+    "profitMarginUsdc": 4824.454769,
+    "estimatedNetProfitUsd": 6741.395643064,
+    "balWethFinal": "0",
+    "balUsdcFinal": "0",
+    "encoding": "production encodeLiquidationRoute 8-field"
+  },
+  "liveGates": {
+    "ENABLE_LIVE_TX": false,
+    "MIN_PROFIT_USD": 45,
+    "minNetProfitGasMultiple": 2,
+    "singleOpportunityConcurrency": true,
+    "simBeforeBroadcast": true,
+    "killSwitch": "ENABLE_LIVE_TX=false or stop process; SimFailureCircuitBreaker after 3 consecutive final_simulation_failed"
+  }
+}

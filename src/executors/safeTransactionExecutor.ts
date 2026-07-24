@@ -4,7 +4,7 @@ import type { ChainRegistry, FlashLoanProviderId } from "../config/chainRegistry
 import type { SupportedChain } from "../config/chains";
 import type { RouteSelectionInput, RouteSelectionResult } from "../profitability/flashLoanProviderRouter";
 import { resolveLiquidationGasLimit } from "../config/liquidationGasLimits";
-import { logOpportunityTrace } from "../observability/opportunityTrace";
+import { logFirstAttempt, logOpportunityTrace } from "../observability/opportunityTrace";
 import type { LocalNonceManager, NonceReservation } from "./nonceManager";
 import type { InFlightExecutionRegistry } from "./inFlightExecutionRegistry";
 import type { RecentLiquidationAttemptLedger } from "./recentLiquidationAttemptLedger";
@@ -89,6 +89,10 @@ export interface SafeExecutionRequest {
   };
   readonly flashblockIndex?: number;
   readonly detectionTsMs?: number;
+  /** Optional local HF (wad string) for first-attempt observability. */
+  readonly localHfWad?: string;
+  /** Optional on-chain HF (wad string) for first-attempt observability. */
+  readonly chainHfWad?: string;
   buildTransaction(route: SelectedRoute): TransactionEnvelope;
   buildFlashLoanPreviewTransaction?(route: SelectedRoute): TransactionEnvelope;
 }
@@ -96,7 +100,7 @@ export interface SafeExecutionRequest {
 export type SafeExecutionResult =
   | { readonly status: "sent"; readonly txHash: Hash }
   | { readonly status: "simulated" }
-  | { readonly status: "rejected"; readonly reason: "route_rejected" | "route_transaction_mismatch" | "final_simulation_failed" | "execution_circuit_open" | "dust_filtered" | "borrower_cooldown" | "recent_attempt_inflight" }
+  | { readonly status: "rejected"; readonly reason: "route_rejected" | "route_transaction_mismatch" | "final_simulation_failed" | "execution_circuit_open" | "dust_filtered" | "borrower_cooldown" | "recent_attempt_inflight" | "single_opportunity_busy" }
   | { readonly status: "failed"; readonly reason: "receipt_reorged" | "receipt_reverted" | "send_failed" | "receipt_timeout" };
 
 export interface FlashLoanRouteSelector {
@@ -153,6 +157,15 @@ export class SafeTransactionExecutor {
       const chain = this.config.registry.get(request.chain);
       if (chain.circuitBreakers.execution.status === "open") {
         return { status: "rejected", reason: "execution_circuit_open" };
+      }
+      // First-live: one opportunity at a time — no parallel flash-loan attempts.
+      if ((this.config.inFlightRegistry?.size() ?? 0) > 0) {
+        this.config.logger.warn("execution_rejected_single_opportunity_busy", {
+          chain: request.chain,
+          opportunityId: request.opportunityId,
+          inFlight: this.config.inFlightRegistry?.size() ?? 0,
+        });
+        return { status: "rejected", reason: "single_opportunity_busy" };
       }
 
       const preflight = await this.runPreflight(request);
@@ -223,6 +236,18 @@ export class SafeTransactionExecutor {
           opportunityId: request.opportunityId,
           reason: dryRun.reason,
         });
+        logFirstAttempt(this.config.logger, {
+          opportunityId: request.opportunityId,
+          chain: request.chain,
+          account: request.account,
+          phase: "simulated",
+          simOk: false,
+          simRevertReason: dryRun.reason,
+          gasEstimate: overrides.gas.toString(),
+          ...(request.localHfWad === undefined ? {} : { localHfWad: request.localHfWad }),
+          ...(request.chainHfWad === undefined ? {} : { chainHfWad: request.chainHfWad }),
+          estProfitAfterFeeGasUsd: Number(preflight.route.netProfit.raw) / 1e8,
+        });
         return { status: "rejected", reason: "final_simulation_failed" };
       }
       if (this.config.dryRunMode === true) {
@@ -233,6 +258,7 @@ export class SafeTransactionExecutor {
           transaction.provider,
           wouldSubmitTsMs - simulationTsMs,
         );
+        const estProfit = Number(preflight.route.netProfit.raw) / 1e8;
         logOpportunityTrace(this.config.logger, {
           opportunityId: request.opportunityId,
           chain: request.chain,
@@ -240,7 +266,22 @@ export class SafeTransactionExecutor {
           detectionTsMs: request.detectionTsMs ?? startedAt,
           simulationTsMs,
           wouldSubmitTsMs,
-          estProfitAfterFeeGasUsd: Number(preflight.route.netProfit.raw) / 1e8,
+          estProfitAfterFeeGasUsd: estProfit,
+          simOk: true,
+          gasEstimate: overrides.gas.toString(),
+          ...(request.localHfWad === undefined ? {} : { localHfWad: request.localHfWad }),
+          ...(request.chainHfWad === undefined ? {} : { chainHfWad: request.chainHfWad }),
+        });
+        logFirstAttempt(this.config.logger, {
+          opportunityId: request.opportunityId,
+          chain: request.chain,
+          account: request.account,
+          phase: "simulated",
+          simOk: true,
+          gasEstimate: overrides.gas.toString(),
+          estProfitAfterFeeGasUsd: estProfit,
+          ...(request.localHfWad === undefined ? {} : { localHfWad: request.localHfWad }),
+          ...(request.chainHfWad === undefined ? {} : { chainHfWad: request.chainHfWad }),
         });
         this.releaseNonce(request, preflight.nonce);
         this.config.logger.info("safe_execution_dry_run_complete", {
@@ -423,6 +464,15 @@ export class SafeTransactionExecutor {
 
   private async onSubmitted(request: SafeExecutionRequest, txHash: Hash): Promise<void> {
     this.config.inFlightRegistry?.trackSubmitted(request.opportunityId, txHash);
+    logFirstAttempt(this.config.logger, {
+      opportunityId: request.opportunityId,
+      chain: request.chain,
+      account: request.account,
+      phase: "broadcast",
+      broadcastHash: txHash,
+      ...(request.localHfWad === undefined ? {} : { localHfWad: request.localHfWad }),
+      ...(request.chainHfWad === undefined ? {} : { chainHfWad: request.chainHfWad }),
+    });
     const ledger = this.config.recentAttemptLedger;
     const hint = request.gasLimitHint;
     if (ledger === undefined || hint === undefined) {
@@ -442,6 +492,15 @@ export class SafeTransactionExecutor {
     outcome: "included" | "reverted" | "timeout",
   ): Promise<void> {
     this.config.inFlightRegistry?.complete(request.opportunityId);
+    logFirstAttempt(this.config.logger, {
+      opportunityId: request.opportunityId,
+      chain: request.chain,
+      account: request.account,
+      phase: "receipt",
+      receiptStatus: outcome,
+      ...(request.localHfWad === undefined ? {} : { localHfWad: request.localHfWad }),
+      ...(request.chainHfWad === undefined ? {} : { chainHfWad: request.chainHfWad }),
+    });
     const ledger = this.config.recentAttemptLedger;
     const hint = request.gasLimitHint;
     if (ledger === undefined || hint === undefined) {

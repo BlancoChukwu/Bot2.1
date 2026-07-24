@@ -56,7 +56,7 @@ function buildMulticallSuccess(
     ? {
       decimals: 18n,
       ltv: 8000n,
-      liquidationThreshold: 8500n,
+      liquidationThreshold: 7800n,
       liquidationBonus: 10500n,
       reserveFactor: 1000n,
       usageAsCollateralEnabled: true,
@@ -69,8 +69,8 @@ function buildMulticallSuccess(
   const usdcReserve = reserveOk
     ? {
       decimals: 6n,
-      ltv: 8000n,
-      liquidationThreshold: 8500n,
+      ltv: 7500n,
+      liquidationThreshold: 7800n,
       liquidationBonus: 10500n,
       reserveFactor: 1000n,
       usageAsCollateralEnabled: true,
@@ -227,6 +227,25 @@ describe("runOraclePriceBootstrap", () => {
     );
     expect(bootstrap.pricesBootstrapped).toBe(true);
     expect(model.prices.get(weth.toLowerCase())).not.toBe(1n);
+  });
+
+  it("hydrates per-asset liquidationThreshold from PDP", async () => {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const model = makeModel();
+    const client = makeClient({});
+
+    await runOraclePriceBootstrap({
+      chain: "base",
+      executionClient: client,
+      feedRegistry: makeRegistry(),
+      model,
+      logger,
+      sleepMs: async () => undefined,
+    });
+
+    expect(model.reserveConfig.get(weth.toLowerCase())?.liquidationThresholdBps).toBe(7800n);
+    expect(model.reserveConfig.get(usdc.toLowerCase())?.liquidationThresholdBps).toBe(7800n);
+    expect(model.reserveConfig.get(weth.toLowerCase())?.liquidationBonus).toBe(10500n);
   });
 
   it("stores liquidationBonus null when reserve config fetch fails", async () => {
