@@ -56,6 +56,11 @@ export interface ReserveConfig {
   variableBorrowIndex: bigint;
   indexUpdatedAtBlock: bigint;
   liquidationBonus: bigint | null;
+  /**
+   * ERC20 decimals from on-chain `decimals()`. Required before HF.
+   * Never invent a default (especially not 18) — missing means fail loud.
+   */
+  decimals?: number;
 }
 
 export interface UserPosition {
@@ -174,9 +179,14 @@ export class LocalPositionModel {
     this.reserveConfig.set(key, { ...reserve, liquidationBonus: bonus });
   }
 
-  public registerReserve(asset: Address, liquidationThresholdBps = BASE_LT_BPS): void {
+  public registerReserve(
+    asset: Address,
+    liquidationThresholdBps = BASE_LT_BPS,
+    decimals?: number,
+  ): void {
     const key = asset.toLowerCase();
-    if (!this.reserveConfig.has(key)) {
+    const existing = this.reserveConfig.get(key);
+    if (existing === undefined) {
       this.reserveConfig.set(key, {
         asset,
         liquidationThresholdBps,
@@ -184,8 +194,33 @@ export class LocalPositionModel {
         variableBorrowIndex: WAD,
         indexUpdatedAtBlock: 0n,
         liquidationBonus: null,
+        ...(decimals === undefined ? {} : { decimals: assertReserveDecimals(decimals, asset) }),
+      });
+      return;
+    }
+    if (decimals !== undefined && existing.decimals === undefined) {
+      this.reserveConfig.set(key, {
+        ...existing,
+        decimals: assertReserveDecimals(decimals, asset),
       });
     }
+  }
+
+  /** Cache on-chain ERC20 decimals. Throws on invalid or conflicting values — never defaults to 18. */
+  public setReserveDecimals(asset: Address, decimals: number): void {
+    const validated = assertReserveDecimals(decimals, asset);
+    this.registerReserve(asset);
+    const key = asset.toLowerCase();
+    const reserve = this.reserveConfig.get(key);
+    if (reserve === undefined) {
+      throw new Error(`reserve_decimals_missing_config:${asset}`);
+    }
+    if (reserve.decimals !== undefined && reserve.decimals !== validated) {
+      throw new Error(
+        `reserve_decimals_conflict:${asset}:have=${reserve.decimals}:got=${validated}`,
+      );
+    }
+    this.reserveConfig.set(key, { ...reserve, decimals: validated });
   }
 
   public onFlashblockTick(_blockNumber: bigint): boolean {
@@ -586,6 +621,18 @@ export class LocalPositionModel {
         return { status: "price_stale", staleAssets };
       }
 
+      const missingDecimals = collectMissingDecimalsAssets(position, this.reserveConfig);
+      if (missingDecimals.length > 0) {
+        this.config.logger?.error("RESERVE_DECIMALS_MISSING", {
+          account: position.account,
+          assets: missingDecimals,
+        });
+        return {
+          status: "error",
+          reason: `missing_reserve_decimals:${missingDecimals.join(",")}`,
+        };
+      }
+
       let weightedCollateral = 0n;
       let totalDebt = 0n;
 
@@ -595,8 +642,12 @@ export class LocalPositionModel {
         if (reserve === undefined || price === undefined || amount === 0n) {
           continue;
         }
+        const decimals = requireReserveDecimals(reserve);
+        const scale = 10n ** BigInt(decimals);
         const scaled = this.scaleCollateralAmount(position, assetKey, amount, reserve);
-        weightedCollateral += (scaled * price * reserve.liquidationThresholdBps) / BPS;
+        // Multiply first, divide last — truncating `scaled / 10^decimals` zeros dust legs.
+        weightedCollateral += (scaled * price * reserve.liquidationThresholdBps)
+          / (BPS * scale);
       }
 
       for (const [assetKey, amount] of position.debt) {
@@ -605,8 +656,10 @@ export class LocalPositionModel {
         if (reserve === undefined || price === undefined || amount === 0n) {
           continue;
         }
+        const decimals = requireReserveDecimals(reserve);
+        const scale = 10n ** BigInt(decimals);
         const scaled = this.scaleDebtAmount(position, assetKey, amount, reserve);
-        totalDebt += scaled * price;
+        totalDebt += (scaled * price) / scale;
       }
 
       if (totalDebt === 0n) {
@@ -952,6 +1005,34 @@ function collectPositionAssets(position: UserPosition): Address[] {
     }
   }
   return assets;
+}
+
+function assertReserveDecimals(decimals: number, asset: Address): number {
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) {
+    throw new Error(`invalid_reserve_decimals:${asset}:${decimals}`);
+  }
+  return decimals;
+}
+
+function requireReserveDecimals(reserve: ReserveConfig): number {
+  if (reserve.decimals === undefined) {
+    throw new Error(`missing_reserve_decimals:${reserve.asset}`);
+  }
+  return reserve.decimals;
+}
+
+function collectMissingDecimalsAssets(
+  position: UserPosition,
+  reserveConfig: ReadonlyMap<string, ReserveConfig>,
+): Address[] {
+  const missing: Address[] = [];
+  for (const assetKey of collectPositionAssets(position)) {
+    const reserve = reserveConfig.get(assetKey.toLowerCase());
+    if (reserve === undefined || reserve.decimals === undefined) {
+      missing.push(assetKey);
+    }
+  }
+  return missing;
 }
 
 function collectMissingPriceAssets(

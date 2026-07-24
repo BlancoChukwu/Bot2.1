@@ -50,8 +50,8 @@ describe("HF skip storm — gap-fill refresh write + tier recompute", () => {
 
   it("recomputeHf does not treat aave-sourced gap-fill prices as Chainlink-stale", async () => {
     const model = createModel();
-    model.registerReserve(BASE_AAVE, 8500n);
-    model.registerReserve(BASE_USDC, 8500n);
+    model.registerReserve(BASE_AAVE, 8500n, 18);
+    model.registerReserve(BASE_USDC, 8500n, 6);
     model.markPricesBootstrapped();
 
     // Stale updatedAt would fail Chainlink heartbeat — aave source must skip that check.
@@ -94,19 +94,23 @@ describe("HF skip storm — gap-fill refresh write + tier recompute", () => {
 
   it("recomputeTiersForAssets updates cached HF after gap-fill price overwrite", async () => {
     const model = createModel();
-    model.registerReserve(BASE_AAVE, 8500n);
-    model.registerReserve(BASE_USDC, 8500n);
+    model.registerReserve(BASE_AAVE, 8500n, 18);
+    model.registerReserve(BASE_USDC, 8500n, 6);
     model.markPricesBootstrapped();
 
-    model.registerBootstrapPrice(BASE_AAVE, 2_000_000_000_000_000_000n, {
-      answer: 200_000_000n,
+    const aavePxHigh = 2_000n * 10n ** 18n;
+    const aavePxLow = 1_000n * 10n ** 18n;
+    const usdcPx = 1n * 10n ** 18n;
+
+    model.registerBootstrapPrice(BASE_AAVE, aavePxHigh, {
+      answer: 200_000_000_000n,
       decimals: 8,
       updatedAt: NOW_SEC - 60,
       feedAddress: BASE_AAVE,
       asset: BASE_AAVE,
       source: "aave",
     });
-    model.registerBootstrapPrice(BASE_USDC, 1_000_000_000_000_000_000n, {
+    model.registerBootstrapPrice(BASE_USDC, usdcPx, {
       answer: 100_000_000n,
       decimals: 8,
       updatedAt: NOW_SEC,
@@ -119,9 +123,9 @@ describe("HF skip storm — gap-fill refresh write + tier recompute", () => {
       account: user,
       blockNumber: 10n,
       eModeCategoryId: 0,
-      healthFactorWad: 1_500_000_000_000_000_000n,
-      totalCollateralBase: 1_000n,
-      totalDebtBase: 100n,
+      healthFactorWad: 3_400_000_000_000_000_000n,
+      totalCollateralBase: 200_000_000_000n,
+      totalDebtBase: 50_000_000_000n,
       liquidationThreshold: 8_500n,
       reserves: [
         { asset: BASE_AAVE, scaledCollateral: 1_000_000_000_000_000_000n, scaledDebt: 0n },
@@ -130,6 +134,8 @@ describe("HF skip storm — gap-fill refresh write + tier recompute", () => {
     });
 
     const position = model.positions.get(user.toLowerCase())!;
+    // Exercise per-reserve path without aggregate divergence guard pinning HF.
+    position.confidence = "low";
     const before = model.recomputeHf(position, NOW_SEC);
     expect(before.status).toBe("ok");
     if (before.status !== "ok") {
@@ -137,9 +143,8 @@ describe("HF skip storm — gap-fill refresh write + tier recompute", () => {
     }
     position.cachedHfWad = before.hf;
 
-    // Crash AAVE price → HF must drop when tiers are recomputed for the refreshed asset.
-    model.registerBootstrapPrice(BASE_AAVE, 1_000_000_000_000_000_000n, {
-      answer: 100_000_000n,
+    model.registerBootstrapPrice(BASE_AAVE, aavePxLow, {
+      answer: 100_000_000_000n,
       decimals: 8,
       updatedAt: NOW_SEC,
       feedAddress: BASE_AAVE,

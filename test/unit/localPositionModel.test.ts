@@ -30,8 +30,8 @@ describe("localPositionModel HfResult", () => {
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       reserveAllowlist: [weth, usdc],
     });
-    model.registerReserve(weth, 8500n);
-    model.registerReserve(usdc, 8500n);
+    model.registerReserve(weth, 8500n, 18);
+    model.registerReserve(usdc, 8500n, 6);
   });
 
   function seedTwoAssetPosition(): UserPosition {
@@ -44,8 +44,8 @@ describe("localPositionModel HfResult", () => {
       totalDebtBase: 100n,
       liquidationThreshold: 8_500n,
       reserves: [
-        { asset: weth, scaledCollateral: 1_000n, scaledDebt: 0n },
-        { asset: usdc, scaledCollateral: 0n, scaledDebt: 100n },
+        { asset: weth, scaledCollateral: 1_000_000_000_000_000_000n, scaledDebt: 0n },
+        { asset: usdc, scaledCollateral: 0n, scaledDebt: 1_000_000n },
       ],
     });
     const position = model.positions.get(user.toLowerCase());
@@ -140,7 +140,7 @@ describe("localPositionModel HfResult", () => {
 
   it("propagates USDbC peg price when USDC feed updates", () => {
     registerWarmPrices();
-    model.registerReserve(usdbc, 8500n);
+    model.registerReserve(usdbc, 8500n, 6);
     model.registerPriceFeed(usdc, usdbc, 1n);
 
     model.applyFeedPriceUpdate(
@@ -157,7 +157,7 @@ describe("localPositionModel HfResult", () => {
 
   it("computes HF for USDbC positions when USDC is fresh without USDbC map entry", () => {
     registerWarmPrices();
-    model.registerReserve(usdbc, 8500n);
+    model.registerReserve(usdbc, 8500n, 6);
     model.seedFromOnChainSnapshot({
       account: user,
       blockNumber: 10n,
@@ -297,8 +297,8 @@ describe("localPositionModel event handling", () => {
       watchHfWad: hfThresholdToWad(purity.localHfWatch),
       reserveAllowlist: [weth, usdc],
     });
-    model.registerReserve(weth, 8500n);
-    model.registerReserve(usdc, 8500n);
+    model.registerReserve(weth, 8500n, 18);
+    model.registerReserve(usdc, 8500n, 6);
     model.registerPriceFeed("0xfeed", weth, 3_000_000_000_000_000_000n);
     model.registerPriceFeed("0xfeed2", usdc, 1_000_000_000_000_000_000n);
     model.markPricesBootstrapped();

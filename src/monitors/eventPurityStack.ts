@@ -32,6 +32,10 @@ import {
   type NeedsManualReconcileEntry,
 } from "./firstTouchReconcile";
 import { bootstrapAaveOracleGapFill, refreshGapFillPrices } from "../oracle/aaveOraclePrice";
+import {
+  collectEventReserveAssets,
+  hydrateReserveDecimals,
+} from "./reserveDecimals";
 import { aavePoolAbi } from "../protocols/aaveV3";
 import { poolEmodeAbi } from "./aaveEmode";
 
@@ -336,6 +340,7 @@ export class EventPurityStack {
       if (coverage.cacheHit) {
         await this.refreshReserveIndices();
       }
+      await this.hydrateAllReserveDecimals();
     } else {
       this.config.logger.info("partial_bootstrap_skipped", {
         reason: "BOOTSTRAP_ENABLED=false",
@@ -354,6 +359,7 @@ export class EventPurityStack {
         failed: gapFill.failed,
       });
     }
+    await this.hydrateAllReserveDecimals();
     this.pricesBootstrapped = bootstrapResult.pricesBootstrapped;
 
     const head = await this.config.executionClient.getBlockNumber();
@@ -482,6 +488,12 @@ export class EventPurityStack {
       await this.handleTierChanges(changes, event.meta.blockNumber);
       return;
     }
+    await hydrateReserveDecimals({
+      client: this.config.executionClient,
+      model: this.model,
+      assets: collectEventReserveAssets(event),
+      logger: this.config.logger,
+    });
     const result = this.model.applyAaveEvent(event);
     if (result.firstTouchReconcile !== undefined) {
       await this.reconcileFirstTouch(result.firstTouchReconcile, event.meta.blockNumber);
@@ -517,6 +529,7 @@ export class EventPurityStack {
     });
 
     if (terminal.status === "seeded") {
+      await this.hydrateAllReserveDecimals();
       const change = this.model.tierChangeForAccount(account, true);
       if (change !== undefined && this.model.isPricesBootstrapped()) {
         await this.handleTierChanges([change], blockNumber);
@@ -670,6 +683,22 @@ export class EventPurityStack {
           error: String(error),
         });
       }
+    }
+    await this.hydrateAllReserveDecimals();
+  }
+
+  private async hydrateAllReserveDecimals(): Promise<void> {
+    const result = await hydrateReserveDecimals({
+      client: this.config.executionClient,
+      model: this.model,
+      logger: this.config.logger,
+    });
+    if (result.hydrated > 0 || result.failed.length > 0) {
+      this.config.logger.info("reserve_decimals_hydrate", {
+        hydrated: result.hydrated,
+        failedCount: result.failed.length,
+        failed: result.failed.slice(0, 20),
+      });
     }
   }
 
