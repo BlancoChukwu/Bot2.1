@@ -157,8 +157,12 @@ async function main(): Promise<void> {
       receiver,
       expectedSwapRouter,
       expectedVersion,
-      expectedAuthorizedInitiator,
-      expectedSwapSlippageBps,
+      ...(expectedAuthorizedInitiator === undefined
+        ? {}
+        : { expectedAuthorizedInitiator }),
+      ...(expectedSwapSlippageBps === undefined
+        ? {}
+        : { expectedSwapSlippageBps }),
     });
   } else {
     // Sepolia: readiness helper is mainnet-chain typed; do the same checks inline.
