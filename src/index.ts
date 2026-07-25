@@ -1202,6 +1202,40 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
           });
           return;
         }
+        // Event-purity confirm does not populate ReserveAwareBorrowerCache by itself.
+        // Mirror near-liq: refresh+upsert the confirmed account, otherwise runOnce scans 0.
+        if (watchlistCoordinator === undefined) {
+          logger.warn("liquidatable_candidate_cache_upsert_skipped", {
+            chain: config.chain,
+            account: candidate.account,
+            reason: "watchlist_coordinator_unavailable",
+          });
+        } else {
+          watchlistCoordinator.registerBorrowers([candidate.account]);
+          const snapshots = await watchlistCoordinator.refreshBorrowers(
+            config.chain,
+            [candidate.account],
+          );
+          for (const snapshot of snapshots) {
+            hybridDetection.cache.upsert(snapshot);
+          }
+          logger.info("liquidatable_candidate_cache_upserted", {
+            chain: config.chain,
+            account: candidate.account,
+            snapshotCount: snapshots.length,
+            ...(snapshots[0] === undefined
+              ? {}
+              : { cachedHealthFactor: Number(snapshots[0].healthFactor) / 1e18 }),
+          });
+          if (snapshots.length === 0) {
+            logger.warn("liquidatable_candidate_refresh_empty", {
+              chain: config.chain,
+              account: candidate.account,
+              confirmedHealthFactor: Number(candidate.confirmed.healthFactor) / 1e18,
+              reason: "refresh_returned_no_snapshot_hf_recovered_or_pair_unavailable",
+            });
+          }
+        }
         await orchestrator.runOnce();
       },
     });
