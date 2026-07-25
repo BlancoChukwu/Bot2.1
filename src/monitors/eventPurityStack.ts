@@ -552,7 +552,8 @@ export class EventPurityStack {
       }
       if (change.isNew && change.tier !== "healthy") {
         this.confirmQueue.enqueueUrgent(change.account);
-      } else if (change.tier === "urgent") {
+      } else if (change.tier === "urgent" || change.tier === "liquidatable") {
+        // liquidatable must confirm+exec — shadow alone does not feed the pipeline
         this.confirmQueue.enqueueUrgent(change.account);
       } else if (change.tier === "watch") {
         this.confirmQueue.enqueueWatch(change.account);
