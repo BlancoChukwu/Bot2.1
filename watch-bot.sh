@@ -7,6 +7,9 @@
 #   ./watch-bot.sh --audit      # include full audit-session.mjs report
 #   ./watch-bot.sh --interval 10
 #   ./watch-bot.sh --log logs/my-session.log
+#   ./watch-bot.sh --liquidations              # live stream: evals / sent / fails
+#   ./watch-bot.sh --liquidations --all-evals  # include healthy HF skips
+#   ./watch-bot.sh --liquidations --backlog 80
 #
 set -euo pipefail
 
@@ -16,6 +19,9 @@ cd "$ROOT"
 INTERVAL=30
 ONCE=false
 AUDIT=false
+LIQUIDATIONS=false
+ALL_EVALS=false
+BACKLOG=40
 METRICS_PORT="${METRICS_PORT:-9090}"
 LOG_FILE=""
 
@@ -41,11 +47,14 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --once) ONCE=true; shift ;;
     --audit) AUDIT=true; shift ;;
+    --liquidations) LIQUIDATIONS=true; shift ;;
+    --all-evals) ALL_EVALS=true; shift ;;
+    --backlog) BACKLOG="${2:?missing backlog value}"; shift 2 ;;
     --interval) INTERVAL="${2:?missing interval value}"; shift 2 ;;
     --log) LOG_FILE="${2:?missing log path}"; shift 2 ;;
     --metrics-port) METRICS_PORT="${2:?missing port}"; shift 2 ;;
     -h|--help)
-      sed -n '2,12p' "$0"
+      sed -n '2,14p' "$0"
       exit 0
       ;;
     *)
@@ -306,6 +315,22 @@ render_once() {
   print_audit
   echo ""
 }
+
+if [[ "$LIQUIDATIONS" == true ]]; then
+  log_path="$(resolve_log_file)"
+  if [[ -z "$log_path" || ! -f "$log_path" ]]; then
+    echo "No log file found. Pass --log path/to.log or start the bot via launcher." >&2
+    exit 1
+  fi
+  liq_args=("$log_path" "--backlog" "$BACKLOG")
+  if [[ "$ALL_EVALS" == true ]]; then
+    liq_args+=(--all-evals)
+  fi
+  if [[ "$ONCE" == true ]]; then
+    liq_args+=(--once)
+  fi
+  exec node scripts/watch-bot-liquidations.mjs "${liq_args[@]}"
+fi
 
 if [[ "$ONCE" == true ]]; then
   render_once
