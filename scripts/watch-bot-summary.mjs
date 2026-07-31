@@ -1,6 +1,6 @@
 /**
- * Compact session summary for watch-bot.sh (single-pass log scan).
- * Usage: node scripts/watch-bot-summary.mjs <logPath> [--json]
+ * Dense ops + liquidations summary for watch-bot.sh (single-pass log scan).
+ * Usage: node scripts/watch-bot-summary.mjs <logPath> [--json] [--mode soak|live|unknown]
  */
 import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
@@ -8,12 +8,48 @@ import { rssGrowthMbPerHour, rssGrowthMbPerHourFullWindow } from "./rssGrowth.mj
 
 const logPath = resolve(process.argv[2] ?? "");
 const jsonOut = process.argv.includes("--json");
+const modeArgIdx = process.argv.indexOf("--mode");
+const modeOverride = modeArgIdx >= 0 ? String(process.argv[modeArgIdx + 1] ?? "unknown") : undefined;
 
 const FATAL_MSGS = new Set([
   "deployment_safety_gate_blocked",
   "uncaught_exception",
   "single_instance_lock_rejected",
   "memory_ceiling_hit",
+]);
+
+const LIQ_COUNT_KEYS = [
+  "event_purity_liquidatable_candidate",
+  "liquidatable_candidate_preview",
+  "liquidatable_candidate_detected_gate_closed",
+  "liquidation_dry_run_preview",
+  "liquidation_evaluated",
+  "liquidation_first_attempt",
+  "opportunity_trace_cycle",
+  "liquidation_path_candidate",
+  "execution_rejected_hf_not_liquidatable",
+  "execution_rejected_single_opportunity_busy",
+  "execution_rejected_recent_attempt_inflight",
+  "flash_loan_preview_rejected",
+  "execution_circuit_open",
+  "transaction_sent",
+  "liquidation_executed",
+  "candidate_execution_uncaught",
+];
+
+const ATTEMPT_MSGS = new Set([
+  "liquidation_first_attempt",
+  "opportunity_trace_cycle",
+  "liquidation_dry_run_preview",
+  "liquidation_evaluated",
+  "transaction_sent",
+  "liquidation_executed",
+  "execution_rejected_hf_not_liquidatable",
+  "execution_rejected_single_opportunity_busy",
+  "execution_rejected_recent_attempt_inflight",
+  "flash_loan_preview_rejected",
+  "execution_circuit_open",
+  "deployment_safety_gate_blocked",
 ]);
 
 function readLogLines(path) {
@@ -35,8 +71,20 @@ function formatDuration(ms) {
   return `${s}s`;
 }
 
+function shortAccount(value) {
+  if (typeof value !== "string" || value.length < 12) return value ?? "?";
+  return `${value.slice(0, 6)}…${value.slice(-4)}`;
+}
+
+function inferModeFromPath(path) {
+  const lower = path.toLowerCase();
+  if (lower.includes("soak") || lower.includes("simulation")) return "soak";
+  if (lower.includes("production") || lower.includes("live")) return "live";
+  return "unknown";
+}
+
 if (!logPath) {
-  console.error("usage: node scripts/watch-bot-summary.mjs <logPath> [--json]");
+  console.error("usage: node scripts/watch-bot-summary.mjs <logPath> [--json] [--mode soak|live|unknown]");
   process.exit(2);
 }
 
@@ -62,13 +110,16 @@ const counts = {
   position_first_touch_reconcile_skipped: 0,
   position_on_chain_reconcile_failed: 0,
   shadow_sample_skipped: 0,
-  event_purity_liquidatable_candidate: 0,
   gap_fill_refresh_poll_result: 0,
   oracle_poll_tick: 0,
   hybrid_detection_failure: 0,
   partial_bootstrap_getlogs_retry: 0,
   hf_price_gap_summary: 0,
+  deployment_safety_gate_blocked: 0,
 };
+for (const key of LIQ_COUNT_KEYS) {
+  counts[key] = 0;
+}
 
 let firstTs;
 let lastTs;
@@ -77,8 +128,10 @@ let lastRuntimeSnapshot;
 let lastShadowAggregate;
 let lastGapFillRefresh;
 let wsStarted = false;
+let simModeHint;
 const rssSamples = [];
 const recentCritical = [];
+const recentAttempts = [];
 
 for (const rawLine of readLogLines(logPath)) {
   let row;
@@ -96,19 +149,37 @@ for (const rawLine of readLogLines(logPath)) {
   const msg = row.msg;
   if (typeof msg !== "string") continue;
 
+  if (row.simulationMode === true || row.simulation_mode === true || row.SIMULATION_MODE === true) {
+    simModeHint = "soak";
+  } else if (row.simulationMode === false || row.simulation_mode === false || row.SIMULATION_MODE === false) {
+    simModeHint = "live";
+  }
+
   if (row.level === 50) counts.critical_errors += 1;
-  if (FATAL_MSGS.has(msg) || (typeof msg === "string" && msg.endsWith("_critical"))) {
+  if (FATAL_MSGS.has(msg) || msg.endsWith("_critical")) {
     recentCritical.push({ time: row.time, msg, error: row.error, reasons: row.reasons });
     if (recentCritical.length > 5) recentCritical.shift();
   }
 
-  if (msg in counts && msg !== "memory_stats" && msg !== "memory_ceiling_hit" && msg !== "memory_warning") {
+  if (msg in counts) {
     counts[msg] += 1;
+  }
+
+  if (ATTEMPT_MSGS.has(msg)) {
+    recentAttempts.push({
+      time: row.time,
+      msg,
+      account: row.account ?? row.borrower ?? row.user,
+      phase: row.phase,
+      simOk: row.sim_ok ?? row.simOk,
+      opportunityId: row.opportunityId,
+      reasons: row.reasons,
+    });
+    if (recentAttempts.length > 6) recentAttempts.shift();
   }
 
   switch (msg) {
     case "memory_stats":
-      counts.memory_stats += 1;
       lastMemory = {
         time: row.time,
         heapUsedMb: row.heapUsedMb,
@@ -154,45 +225,74 @@ for (const rawLine of readLogLines(logPath)) {
         skipReason: row.skipReason,
       };
       break;
-    case "oracle_poll_timer_started":
-      break;
-    case "hf_price_gap_summary":
-      counts.hf_price_gap_summary += 1;
-      break;
     case "ws_event_layer_started":
       wsStarted = true;
-      break;
-    case "memory_ceiling_hit":
-      counts.memory_ceiling_hit += 1;
-      break;
-    case "memory_warning":
-      counts.memory_warning += 1;
       break;
     default:
       break;
   }
 }
 
+const rejectedTotal =
+  counts.execution_rejected_hf_not_liquidatable
+  + counts.execution_rejected_single_opportunity_busy
+  + counts.execution_rejected_recent_attempt_inflight
+  + counts.flash_loan_preview_rejected;
+
+const mode = modeOverride && modeOverride !== "unknown"
+  ? modeOverride
+  : (simModeHint ?? inferModeFromPath(logPath));
+
+const isSoak = mode === "soak";
 const windowMs = firstTs && lastTs ? Date.parse(lastTs) - Date.parse(firstTs) : undefined;
 const rssPostWarmup = Number(rssGrowthMbPerHour(rssSamples).toFixed(2));
 const rssFullWindow = Number(rssGrowthMbPerHourFullWindow(rssSamples).toFixed(2));
+const healthy =
+  counts.critical_errors === 0
+  && counts.memory_ceiling_hit === 0
+  && counts.position_on_chain_reconcile_failed === 0
+  && counts.hybrid_detection_failure === 0
+  && counts.deployment_safety_gate_blocked === 0
+  && counts.execution_circuit_open === 0;
+
 const summary = {
   logPath,
   logSizeMb: Number((logSizeBytes / 1024 / 1024).toFixed(2)),
+  mode,
   window: { firstTs, lastTs, duration: windowMs === undefined ? undefined : formatDuration(windowMs) },
   wsEventLayerStarted: wsStarted,
   counts,
+  liquidations: {
+    candidates: counts.event_purity_liquidatable_candidate,
+    previews: counts.liquidatable_candidate_preview,
+    gateClosed: counts.liquidatable_candidate_detected_gate_closed,
+    evaluated: counts.liquidation_evaluated,
+    pathCandidates: counts.liquidation_path_candidate,
+    dryRuns: counts.liquidation_dry_run_preview,
+    firstAttempts: counts.liquidation_first_attempt,
+    opportunityTraces: counts.opportunity_trace_cycle,
+    rejected: rejectedTotal,
+    rejectedDetail: {
+      hfNotLiquidatable: counts.execution_rejected_hf_not_liquidatable,
+      busy: counts.execution_rejected_single_opportunity_busy,
+      inflight: counts.execution_rejected_recent_attempt_inflight,
+      flashPreview: counts.flash_loan_preview_rejected,
+    },
+    circuitOpen: counts.execution_circuit_open,
+    sent: counts.transaction_sent,
+    executed: counts.liquidation_executed,
+    uncaught: counts.candidate_execution_uncaught,
+    safetyGateBlocked: counts.deployment_safety_gate_blocked,
+  },
   rssGrowthMbPerHour: rssPostWarmup,
   rssGrowthMbPerHourFullWindow: rssFullWindow,
   lastMemory,
   lastRuntimeSnapshot,
   lastShadowAggregate,
+  lastGapFillRefresh,
   recentCritical,
-  healthy:
-    counts.critical_errors === 0
-    && counts.memory_ceiling_hit === 0
-    && counts.position_on_chain_reconcile_failed === 0
-    && counts.hybrid_detection_failure === 0,
+  recentAttempts,
+  healthy,
 };
 
 if (jsonOut) {
@@ -200,7 +300,47 @@ if (jsonOut) {
   process.exit(summary.healthy ? 0 : 1);
 }
 
-console.log("── Session summary ──");
+const modeLabel = isSoak
+  ? "soak (no live TX) — attempts = dry-run / sim / evaluated"
+  : mode === "live"
+    ? "live — sent/executed count real txs"
+    : "mode unknown — treat sent/executed cautiously";
+
+console.log("── Liquidations ──");
+console.log(`  Mode:         ${modeLabel}`);
+console.log(`  Candidates:   found=${summary.liquidations.candidates} preview=${summary.liquidations.previews} path=${summary.liquidations.pathCandidates} gate_closed=${summary.liquidations.gateClosed}`);
+console.log(`  Pipeline:     evaluated=${summary.liquidations.evaluated} first_attempt=${summary.liquidations.firstAttempts} traces=${summary.liquidations.opportunityTraces}`);
+console.log(`  Dry-run/sim:  ${summary.liquidations.dryRuns}`);
+console.log(
+  `  Rejected:     ${summary.liquidations.rejected}`
+  + ` (hf=${summary.liquidations.rejectedDetail.hfNotLiquidatable}`
+  + ` busy=${summary.liquidations.rejectedDetail.busy}`
+  + ` inflight=${summary.liquidations.rejectedDetail.inflight}`
+  + ` flash=${summary.liquidations.rejectedDetail.flashPreview})`,
+);
+if (isSoak) {
+  console.log(`  Sent/exec:    n/a in soak (dry-run only) | circuit_open=${summary.liquidations.circuitOpen}`);
+} else {
+  console.log(`  Sent/exec:    sent=${summary.liquidations.sent} executed=${summary.liquidations.executed} uncaught=${summary.liquidations.uncaught} circuit_open=${summary.liquidations.circuitOpen}`);
+}
+if (summary.liquidations.safetyGateBlocked > 0) {
+  console.log(`  Safety gate:  BLOCKED x${summary.liquidations.safetyGateBlocked} — run dry-run receipt then restart live`);
+}
+if (recentAttempts.length > 0) {
+  console.log("  Recent:");
+  for (const row of recentAttempts.slice(-5)) {
+    const bits = [row.time ?? "?", row.msg];
+    if (row.account) bits.push(shortAccount(String(row.account)));
+    if (row.phase) bits.push(`phase=${row.phase}`);
+    if (row.simOk !== undefined) bits.push(`sim=${row.simOk}`);
+    console.log(`    ${bits.join(" ")}`);
+  }
+} else {
+  console.log("  Recent:       (none yet this session)");
+}
+
+console.log("");
+console.log("── Health ──");
 console.log(`  Log size:     ${summary.logSizeMb} MB`);
 if (summary.window.firstTs) {
   console.log(`  Window:       ${summary.window.firstTs} → ${summary.window.lastTs ?? "now"} (${summary.window.duration ?? "?"})`);
@@ -220,7 +360,6 @@ if (lastMemory) {
   console.log(`  Memory:       heap=${lastMemory.heapUsedMb ?? "?"}MB rss=${lastMemory.rssMb ?? "?"}MB watchlist=${lastMemory.watchlistSize ?? "?"} (rss slope post-warmup ${summary.rssGrowthMbPerHour} MB/h; full-window ${summary.rssGrowthMbPerHourFullWindow} MB/h)`);
 }
 console.log(`  Reconcile:    ok=${counts.position_first_touch_reconciled} skipped=${counts.position_first_touch_reconcile_skipped} failed=${counts.position_on_chain_reconcile_failed}`);
-console.log(`  Candidates:   ${counts.event_purity_liquidatable_candidate} liquidatable | bootstrap retries=${counts.partial_bootstrap_getlogs_retry}`);
 if (lastGapFillRefresh || counts.gap_fill_refresh_poll_result > 0) {
   const tickNote = counts.oracle_poll_tick > 0 ? ` ticks=${counts.oracle_poll_tick}` : "";
   console.log(
@@ -229,11 +368,5 @@ if (lastGapFillRefresh || counts.gap_fill_refresh_poll_result > 0) {
 } else {
   console.log("  Gap-fill:     no refresh poll logs (rebuild + restart required)");
 }
-console.log(`  Critical:     level50=${counts.critical_errors} ceiling=${counts.memory_ceiling_hit} hybrid_fail=${counts.hybrid_detection_failure}`);
-if (recentCritical.length > 0) {
-  console.log("  Recent critical:");
-  for (const row of recentCritical) {
-    console.log(`    ${row.time ?? "?"} ${row.msg}`);
-  }
-}
-console.log(`  Status:       ${summary.healthy ? "OK" : "CHECK WARNINGS"}`);
+console.log(`  Critical:     level50=${counts.critical_errors} ceiling=${counts.memory_ceiling_hit} hybrid_fail=${counts.hybrid_detection_failure} mem_warn=${counts.memory_warning}`);
+console.log(`  Status:       ${summary.healthy ? "OK" : "ATTENTION NEEDED"}`);

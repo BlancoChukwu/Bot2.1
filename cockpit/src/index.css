@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+@theme {
+  /* Neutral dark gray chassis — no blue tint */
+  --color-chassis: #121212;
+  --color-panel: #1a1a1a;
+  --color-bevel: #2e2e2e;
+  --color-phosphor: #00ff41;
+  --color-phosphor-dim: #00cc33;
+  --color-amber: #f5a524;
+  --color-amber-deep: #7a4a10;
+  --color-crimson: #8b1219;
+  --color-red-glow: #ff2a2a;
+  --color-muted: #8a8a8a;
+  --color-text: #e8e8e8;
+  --color-header: #ffffff;
+  --font-display: "Barlow Condensed", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Share Tech Mono", ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--color-text);
+  font-family: var(--font-display);
+  background:
+    radial-gradient(ellipse 900px 500px at 20% -10%, rgba(0, 255, 65, 0.04), transparent 55%),
+    linear-gradient(165deg, #121212 0%, #1a1a1a 50%, #121212 100%);
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.22;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='0.55'/%3E%3C/svg%3E");
+  mix-blend-mode: overlay;
+}
+
+.phosphor {
+  color: var(--color-phosphor);
+  text-shadow: 0 0 10px rgba(0, 255, 65, 0.35);
+}
+
+.flash-critical {
+  animation: criticalFlash 1s ease-in-out infinite;
+}
+
+@keyframes criticalFlash {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(255, 42, 42, 0.55);
+  }
+  50% {
+    opacity: 0.55;
+    box-shadow: 0 0 22px 2px rgba(255, 42, 42, 0.45);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flash-critical {
+    animation: none;
+    opacity: 1;
+    box-shadow: 0 0 16px 1px rgba(255, 42, 42, 0.4);
+  }
+}

@@ -44,7 +44,9 @@ Logs: `logs/<prefix>-YYYYMMDD-HHMMSS.log` · Session pointer: `logs/latest-sessi
 
 | Action | Command |
 |--------|---------|
-| Monitor (refresh 30s) | `./watch-bot.sh` |
+| Desktop cockpit (laptop) | `cd cockpit && npm install && npm run tauri:dev` |
+| Cockpit UI preview (browser mock) | `cd cockpit && npm run dev` → http://127.0.0.1:5179 |
+| Monitor on VM (refresh 30s) | `./watch-bot.sh` |
 | Single status snapshot | `./watch-bot.sh --once` |
 | Full audit in monitor | `./watch-bot.sh --audit` |
 | Tail active log | `tail -f logs/event-purity-production-*.log` *(or path from `latest-session.txt`)* |
@@ -65,7 +67,7 @@ Logs: `logs/<prefix>-YYYYMMDD-HHMMSS.log` · Session pointer: `logs/latest-sessi
 | `./start-simulation.sh` | `.env.simulation` | Legacy soak (poll/orchestrator) |
 | `./start-production.sh` | `.env.production` | Legacy live (standard RPC) |
 | `./start-production-budget.sh` | `.env.production.budget` | Legacy live (`RPC_BUDGET_MODE=true`) |
-| `./watch-bot.sh` | — | Live monitor dashboard |
+| `./watch-bot.sh` | — | Dense live monitor (status + liquidations + health) |
 | `./watch-bot.sh --once` | — | One-shot status |
 | `./watch-bot.sh --audit` | — | Monitor + full session audit |
 | `./watch-bot.sh --interval 10` | — | Refresh every 10s |

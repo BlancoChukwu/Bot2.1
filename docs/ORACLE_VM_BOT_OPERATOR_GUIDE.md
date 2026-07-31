@@ -235,6 +235,9 @@ You want a response that looks successful (not a connection error).
 ```
 
 - The screen refreshes about every 30 seconds.
+- Top banner: **green RUNNING** / **red OFF**, plus mode (soak vs live).
+- A flashing **ALERT** appears when critical log errors need attention.
+- Liquidations section lists candidates, evaluations, dry-runs/sim, rejects, and (in live) sent/executed.
 - To stop watching (bot keeps running): press `Ctrl` + `C`.
 
 ### Step 14 — Follow the log file
@@ -292,7 +295,8 @@ cd ~/optimism-aave-v3-liquidator-ts
 | --- | --- |
 | Start safe soak | `./start-event-purity-soak.sh` |
 | See if bot is running | `npm run bot:status` |
-| Live dashboard | `./watch-bot.sh` |
+| Live dashboard (on VM) | `./watch-bot.sh` |
+| Desktop cockpit (on laptop) | `cd cockpit && npm run tauri:dev` |
 | One status snapshot | `./watch-bot.sh --once` |
 | Stop bot | `npm run bot:stop` |
 | Update code then restart soak | `git pull --ff-only` then `./start-event-purity-soak.sh` |
