@@ -34,11 +34,12 @@ The cockpit is an operator plane on the laptop. It must never degrade liquidatio
 | Control | Behavior |
 | --- | --- |
 | PREPARE & START LIVE | VM: dry-run receipt → `./start-event-purity-production.sh` |
-| LIVE MODE | **Read-only** indicator (no mutation) |
 | STOP BOT | Confirm → `npm run bot:stop` |
 | UPDATE CODE | VM only: `git pull --ff-only` (laptop pushes to GitHub manually) |
 | SYNC ENV | Production only: SCP `.env.event-purity-production` → VM, then `cp` to `.env` |
 | LOG | Cycles log filters on each click: all → liquidations → errors (persisted) |
+
+**Live mode** is shown read-only in Run status (`true` / `false`). There is no Live Mode control — cockpit is live/production only.
 
 **Not in v1:** Start Soak, Sync Soak Env, laptop `git push` from cockpit.
 

@@ -142,6 +142,20 @@ export default function App() {
     try {
       const result = await runOpsCommand(command, settings);
       showToast(result.message);
+      // After lifecycle ops, refresh immediately so Live mode / RUNNING update.
+      if (
+        command === "prepare_and_start_live" ||
+        command === "stop_bot" ||
+        command === "sync_env_production"
+      ) {
+        await vm.refreshNow();
+        // Second pass shortly after start — catches session meta / health once process is up.
+        if (command === "prepare_and_start_live") {
+          window.setTimeout(() => {
+            void vm.refreshNow();
+          }, 5000);
+        }
+      }
     } catch (error) {
       showToast(`Command failed: ${String(error)}`);
     } finally {
@@ -202,7 +216,6 @@ export default function App() {
         <ControlColumn
           busy={busy}
           connected={!desktop || connected}
-          liveMode={telemetry.liveMode}
           logFilter={logFilter}
           onCommand={onCommand}
           onStopRequest={() => setStopOpen(true)}

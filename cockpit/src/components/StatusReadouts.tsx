@@ -17,15 +17,21 @@ export function StatusReadouts({ telemetry }: { telemetry: CockpitTelemetry }) {
             Current run time:{" "}
             <span className="text-phosphor">{formatUptime(telemetry.uptimeSec)}</span>
           </div>
-          <div>
+          <div className="col-span-2 rounded border border-bevel bg-black/30 px-2 py-1.5">
             Live mode:{" "}
-            <span className={telemetry.liveMode ? "text-amber" : "text-phosphor"}>
+            <span
+              className={`font-bold tracking-wide ${
+                telemetry.liveMode ? "text-amber" : "text-muted"
+              }`}
+            >
               {String(telemetry.liveMode)}
             </span>
-          </div>
-          <div>
-            Live TX:{" "}
-            <span className={telemetry.liveTxEnabled ? "text-amber" : "text-phosphor"}>
+            <span className="text-muted"> · Live TX: </span>
+            <span
+              className={`font-bold tracking-wide ${
+                telemetry.liveTxEnabled ? "text-amber" : "text-muted"
+              }`}
+            >
               {String(telemetry.liveTxEnabled)}
             </span>
           </div>

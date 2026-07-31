@@ -8,6 +8,7 @@
  * @property {string} [summaryJson]
  * @property {string} [healthzJson]
  * @property {string} [statusJson]
+ * @property {string} [sessionJson]
  * @property {boolean} [botRunning]
  * @property {Date} [now]
  */
@@ -82,6 +83,43 @@ function emptyTelemetry(now = new Date()) {
   };
 }
 
+function looksLive(blob) {
+  const lower = String(blob ?? "").toLowerCase();
+  return lower.includes("production") || lower.includes("live");
+}
+
+function looksSoak(blob) {
+  const lower = String(blob ?? "").toLowerCase();
+  return lower.includes("soak") || lower.includes("simulation");
+}
+
+/**
+ * Resolve live vs soak from summary.mode, session meta, and path hints.
+ * Cockpit is live-only ops; we still detect soak accurately if an old session is active.
+ */
+export function resolveLiveMode(summary = {}, session = {}) {
+  if (session.simulationMode === false) return true;
+  if (session.simulationMode === true) return false;
+
+  const mode = String(session.mode ?? summary.mode ?? "unknown").toLowerCase();
+  if (mode === "live") return true;
+  if (mode === "soak") return false;
+
+  const hints = [
+    summary.logPath,
+    session.log,
+    session.prefix,
+    session.env_file,
+    session.envFile,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  if (looksLive(hints)) return true;
+  if (looksSoak(hints)) return false;
+  return false;
+}
+
 /**
  * Map a VM telemetry snapshot into CockpitTelemetry (core fields only).
  * Candidates / HF traces / watchlist stay empty in v1.
@@ -93,11 +131,11 @@ export function mapVmSnapshot(input = {}) {
   const summary = safeParse(input.summaryJson, {});
   const healthz = safeParse(input.healthzJson, {});
   const status = safeParse(input.statusJson, {});
+  const session = safeParse(input.sessionJson, {});
 
   const liq = summary.liquidations ?? {};
   const snap = summary.lastRuntimeSnapshot ?? {};
-  const mode = typeof summary.mode === "string" ? summary.mode : "unknown";
-  const liveMode = mode === "live";
+  const liveMode = resolveLiveMode(summary, session);
   const circuitOpen = Number(liq.circuitOpen ?? 0) > 0;
   const botRunning =
     typeof input.botRunning === "boolean"
@@ -193,8 +231,8 @@ export function mapVmSnapshot(input = {}) {
     liveTxEnabled: liveMode,
     botRunning,
     circuit: circuitOpen ? "open" : "closed",
-    sessionId: String(summary.logPath ?? "—").split(/[/\\]/).pop() ?? "—",
-    versionStamp: liveMode ? "LIVE" : mode === "soak" ? "SOAK" : mode.toUpperCase(),
+    sessionId: String(summary.logPath ?? session.log ?? "—").split(/[/\\]/).pop() ?? "—",
+    versionStamp: liveMode ? "LIVE" : looksSoak(`${summary.mode ?? ""} ${session.prefix ?? ""}`) ? "SOAK" : "UNKNOWN",
     uptimeSec: uptimeFromWindow(summary.window),
     mountainTime: mountainTime(now),
     seededAccounts: seeded,

@@ -1,11 +1,11 @@
 import { useState } from "react";
 import type { LogFilter, OpsCommand } from "../types/telemetry";
 import { LOG_FILTER_CYCLE } from "../types/telemetry";
+
 interface ControlColumnProps {
   busy: boolean;
   /** When false, ops buttons that talk to the VM are disabled. */
   connected: boolean;
-  liveMode: boolean;
   logFilter: LogFilter;
   onCommand: (command: OpsCommand) => void;
   onStopRequest: () => void;
@@ -84,7 +84,6 @@ export function nextLogFilter(current: LogFilter): LogFilter {
 export function ControlColumn({
   busy,
   connected,
-  liveMode,
   logFilter,
   onCommand,
   onStopRequest,
@@ -96,7 +95,7 @@ export function ControlColumn({
   const opsDisabled = busy || !connected;
 
   return (
-    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
       <IndustrialButton
         labelLines={["PREPARE", "& START", "LIVE"]}
         tone={prepareStartClicked ? "green" : "amber"}
@@ -106,28 +105,6 @@ export function ControlColumn({
           onCommand("prepare_and_start_live");
         }}
       />
-
-      <button
-        type="button"
-        disabled={busy}
-        className={`${CONTROL_CELL} cursor-default bg-linear-to-b disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-phosphor ${
-          liveMode
-            ? "border-phosphor/60 from-[#0d3a1c] to-[#07140c] shadow-[0_0_14px_rgba(0,255,65,0.35)]"
-            : "border-[#ffb84d] from-[#5c3a12] to-[#2a1808] shadow-[0_0_18px_rgba(245,165,36,0.45)]"
-        }`}
-        title="Read-only indicator — does not toggle live mode on the VM"
-      >
-        <span className="block font-mono text-[9px] tracking-[0.14em] text-muted uppercase">
-          Live Mode
-        </span>
-        <span
-          className={`block font-display text-sm font-bold tracking-[0.1em] uppercase ${
-            liveMode ? "text-amber" : "text-phosphor"
-          }`}
-        >
-          {liveMode ? "ON" : "OFF"}
-        </span>
-      </button>
 
       <IndustrialButton
         labelLines={["STOP", "BOT"]}

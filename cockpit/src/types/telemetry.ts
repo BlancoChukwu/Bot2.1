@@ -83,6 +83,7 @@ export interface TelemetrySnapshotResult {
   summaryJson?: string;
   healthzJson?: string;
   statusJson?: string;
+  sessionJson?: string;
   botRunning?: boolean;
   detail?: string;
   at: string;

@@ -50,6 +50,7 @@ pub struct TelemetrySnapshotResult {
   pub summary_json: Option<String>,
   pub healthz_json: Option<String>,
   pub status_json: Option<String>,
+  pub session_json: Option<String>,
   pub bot_running: Option<bool>,
   pub detail: Option<String>,
   pub at: String,
@@ -250,17 +251,44 @@ fn test_connection(settings: &OpsSettings) -> Result<(String, Option<bool>, Opti
   Ok((out, bot_running, git_head))
 }
 
-fn fetch_snapshot(settings: &OpsSettings) -> Result<(String, String, String, Option<bool>), String> {
+fn fetch_snapshot(
+  settings: &OpsSettings,
+) -> Result<(String, String, String, String, Option<bool>), String> {
   validate_settings(settings)?;
   let path = shell_quote(&settings.vm_path);
+  // Resolve active log + session meta, infer mode from production/live hints, then summarize.
+  // Session JSON is a dedicated segment so the UI can flip liveMode even before log lines appear.
   let remote = format!(
     "cd {path} && \
      LOG=$(node scripts/resolve-active-session-log.mjs 2>/dev/null || true) && \
      if [ -z \"$LOG\" ] || [ ! -f \"$LOG\" ]; then \
-       LOG=$(ls -t logs/event-purity-*.log logs/*.log 2>/dev/null | head -1 || true); \
+       if [ -f logs/latest-session.txt ]; then \
+         LOG=$(grep -E '^log=' logs/latest-session.txt | head -1 | cut -d= -f2- || true); \
+       fi; \
      fi && \
+     if [ -z \"$LOG\" ] || [ ! -f \"$LOG\" ]; then \
+       LOG=$(ls -t logs/event-purity-production-*.log logs/event-purity-*.log logs/*.log 2>/dev/null | head -1 || true); \
+     fi && \
+     PREFIX=$(grep -E '^prefix=' logs/latest-session.txt 2>/dev/null | head -1 | cut -d= -f2- || true) && \
+     ENV_FILE=$(grep -E '^env_file=' logs/latest-session.txt 2>/dev/null | head -1 | cut -d= -f2- || true) && \
+     LOG_META=$(grep -E '^log=' logs/latest-session.txt 2>/dev/null | head -1 | cut -d= -f2- || true) && \
+     SIM=$(grep -E '^simulation_mode=' logs/latest-session.txt 2>/dev/null | head -1 | cut -d= -f2- || true) && \
+     if [ -z \"$SIM\" ]; then \
+       SIM=$(grep -E '^export SIMULATION_MODE=' .runtime/launch-session.sh 2>/dev/null | head -1 | sed 's/.*=//' | tr -d '\"' || true); \
+     fi && \
+     BLOB=$(printf '%s %s %s %s' \"$PREFIX\" \"$ENV_FILE\" \"$LOG_META\" \"$LOG\" | tr '[:upper:]' '[:lower:]') && \
+     MODE=unknown && \
+     if [ \"$SIM\" = \"false\" ] || echo \"$BLOB\" | grep -qE 'production|live'; then MODE=live; \
+     elif [ \"$SIM\" = \"true\" ] || echo \"$BLOB\" | grep -qE 'soak|simulation'; then MODE=soak; \
+     fi && \
+     if [ \"$SIM\" = \"false\" ]; then SIM_JSON=false; \
+     elif [ \"$SIM\" = \"true\" ]; then SIM_JSON=true; \
+     else SIM_JSON=null; \
+     fi && \
+     SESSION_JSON=$(printf '{{\"prefix\":\"%s\",\"env_file\":\"%s\",\"log\":\"%s\",\"simulationMode\":%s,\"mode\":\"%s\"}}' \
+       \"$PREFIX\" \"$ENV_FILE\" \"$LOG_META\" \"$SIM_JSON\" \"$MODE\") && \
      if [ -n \"$LOG\" ] && [ -f \"$LOG\" ]; then \
-       OUT=$(node scripts/watch-bot-summary.mjs \"$LOG\" --json 2>/dev/null || true); \
+       OUT=$(node scripts/watch-bot-summary.mjs \"$LOG\" --json --mode \"$MODE\" 2>/dev/null || true); \
        if [ -n \"$OUT\" ]; then printf '%s\\n' \"$OUT\"; else echo '{{}}'; fi; \
      else \
        echo '{{}}'; \
@@ -270,11 +298,16 @@ fn fetch_snapshot(settings: &OpsSettings) -> Result<(String, String, String, Opt
      echo '---COCKPIT---' && \
      (curl -sf --max-time 3 http://127.0.0.1:9090/status 2>/dev/null || echo '{{}}') && \
      echo '---COCKPIT---' && \
-     (node scripts/ensure-single-bot.mjs --status 2>/dev/null || echo '{{}}')"
+     (node scripts/ensure-single-bot.mjs --status 2>/dev/null || echo '{{}}') && \
+     echo '---COCKPIT---' && \
+     printf '%s\\n' \"$SESSION_JSON\""
   );
   let out = run_ssh_with_timeout(settings, &remote, Some(Duration::from_secs(30)))?;
   let parts: Vec<&str> = out.split("---COCKPIT---").collect();
-  let summary = parts.first().map(|s| s.trim().to_string()).unwrap_or_else(|| "{}".into());
+  let summary = parts
+    .first()
+    .map(|s| s.trim().to_string())
+    .unwrap_or_else(|| "{}".into());
   let healthz = parts
     .get(1)
     .map(|s| s.trim().to_string())
@@ -284,8 +317,12 @@ fn fetch_snapshot(settings: &OpsSettings) -> Result<(String, String, String, Opt
     .map(|s| s.trim().to_string())
     .unwrap_or_else(|| "{}".into());
   let bot_status = parts.get(3).map(|s| s.trim()).unwrap_or("{}");
+  let session = parts
+    .get(4)
+    .map(|s| s.trim().to_string())
+    .unwrap_or_else(|| "{}".into());
   let bot_running = parse_bot_running(bot_status);
-  Ok((summary, healthz, status, bot_running))
+  Ok((summary, healthz, status, session, bot_running))
 }
 
 #[tauri::command]
@@ -337,22 +374,26 @@ fn test_vm_connection(settings: OpsSettings) -> ConnectionTestResult {
 #[tauri::command]
 fn fetch_telemetry_snapshot(settings: OpsSettings) -> TelemetrySnapshotResult {
   match fetch_snapshot(&settings) {
-    Ok((summary_json, healthz_json, status_json, bot_running)) => TelemetrySnapshotResult {
-      ok: true,
-      message: "Telemetry snapshot ok".into(),
-      summary_json: Some(summary_json),
-      healthz_json: Some(healthz_json),
-      status_json: Some(status_json),
-      bot_running,
-      detail: None,
-      at: now_iso(),
-    },
+    Ok((summary_json, healthz_json, status_json, session_json, bot_running)) => {
+      TelemetrySnapshotResult {
+        ok: true,
+        message: "Telemetry snapshot ok".into(),
+        summary_json: Some(summary_json),
+        healthz_json: Some(healthz_json),
+        status_json: Some(status_json),
+        session_json: Some(session_json),
+        bot_running,
+        detail: None,
+        at: now_iso(),
+      }
+    }
     Err(err) => TelemetrySnapshotResult {
       ok: false,
       message: err,
       summary_json: None,
       healthz_json: None,
       status_json: None,
+      session_json: None,
       bot_running: None,
       detail: None,
       at: now_iso(),

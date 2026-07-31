@@ -9,6 +9,7 @@ export type MapVmSnapshotInput = {
   summaryJson?: string;
   healthzJson?: string;
   statusJson?: string;
+  sessionJson?: string;
   botRunning?: boolean;
   now?: Date;
 };

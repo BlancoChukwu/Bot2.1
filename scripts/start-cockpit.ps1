@@ -52,9 +52,13 @@ Assert-SshOnPath
 
 Set-Location $CockpitDir
 
-if (-not (Test-Path (Join-Path $CockpitDir "node_modules"))) {
+$TauriCli = Join-Path $CockpitDir "node_modules\@tauri-apps\cli\tauri.js"
+if (-not (Test-Path (Join-Path $CockpitDir "node_modules")) -or -not (Test-Path -LiteralPath $TauriCli)) {
   Write-Host "Installing cockpit npm dependencies..." -ForegroundColor Yellow
   npm install
+  if (-not (Test-Path -LiteralPath $TauriCli)) {
+    throw "Tauri CLI missing after npm install: $TauriCli"
+  }
 }
 
 $ReleaseExeCandidates = @(

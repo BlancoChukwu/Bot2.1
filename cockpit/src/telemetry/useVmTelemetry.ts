@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchTelemetrySnapshot } from "../ops/opsClient";
 import type { CockpitTelemetry, OpsSettings } from "../types/telemetry";
 import { emptyTelemetry, mapVmSnapshot } from "./mapVmSnapshot";
@@ -18,6 +18,8 @@ export interface VmTelemetryState {
   lastPollIso: string | null;
   lastError: string | null;
   polling: boolean;
+  /** Force an immediate SSH snapshot (e.g. after Prepare & Start Live). */
+  refreshNow: () => Promise<void>;
 }
 
 /**
@@ -36,7 +38,47 @@ export function useVmTelemetry({
   const [polling, setPolling] = useState(false);
   const inFlight = useRef(false);
   const settingsRef = useRef(settings);
+  const connectedRef = useRef(connected);
   settingsRef.current = settings;
+  connectedRef.current = connected;
+
+  const applySnapshot = useCallback(async () => {
+    if (!connectedRef.current || inFlight.current) return;
+    inFlight.current = true;
+    setPolling(true);
+    try {
+      const snap = await fetchTelemetrySnapshot(settingsRef.current);
+      if (!snap.ok) {
+        setLastError(snap.message);
+        return;
+      }
+      const mapped = mapVmSnapshot({
+        summaryJson: snap.summaryJson,
+        healthzJson: snap.healthzJson,
+        statusJson: snap.statusJson,
+        sessionJson: snap.sessionJson,
+        botRunning: snap.botRunning,
+      });
+      setTelemetry((prev) => ({
+        ...mapped,
+        alerts: mapped.alerts.map((a) => {
+          const prior = prev.alerts.find((p) => p.id === a.id);
+          return prior?.acknowledged ? { ...a, acknowledged: true } : a;
+        }),
+      }));
+      setLastPollIso(new Date().toISOString());
+      setLastError(null);
+    } catch (error) {
+      setLastError(String(error));
+    } finally {
+      inFlight.current = false;
+      setPolling(false);
+    }
+  }, []);
+
+  const refreshNow = useCallback(async () => {
+    await applySnapshot();
+  }, [applySnapshot]);
 
   useEffect(() => {
     if (!connected) {
@@ -49,51 +91,21 @@ export function useVmTelemetry({
 
     let cancelled = false;
 
-    const poll = async () => {
-      if (cancelled || paused || inFlight.current) return;
-      inFlight.current = true;
-      setPolling(true);
-      try {
-        const snap = await fetchTelemetrySnapshot(settingsRef.current);
-        if (cancelled) return;
-        if (!snap.ok) {
-          setLastError(snap.message);
-          return;
-        }
-        const mapped = mapVmSnapshot({
-          summaryJson: snap.summaryJson,
-          healthzJson: snap.healthzJson,
-          statusJson: snap.statusJson,
-          botRunning: snap.botRunning,
-        });
-        setTelemetry((prev) => ({
-          ...mapped,
-          // Preserve acknowledged alerts across polls when ids match.
-          alerts: mapped.alerts.map((a) => {
-            const prior = prev.alerts.find((p) => p.id === a.id);
-            return prior?.acknowledged ? { ...a, acknowledged: true } : a;
-          }),
-        }));
-        setLastPollIso(new Date().toISOString());
-        setLastError(null);
-      } catch (error) {
-        if (!cancelled) setLastError(String(error));
-      } finally {
-        inFlight.current = false;
-        if (!cancelled) setPolling(false);
-      }
+    const tick = async () => {
+      if (cancelled || paused) return;
+      await applySnapshot();
     };
 
-    void poll();
+    void tick();
     const id = window.setInterval(() => {
-      void poll();
+      void tick();
     }, pollMs);
 
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [connected, paused, pollMs, settings.vmHost, settings.vmUser, settings.vmPath, settings.sshKeyPath]);
+  }, [applySnapshot, connected, paused, pollMs, settings.vmHost, settings.vmUser, settings.vmPath, settings.sshKeyPath]);
 
-  return { telemetry, lastPollIso, lastError, polling };
+  return { telemetry, lastPollIso, lastError, polling, refreshNow };
 }

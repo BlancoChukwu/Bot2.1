@@ -77,13 +77,14 @@ Use **Browse** for key/repo paths, then **CONNECT**. Settings persist in `localS
 
 | Control | Action |
 | --- | --- |
-| CONNECT | SSH preflight → start 20s telemetry poll |
-| PREPARE & START LIVE | VM: dry-run receipt → production start |
-| LIVE MODE | Read-only indicator (not toggled here) |
+| CONNECT | SSH preflight → start 20s telemetry poll (does **not** start the bot) |
+| PREPARE & START LIVE | VM: dry-run receipt → production live start |
 | STOP BOT | Confirm → `npm run bot:stop` |
 | UPDATE CODE | VM: `git pull --ff-only` (push from laptop yourself) |
 | SYNC ENV | SCP `.env.event-purity-production` → VM, then `cp` to `.env` |
 | LOG | Cycles filters: all → liquidations → errors → all (persisted) |
+
+Live mode (`true`/`false`) is shown only in **Run status**. Cockpit is live/production only — no soak controls.
 
 ## Live telemetry (core v1)
 

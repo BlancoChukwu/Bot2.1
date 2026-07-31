@@ -121,6 +121,57 @@ describe("mapVmSnapshot", () => {
     expect(empty.stream).toEqual([]);
   });
 
+  it("sets liveMode from session meta even when summary.mode is unknown", () => {
+    const telemetry = mapVmSnapshot({
+      summaryJson: JSON.stringify({
+        mode: "unknown",
+        liquidations: {
+          candidates: 0,
+          firstAttempts: 0,
+          sent: 0,
+          executed: 0,
+          circuitOpen: 0,
+          safetyGateBlocked: 0,
+        },
+        recentCritical: [],
+        recentAttempts: [],
+      }),
+      sessionJson: JSON.stringify({
+        prefix: "event-purity-production",
+        env_file: ".env.event-purity-production",
+        log: "logs/event-purity-production-20260730.log",
+        simulationMode: false,
+        mode: "live",
+      }),
+      botRunning: true,
+    });
+
+    expect(telemetry.liveMode).toBe(true);
+    expect(telemetry.liveTxEnabled).toBe(true);
+    expect(telemetry.versionStamp).toBe("LIVE");
+  });
+
+  it("sets liveMode from production log path when mode fields are missing", () => {
+    const telemetry = mapVmSnapshot({
+      summaryJson: JSON.stringify({
+        logPath: "logs/event-purity-production-abc.log",
+        liquidations: {
+          candidates: 1,
+          firstAttempts: 0,
+          sent: 0,
+          executed: 0,
+          circuitOpen: 0,
+          safetyGateBlocked: 0,
+        },
+        recentCritical: [],
+        recentAttempts: [],
+      }),
+      sessionJson: JSON.stringify({}),
+      botRunning: true,
+    });
+    expect(telemetry.liveMode).toBe(true);
+  });
+
   it("tolerates invalid JSON blobs", () => {
     const telemetry = mapVmSnapshot({
       summaryJson: "not-json",

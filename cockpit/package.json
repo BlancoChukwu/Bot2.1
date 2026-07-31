@@ -7,9 +7,9 @@
     "dev": "node ./node_modules/vite/bin/vite.js",
     "build": "tsc -p tsconfig.app.json --noEmit && node ./node_modules/vite/bin/vite.js build",
     "preview": "node ./node_modules/vite/bin/vite.js preview",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build",
+    "tauri": "node ./node_modules/@tauri-apps/cli/tauri.js",
+    "tauri:dev": "node ./node_modules/@tauri-apps/cli/tauri.js dev",
+    "tauri:build": "node ./node_modules/@tauri-apps/cli/tauri.js build",
     "launch": "powershell -ExecutionPolicy Bypass -File ../scripts/start-cockpit.ps1"
   },
   "dependencies": {
