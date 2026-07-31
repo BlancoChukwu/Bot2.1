@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createBotMetrics, createLogger } from "../../src/bot";
 import { createChainRegistry } from "../../src/config/chainRegistry";
 import { getChainConfig } from "../../src/config/chains";
@@ -49,5 +49,39 @@ describe("WatchlistCoordinator cold start", () => {
     await (coordinator as unknown as { seedColdStart: () => Promise<void> }).seedColdStart();
 
     expect(coordinator.watchlist.size()).toBeGreaterThan(0);
+  });
+});
+
+describe("WatchlistCoordinator staleness heartbeat", () => {
+  it("touchActivity and re-register keep the guard fresh", () => {
+    vi.useFakeTimers();
+    const coordinator = new WatchlistCoordinator({
+      chain: "base",
+      protocol: {
+        listBorrowerAddresses: async () => [],
+        getLiquidatablePositions: async () => [],
+      },
+      registry,
+      readClient: { getBlockNumber: async () => 1n } as never,
+      poolAddress: getChainConfig("base").aave.pool,
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      minDebtBase: 0n,
+      maxStaleMs: 1_000,
+      reserveAllowlist: [],
+    });
+
+    coordinator.touchActivity();
+    expect(coordinator.stalenessGuard.check()).toBe("fresh");
+
+    const account = "0x00000000000000000000000000000000000000aa" as const;
+    expect(coordinator.registerBorrowers([account])).toBe(1);
+    vi.advanceTimersByTime(3_500);
+    expect(coordinator.stalenessGuard.check()).toBe("critical");
+
+    // Already-known borrower must still heartbeat (event-purity quiet markets).
+    expect(coordinator.registerBorrowers([account])).toBe(0);
+    expect(coordinator.stalenessGuard.check()).toBe("fresh");
+    vi.useRealTimers();
   });
 });

@@ -245,6 +245,12 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
     return this.refreshActiveAccounts(accounts);
   }
 
+  /** Heartbeat for event-purity / WS activity when classic sweeps are disabled. */
+  public touchActivity(): void {
+    this.stalenessGuard.record();
+    this.publishWatchlistMetrics();
+  }
+
   public registerBorrowers(accounts: readonly Address[], blockNumber?: bigint): number {
     if (accounts.length === 0) {
       return 0;
@@ -259,9 +265,9 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
       }
     }
     this.borrowersDiscovered += added;
+    // Any inbound account batch is live activity — do not require net-new adds.
+    this.touchActivity();
     if (added > 0) {
-      this.stalenessGuard.record();
-      this.publishWatchlistMetrics();
       this.config.logger.info("watchlist_borrowers_registered", {
         chain: this.config.chain,
         added,
@@ -287,6 +293,7 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
     if (snapshots.length === 0) {
       return;
     }
+    this.touchActivity();
     this.config.onSnapshots?.(snapshots);
     this.config.logger.info("watchlist_event_target_refresh_complete", {
       chain: this.config.chain,

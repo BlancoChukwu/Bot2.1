@@ -195,8 +195,9 @@ export function formatEvent(row, tier, opts = {}) {
   if (tier === "critical" || tier === "fail") {
     const err = row.error != null ? String(row.error).slice(0, 120) : "";
     const reason = row.skipReason ?? row.reason ?? (Array.isArray(row.reasons) ? row.reasons.join(",") : "");
-    const detail = err || reason || "";
-    return `${badge} ${paint(color, ANSI.dim, time)}  ${paint(color, ANSI.red + ANSI.bold, msg)}  ${paint(color, ANSI.bold, account)}${detail ? `  ${paint(color, ANSI.yellow, String(detail).slice(0, 100))}` : ""}`;
+    const ageMs = row.ageMs != null ? `ageMs=${row.ageMs}` : "";
+    const detail = [err || reason, ageMs].filter(Boolean).join("  ");
+    return `${badge} ${paint(color, ANSI.dim, time)}  ${paint(color, ANSI.red + ANSI.bold, msg)}  ${paint(color, ANSI.bold, account)}${detail ? `  ${paint(color, ANSI.yellow, String(detail).slice(0, 120))}` : ""}`;
   }
 
   if (tier === "attempt") {

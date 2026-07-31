@@ -1172,6 +1172,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       metrics,
       onBlockObserved: (blockNumber) => {
         latestKnownBlock = blockNumber;
+        // Event-purity defers classic EventDrivenWatchlist + disables fullSweepIntervalMs,
+        // so block ticks must heartbeat the staleness guard or pipeline execution stays skipped.
+        watchlistCoordinator?.touchActivity();
       },
       onLiquidatableCandidate: async (candidate) => {
         logger.info("liquidatable_candidate_preview", {
