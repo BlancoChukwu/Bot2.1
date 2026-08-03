@@ -139,27 +139,44 @@ export default function App() {
       return;
     }
     setBusy(true);
+    let ok = false;
     try {
       const result = await runOpsCommand(command, settings);
+      ok = result.ok;
       showToast(result.message);
       // After lifecycle ops, refresh immediately so Live mode / RUNNING update.
       if (
-        command === "prepare_and_start_live" ||
-        command === "stop_bot" ||
-        command === "sync_env_production"
+        ok &&
+        (command === "prepare_and_start_live" ||
+          command === "stop_bot" ||
+          command === "sync_env_production")
       ) {
         await vm.refreshNow();
-        // Second pass shortly after start — catches session meta / health once process is up.
-        if (command === "prepare_and_start_live") {
-          window.setTimeout(() => {
-            void vm.refreshNow();
-          }, 5000);
-        }
       }
     } catch (error) {
       showToast(`Command failed: ${String(error)}`);
     } finally {
       setBusy(false);
+    }
+
+    // Background confirmation polls — do not keep controls locked.
+    if (ok && command === "prepare_and_start_live" && connected) {
+      void (async () => {
+        const delaysMs = [3_000, 8_000, 15_000, 30_000, 45_000];
+        for (const delay of delaysMs) {
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, delay);
+          });
+          const snap = await vm.refreshNow();
+          if (snap?.liveMode && snap.botRunning) {
+            showToast(
+              `Live confirmed — mode=${String(snap.liveMode)} tx=${String(snap.liveTxEnabled)}`,
+            );
+            return;
+          }
+        }
+        showToast("Bot started — Live mode still pending; check Run status / Activity stream");
+      })();
     }
   };
 
@@ -221,6 +238,9 @@ export default function App() {
           onStopRequest={() => setStopOpen(true)}
           onCycleLogFilter={onCycleLogFilter}
         />
+        <p className="mt-2 font-mono text-[10px] tracking-wide text-muted uppercase">
+          Controls: Prepare / Stop / Update / Sync / Log -- live mode is Run status only
+        </p>
       </div>
 
       {toast ? (

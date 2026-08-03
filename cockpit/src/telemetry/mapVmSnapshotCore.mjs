@@ -121,6 +121,57 @@ export function resolveLiveMode(summary = {}, session = {}) {
 }
 
 /**
+ * Resolve ENABLE_LIVE_TX independently of liveMode (soak can be live-path with TX off).
+ */
+export function resolveLiveTxEnabled(session = {}, liveMode = false, summary = {}) {
+  if (session.enableLiveTx === true) return true;
+  if (session.enableLiveTx === false) return false;
+  // Unknown: production live sessions default armed; soak stays false.
+  const hints = [
+    session.prefix,
+    session.env_file,
+    session.envFile,
+    session.log,
+    summary.logPath,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  if (liveMode && looksLive(hints)) return true;
+  return false;
+}
+
+function pushStreamRow(stream, row, now) {
+  const msg = String(row.msg ?? "event");
+  const isLiq =
+    msg.includes("liquidation") ||
+    msg.includes("liquidatable") ||
+    msg.includes("transaction_sent") ||
+    msg.includes("dry_run") ||
+    msg.includes("opportunity_trace");
+  const tone =
+    msg.includes("reject") || msg.includes("fail") || msg.includes("error") || msg.includes("blocked")
+      ? "red"
+      : msg.includes("sent") || msg.includes("executed") || msg.includes("started")
+        ? "green"
+        : isLiq
+          ? "amber"
+          : "cyan";
+  const bits = [];
+  if (row.account) bits.push(shortAccount(String(row.account)));
+  if (row.phase) bits.push(`phase=${row.phase}`);
+  if (row.simOk !== undefined) bits.push(`sim=${row.simOk}`);
+  if (row.detail) bits.push(String(row.detail));
+  stream.push({
+    id: `evt-${row.time ?? stream.length}-${msg}-${stream.length}`,
+    time: utcClock(row.time ? new Date(row.time) : now),
+    tone,
+    kind: msg,
+    detail: bits.join(" · ") || msg,
+    isLiquidation: isLiq,
+  });
+}
+
+/**
  * Map a VM telemetry snapshot into CockpitTelemetry (core fields only).
  * Candidates / HF traces / watchlist stay empty in v1.
  *
@@ -136,6 +187,7 @@ export function mapVmSnapshot(input = {}) {
   const liq = summary.liquidations ?? {};
   const snap = summary.lastRuntimeSnapshot ?? {};
   const liveMode = resolveLiveMode(summary, session);
+  const liveTxEnabled = resolveLiveTxEnabled(session, liveMode, summary);
   const circuitOpen = Number(liq.circuitOpen ?? 0) > 0;
   const botRunning =
     typeof input.botRunning === "boolean"
@@ -181,37 +233,38 @@ export function mapVmSnapshot(input = {}) {
     });
   }
 
+  const watchlistStale = summary.watchlistStaleness ?? {};
+  const lastWatchlistAgeMs = Number(watchlistStale.lastAgeMs ?? 0);
+  const watchlistCriticalCount = Number(watchlistStale.critical ?? 0);
+  if (watchlistCriticalCount >= 3 || lastWatchlistAgeMs > 180_000) {
+    alerts.unshift({
+      id: "watchlist-stale",
+      severity: "critical",
+      title: "watchlist_stale_critical",
+      detail: `Watchlist ageMs=${lastWatchlistAgeMs} critical×${watchlistCriticalCount} — execution may be blocked`,
+      time: utcClock(watchlistStale.lastAt ? new Date(watchlistStale.lastAt) : now),
+      acknowledged: false,
+    });
+  }
+
   /** @type {Array<{id:string,time:string,tone:string,kind:string,detail:string,isLiquidation:boolean}>} */
   const stream = [];
   const recentAttempts = Array.isArray(summary.recentAttempts) ? summary.recentAttempts : [];
-  for (const row of recentAttempts.slice().reverse().slice(0, 40)) {
-    const msg = String(row.msg ?? "attempt");
-    const isLiq =
-      msg.includes("liquidation") ||
-      msg.includes("liquidatable") ||
-      msg.includes("transaction_sent") ||
-      msg.includes("dry_run");
-    const tone =
-      msg.includes("reject") || msg.includes("fail") || msg.includes("error")
-        ? "red"
-        : msg.includes("sent") || msg.includes("executed")
-          ? "green"
-          : isLiq
-            ? "amber"
-            : "cyan";
-    const bits = [];
-    if (row.account) bits.push(shortAccount(String(row.account)));
-    if (row.phase) bits.push(`phase=${row.phase}`);
-    if (row.simOk !== undefined) bits.push(`sim=${row.simOk}`);
-    stream.push({
-      id: `evt-${row.time ?? stream.length}-${msg}`,
-      time: utcClock(row.time ? new Date(row.time) : now),
-      tone,
-      kind: msg,
-      detail: bits.join(" · ") || msg,
-      isLiquidation: isLiq,
-    });
+  const recentLifecycle = Array.isArray(summary.recentLifecycle) ? summary.recentLifecycle : [];
+  const merged = [
+    ...recentLifecycle.map((row) => ({ ...row, _rank: 0 })),
+    ...recentAttempts.map((row) => ({ ...row, _rank: 1 })),
+  ].sort((a, b) => {
+    const ta = a.time ? Date.parse(a.time) : 0;
+    const tb = b.time ? Date.parse(b.time) : 0;
+    if (ta !== tb) return ta - tb;
+    return a._rank - b._rank;
+  });
+  for (const row of merged.slice(-60)) {
+    pushStreamRow(stream, row, now);
   }
+  // Newest first for the tail panel.
+  stream.reverse();
 
   const seeded =
     Number(status.usersSeeded ?? snap.usersSeeded ?? healthz.usersSeeded ?? 0) || 0;
@@ -228,7 +281,7 @@ export function mapVmSnapshot(input = {}) {
 
   return {
     liveMode,
-    liveTxEnabled: liveMode,
+    liveTxEnabled,
     botRunning,
     circuit: circuitOpen ? "open" : "closed",
     sessionId: String(summary.logPath ?? session.log ?? "—").split(/[/\\]/).pop() ?? "—",

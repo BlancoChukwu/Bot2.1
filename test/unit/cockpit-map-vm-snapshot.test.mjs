@@ -56,12 +56,25 @@ describe("mapVmSnapshot", () => {
           account: "0x21bb44e1deadbeef00112233445566778899aabb",
         },
       ],
+      recentLifecycle: [
+        {
+          time: "2026-07-30T12:00:01.000Z",
+          msg: "ws_event_layer_started",
+        },
+      ],
     };
 
     const telemetry = mapVmSnapshot({
       summaryJson: JSON.stringify(summary),
       healthzJson: JSON.stringify({ ok: true }),
       statusJson: JSON.stringify({ usersSeeded: 18422, bootstrapSource: "cache" }),
+      sessionJson: JSON.stringify({
+        prefix: "event-purity-production",
+        env_file: ".env.event-purity-production",
+        simulationMode: false,
+        mode: "live",
+        enableLiveTx: true,
+      }),
       botRunning: true,
       now: new Date("2026-07-30T13:00:00.000Z"),
     });
@@ -77,8 +90,9 @@ describe("mapVmSnapshot", () => {
     expect(telemetry.rpcStatus).toBe("up");
     expect(telemetry.versionStamp).toBe("LIVE");
     expect(telemetry.candidates).toEqual([]);
-    expect(telemetry.stream.length).toBe(2);
-    expect(telemetry.stream[0].isLiquidation).toBe(true);
+    expect(telemetry.stream.length).toBe(3);
+    expect(telemetry.stream.some((e) => e.kind === "ws_event_layer_started")).toBe(true);
+    expect(telemetry.stream.some((e) => e.isLiquidation)).toBe(true);
   });
 
   it("raises critical alerts for safety gate and open circuit", () => {
@@ -113,6 +127,32 @@ describe("mapVmSnapshot", () => {
     expect(telemetry.rpcStatus).toBe("degraded");
   });
 
+  it("raises watchlist stale alert when critical count or ageMs is high", () => {
+    const telemetry = mapVmSnapshot({
+      summaryJson: JSON.stringify({
+        mode: "live",
+        liquidations: {
+          candidates: 0,
+          firstAttempts: 0,
+          sent: 0,
+          executed: 0,
+          circuitOpen: 0,
+          safetyGateBlocked: 0,
+        },
+        watchlistStaleness: {
+          critical: 5,
+          lastAgeMs: 17520030,
+          lastAt: "2026-07-31T14:25:15.077Z",
+        },
+        recentCritical: [],
+        recentAttempts: [],
+      }),
+      botRunning: true,
+    });
+
+    expect(telemetry.alerts.some((a) => a.id === "watchlist-stale")).toBe(true);
+  });
+
   it("createEmptyTelemetry returns disconnected defaults", () => {
     const empty = createEmptyTelemetry(new Date("2026-07-30T00:00:00.000Z"));
     expect(empty.botRunning).toBe(false);
@@ -142,6 +182,7 @@ describe("mapVmSnapshot", () => {
         log: "logs/event-purity-production-20260730.log",
         simulationMode: false,
         mode: "live",
+        enableLiveTx: true,
       }),
       botRunning: true,
     });
@@ -149,6 +190,33 @@ describe("mapVmSnapshot", () => {
     expect(telemetry.liveMode).toBe(true);
     expect(telemetry.liveTxEnabled).toBe(true);
     expect(telemetry.versionStamp).toBe("LIVE");
+  });
+
+  it("decouples liveTxEnabled from ENABLE_LIVE_TX session flag", () => {
+    const armed = mapVmSnapshot({
+      summaryJson: JSON.stringify({ mode: "live", recentAttempts: [], recentLifecycle: [] }),
+      sessionJson: JSON.stringify({
+        simulationMode: false,
+        mode: "live",
+        enableLiveTx: true,
+        prefix: "event-purity-production",
+      }),
+      botRunning: true,
+    });
+    const disarmed = mapVmSnapshot({
+      summaryJson: JSON.stringify({ mode: "live", recentAttempts: [], recentLifecycle: [] }),
+      sessionJson: JSON.stringify({
+        simulationMode: false,
+        mode: "live",
+        enableLiveTx: false,
+        prefix: "event-purity-production",
+      }),
+      botRunning: true,
+    });
+    expect(armed.liveMode).toBe(true);
+    expect(armed.liveTxEnabled).toBe(true);
+    expect(disarmed.liveMode).toBe(true);
+    expect(disarmed.liveTxEnabled).toBe(false);
   });
 
   it("sets liveMode from production log path when mode fields are missing", () => {

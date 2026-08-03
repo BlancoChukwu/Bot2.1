@@ -57,4 +57,39 @@ describe("watch-bot-summary", () => {
     expect(summary.liquidations.safetyGateBlocked).toBe(1);
     expect(summary.healthy).toBe(false);
   });
+
+  it("includes lifecycle heartbeat events for cockpit activity stream", () => {
+    const summary = runSummary([
+      { time: "2026-07-26T00:00:00.000Z", msg: "ws_event_layer_started", level: 30 },
+      { time: "2026-07-26T00:01:00.000Z", msg: "event_purity_runtime_snapshot", level: 30, usersSeeded: 100 },
+      { time: "2026-07-26T00:02:00.000Z", msg: "memory_stats", level: 30, rssMb: 512 },
+    ], ["--mode", "live"]);
+
+    expect(summary.recentLifecycle.length).toBeGreaterThanOrEqual(3);
+    expect(summary.recentLifecycle.some((row) => row.msg === "ws_event_layer_started")).toBe(true);
+  });
+
+  it("surfaces watchlist staleness counters and last ageMs", () => {
+    const summary = runSummary([
+      {
+        time: "2026-07-26T00:00:00.000Z",
+        msg: "watchlist_stale_critical",
+        level: 50,
+        ageMs: 17520030,
+        consecutive: 4,
+      },
+      {
+        time: "2026-07-26T00:01:00.000Z",
+        msg: "watchlist_heartbeat",
+        level: 30,
+        reason: "oracle_poll",
+        ageMs: 1200,
+      },
+    ], ["--mode", "live"]);
+
+    expect(summary.watchlistStaleness.critical).toBe(1);
+    expect(summary.watchlistStaleness.heartbeats).toBe(1);
+    expect(summary.watchlistStaleness.lastAgeMs).toBe(17520030);
+    expect(summary.watchlistStaleness.lastConsecutive).toBe(4);
+  });
 });

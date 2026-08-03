@@ -3,12 +3,21 @@ groups:
     rules:
       - alert: WatchlistStale
         expr: max(watchlist_last_update_age_seconds) > 60
-        for: 10s
+        for: 3m
         labels:
           severity: critical
         annotations:
           summary: "Watchlist stale — pipeline may be paused"
           description: "watchlist_last_update_age_seconds exceeded 60s for {{ $labels.chain }}"
+
+      - alert: WatchlistStaleCritical
+        expr: max(watchlist_last_update_age_seconds) > 180
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Watchlist critically stale — execution likely blocked"
+          description: "watchlist_last_update_age_seconds exceeded 180s for {{ $labels.chain }}"
 
       - alert: MemoryHighRSS
         expr: process_rss_bytes > 629145600

@@ -2,7 +2,7 @@
  * Dense ops + liquidations summary for watch-bot.sh (single-pass log scan).
  * Usage: node scripts/watch-bot-summary.mjs <logPath> [--json] [--mode soak|live|unknown]
  */
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { rssGrowthMbPerHour, rssGrowthMbPerHourFullWindow } from "./rssGrowth.mjs";
 
@@ -52,12 +52,49 @@ const ATTEMPT_MSGS = new Set([
   "deployment_safety_gate_blocked",
 ]);
 
+/** Lifecycle / heartbeat msgs so cockpit Activity stream is not empty on a healthy idle bot. */
+const LIFECYCLE_MSGS = new Set([
+  "ws_event_layer_started",
+  "event_purity_runtime_snapshot",
+  "memory_stats",
+  "launcher_session_exit",
+  "single_instance_lock_acquired",
+  "bootstrap_complete",
+  "gap_fill_refresh_poll_result",
+  "oracle_poll_tick",
+  "hybrid_detection_layer_started",
+  "position_cache_warmed",
+]);
+
+const RECENT_ATTEMPT_CAP = 40;
+const RECENT_LIFECYCLE_CAP = 30;
+/** Cap full-file scans so SSH cockpit polls do not OOM / timeout on huge soak logs. */
+const MAX_LOG_BYTES = 2 * 1024 * 1024;
+
 function readLogLines(path) {
-  const buffer = readFileSync(path);
+  const st = statSync(path);
+  let buffer;
+  if (st.size > MAX_LOG_BYTES) {
+    const fd = openSync(path, "r");
+    try {
+      buffer = Buffer.alloc(MAX_LOG_BYTES);
+      readSync(fd, buffer, 0, MAX_LOG_BYTES, st.size - MAX_LOG_BYTES);
+    } finally {
+      closeSync(fd);
+    }
+  } else {
+    buffer = readFileSync(path);
+  }
   const encoding = buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe
     ? "utf16le"
     : "utf8";
-  return buffer.toString(encoding).split(/\r?\n/).filter((line) => line.trim().length > 0);
+  const text = buffer.toString(encoding);
+  // When tailing, drop the first partial line.
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (st.size > MAX_LOG_BYTES && lines.length > 1) {
+    lines.shift();
+  }
+  return lines;
 }
 
 function formatDuration(ms) {
@@ -116,6 +153,10 @@ const counts = {
   partial_bootstrap_getlogs_retry: 0,
   hf_price_gap_summary: 0,
   deployment_safety_gate_blocked: 0,
+  watchlist_stale: 0,
+  watchlist_stale_critical: 0,
+  watchlist_heartbeat: 0,
+  watchlist_stale_alert_sent: 0,
 };
 for (const key of LIQ_COUNT_KEYS) {
   counts[key] = 0;
@@ -130,8 +171,10 @@ let lastGapFillRefresh;
 let wsStarted = false;
 let simModeHint;
 const rssSamples = [];
+let lastWatchlistStale;
 const recentCritical = [];
 const recentAttempts = [];
+const recentLifecycle = [];
 
 for (const rawLine of readLogLines(logPath)) {
   let row;
@@ -157,8 +200,23 @@ for (const rawLine of readLogLines(logPath)) {
 
   if (row.level === 50) counts.critical_errors += 1;
   if (FATAL_MSGS.has(msg) || msg.endsWith("_critical")) {
-    recentCritical.push({ time: row.time, msg, error: row.error, reasons: row.reasons });
+    recentCritical.push({
+      time: row.time,
+      msg,
+      error: row.error,
+      reasons: row.reasons,
+      ageMs: row.ageMs,
+    });
     if (recentCritical.length > 5) recentCritical.shift();
+  }
+
+  if (msg === "watchlist_stale" || msg === "watchlist_stale_critical") {
+    lastWatchlistStale = {
+      time: row.time,
+      msg,
+      ageMs: row.ageMs,
+      consecutive: row.consecutive,
+    };
   }
 
   if (msg in counts) {
@@ -175,7 +233,23 @@ for (const rawLine of readLogLines(logPath)) {
       opportunityId: row.opportunityId,
       reasons: row.reasons,
     });
-    if (recentAttempts.length > 6) recentAttempts.shift();
+    if (recentAttempts.length > RECENT_ATTEMPT_CAP) recentAttempts.shift();
+  }
+
+  if (LIFECYCLE_MSGS.has(msg)) {
+    recentLifecycle.push({
+      time: row.time,
+      msg,
+      detail:
+        msg === "event_purity_runtime_snapshot"
+          ? `seeded=${row.usersSeeded ?? "?"}`
+          : msg === "memory_stats"
+            ? `rssMb=${row.rssMb ?? "?"}`
+            : msg === "gap_fill_refresh_poll_result"
+              ? `refreshed=${row.refreshed ?? 0}`
+              : undefined,
+    });
+    if (recentLifecycle.length > RECENT_LIFECYCLE_CAP) recentLifecycle.shift();
   }
 
   switch (msg) {
@@ -292,11 +366,22 @@ const summary = {
   lastGapFillRefresh,
   recentCritical,
   recentAttempts,
+  recentLifecycle,
+  watchlistStaleness: {
+    stale: counts.watchlist_stale,
+    critical: counts.watchlist_stale_critical,
+    heartbeats: counts.watchlist_heartbeat,
+    alertsSent: counts.watchlist_stale_alert_sent,
+    lastAgeMs: lastWatchlistStale?.ageMs,
+    lastAt: lastWatchlistStale?.time,
+    lastConsecutive: lastWatchlistStale?.consecutive,
+  },
   healthy,
 };
 
 if (jsonOut) {
-  console.log(JSON.stringify(summary, null, 2));
+  // Compact JSON — pretty-print blows SSH payload size for cockpit polls.
+  console.log(JSON.stringify(summary));
   process.exit(summary.healthy ? 0 : 1);
 }
 

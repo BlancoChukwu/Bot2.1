@@ -258,6 +258,7 @@ fn fetch_snapshot(
   let path = shell_quote(&settings.vm_path);
   // Resolve active log + session meta, infer mode from production/live hints, then summarize.
   // Session JSON is a dedicated segment so the UI can flip liveMode even before log lines appear.
+  // ENABLE_LIVE_TX is read from the session env file so Live TX is independent of liveMode.
   let remote = format!(
     "cd {path} && \
      LOG=$(node scripts/resolve-active-session-log.mjs 2>/dev/null || true) && \
@@ -276,6 +277,17 @@ fn fetch_snapshot(
      if [ -z \"$SIM\" ]; then \
        SIM=$(grep -E '^export SIMULATION_MODE=' .runtime/launch-session.sh 2>/dev/null | head -1 | sed 's/.*=//' | tr -d '\"' || true); \
      fi && \
+     ENV_PATH=\"$ENV_FILE\" && \
+     if [ -z \"$ENV_PATH\" ]; then ENV_PATH=$(grep -E '^dotenv=' logs/latest-session.txt 2>/dev/null | head -1 | cut -d= -f2- || true); fi && \
+     if [ -z \"$ENV_PATH\" ]; then ENV_PATH=.env; fi && \
+     LIVE_TX=$(grep -E '^ENABLE_LIVE_TX=' \"$ENV_PATH\" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\"' | tr '[:upper:]' '[:lower:]' || true) && \
+     if [ -z \"$LIVE_TX\" ] && [ -f .env ]; then \
+       LIVE_TX=$(grep -E '^ENABLE_LIVE_TX=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\"' | tr '[:upper:]' '[:lower:]' || true); \
+     fi && \
+     if [ \"$LIVE_TX\" = \"true\" ] || [ \"$LIVE_TX\" = \"1\" ]; then LIVE_TX_JSON=true; \
+     elif [ \"$LIVE_TX\" = \"false\" ] || [ \"$LIVE_TX\" = \"0\" ]; then LIVE_TX_JSON=false; \
+     else LIVE_TX_JSON=null; \
+     fi && \
      BLOB=$(printf '%s %s %s %s' \"$PREFIX\" \"$ENV_FILE\" \"$LOG_META\" \"$LOG\" | tr '[:upper:]' '[:lower:]') && \
      MODE=unknown && \
      if [ \"$SIM\" = \"false\" ] || echo \"$BLOB\" | grep -qE 'production|live'; then MODE=live; \
@@ -285,8 +297,8 @@ fn fetch_snapshot(
      elif [ \"$SIM\" = \"true\" ]; then SIM_JSON=true; \
      else SIM_JSON=null; \
      fi && \
-     SESSION_JSON=$(printf '{{\"prefix\":\"%s\",\"env_file\":\"%s\",\"log\":\"%s\",\"simulationMode\":%s,\"mode\":\"%s\"}}' \
-       \"$PREFIX\" \"$ENV_FILE\" \"$LOG_META\" \"$SIM_JSON\" \"$MODE\") && \
+     SESSION_JSON=$(printf '{{\"prefix\":\"%s\",\"env_file\":\"%s\",\"log\":\"%s\",\"simulationMode\":%s,\"mode\":\"%s\",\"enableLiveTx\":%s}}' \
+       \"$PREFIX\" \"$ENV_FILE\" \"$LOG_META\" \"$SIM_JSON\" \"$MODE\" \"$LIVE_TX_JSON\") && \
      if [ -n \"$LOG\" ] && [ -f \"$LOG\" ]; then \
        OUT=$(node scripts/watch-bot-summary.mjs \"$LOG\" --json --mode \"$MODE\" 2>/dev/null || true); \
        if [ -n \"$OUT\" ]; then printf '%s\\n' \"$OUT\"; else echo '{{}}'; fi; \

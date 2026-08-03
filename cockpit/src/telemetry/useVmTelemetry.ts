@@ -19,7 +19,7 @@ export interface VmTelemetryState {
   lastError: string | null;
   polling: boolean;
   /** Force an immediate SSH snapshot (e.g. after Prepare & Start Live). */
-  refreshNow: () => Promise<void>;
+  refreshNow: () => Promise<CockpitTelemetry | null>;
 }
 
 /**
@@ -37,20 +37,25 @@ export function useVmTelemetry({
   const [lastError, setLastError] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
   const inFlight = useRef(false);
+  const pendingRefresh = useRef(false);
   const settingsRef = useRef(settings);
   const connectedRef = useRef(connected);
   settingsRef.current = settings;
   connectedRef.current = connected;
 
-  const applySnapshot = useCallback(async () => {
-    if (!connectedRef.current || inFlight.current) return;
+  const applySnapshot = useCallback(async (): Promise<CockpitTelemetry | null> => {
+    if (!connectedRef.current) return null;
+    if (inFlight.current) {
+      pendingRefresh.current = true;
+      return null;
+    }
     inFlight.current = true;
     setPolling(true);
     try {
       const snap = await fetchTelemetrySnapshot(settingsRef.current);
       if (!snap.ok) {
         setLastError(snap.message);
-        return;
+        return null;
       }
       const mapped = mapVmSnapshot({
         summaryJson: snap.summaryJson,
@@ -68,16 +73,24 @@ export function useVmTelemetry({
       }));
       setLastPollIso(new Date().toISOString());
       setLastError(null);
+      return mapped;
     } catch (error) {
       setLastError(String(error));
+      return null;
     } finally {
       inFlight.current = false;
       setPolling(false);
+      if (pendingRefresh.current) {
+        pendingRefresh.current = false;
+        queueMicrotask(() => {
+          void applySnapshot();
+        });
+      }
     }
   }, []);
 
   const refreshNow = useCallback(async () => {
-    await applySnapshot();
+    return applySnapshot();
   }, [applySnapshot]);
 
   useEffect(() => {

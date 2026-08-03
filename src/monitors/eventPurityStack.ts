@@ -243,6 +243,8 @@ export interface EventPurityStackConfig {
     readonly confirmed: ConfirmResult;
   }) => void | Promise<void>;
   readonly onBlockObserved?: (blockNumber: bigint) => void;
+  readonly onWsDisconnected?: () => void;
+  readonly onWsReconnected?: (meta: { readonly downtimeMs: number | undefined }) => void;
   /** Test seam for first-touch reconcile backoff. */
   readonly sleepMs?: (ms: number) => Promise<void>;
 }
@@ -371,6 +373,12 @@ export class EventPurityStack {
       bootstrapFromBlock: this.config.bootstrapFromBlock ?? bootstrapFromBlock,
       onEvent: (event) => this.handleEvent(event),
       onFlashblockTick: (blockNumber) => this.handleFlashblockTick(blockNumber),
+      ...(this.config.onWsDisconnected === undefined
+        ? {}
+        : { onWsDisconnected: () => this.config.onWsDisconnected?.() }),
+      ...(this.config.onWsReconnected === undefined
+        ? {}
+        : { onWsReconnected: (meta) => this.config.onWsReconnected?.(meta) }),
     });
     await this.wsLayer.start();
   }

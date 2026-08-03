@@ -73,7 +73,7 @@ import { AaveSnapshotProvider } from "./monitors/aaveSnapshotProvider";
 import { HybridDetectionPipeline, type BorrowerSnapshotProvider } from "./monitors/hybridDetectionPipeline";
 import { RescanCircuitBreaker } from "./monitors/rescanCircuitBreaker";
 import { MultiWsEventSource } from "./monitors/MultiWsEventSource";
-import { WatchlistCoordinator } from "./monitors/watchlistCoordinator";
+import { WatchlistCoordinator, type WatchlistHeartbeatReason } from "./monitors/watchlistCoordinator";
 import { parseWatchlistReserveAllowlist } from "./config/watchlistReserveAllowlist";
 import { SimFailureCircuitBreaker } from "./executors/simFailureCircuitBreaker";
 import { resetCycleDiagnosticsCollector } from "./observability/cycleDiagnostics";
@@ -585,6 +585,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   let activeChainConfig = withResolvedAave(getChainConfig(config.chain), cachedResolvedForActive);
   let activePoolAddress = activeChainConfig.aave.pool;
   let latestKnownBlock: bigint = 0n;
+  let lastBlockObservedAtMs = 0;
+  let lastOraclePollSuccessAtMs = 0;
+  let lastDetectionActivityAtMs = 0;
   const publicClient = createFailoverPublicClient({
     chain: config.chain,
     rpcUrl: config.executionRpcUrlPrimary,
@@ -1172,9 +1175,21 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       metrics,
       onBlockObserved: (blockNumber) => {
         latestKnownBlock = blockNumber;
+        lastBlockObservedAtMs = Date.now();
+        lastDetectionActivityAtMs = Date.now();
         // Event-purity defers classic EventDrivenWatchlist + disables fullSweepIntervalMs,
         // so block ticks must heartbeat the staleness guard or pipeline execution stays skipped.
-        watchlistCoordinator?.touchActivity();
+        watchlistCoordinator?.touchActivity("event_purity_block");
+      },
+      onWsDisconnected: () => {
+        watchlistCoordinator?.emitHeartbeat("ws_disconnect");
+      },
+      onWsReconnected: ({ downtimeMs }) => {
+        watchlistCoordinator?.touchActivity("ws_reconnect");
+        logger.info("ws_event_layer_reconnected_watchlist_heartbeat", {
+          chain: config.chain,
+          downtimeMs,
+        });
       },
       onLiquidatableCandidate: async (candidate) => {
         logger.info("liquidatable_candidate_preview", {
@@ -1385,6 +1400,9 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
             } catch (error) {
               logger.warn("gap_fill_refresh_poll_failed", { error: String(error) });
             }
+            lastOraclePollSuccessAtMs = Date.now();
+            lastDetectionActivityAtMs = Date.now();
+            watchlistCoordinator?.touchActivity("oracle_poll");
           })();
         }, config.oraclePollIntervalMs);
         logger.info("oracle_poll_timer_started", {
@@ -1547,6 +1565,30 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
             account: row.address,
             healthFactor: row.healthFactor,
           }));
+        },
+        watchlistCriticalAlertCycles: parseMinNumber(
+          process.env.WATCHLIST_CRITICAL_ALERT_CYCLES,
+          3,
+          1,
+          "WATCHLIST_CRITICAL_ALERT_CYCLES",
+        ),
+        onWatchlistStaleCritical: async ({ chain, ageMs, consecutive }) => {
+          logger.error("watchlist_stale_alert_sent", { chain, ageMs, consecutive });
+          void webhookAlerter.notify("watchlist_stale_critical", { chain, ageMs, consecutive });
+        },
+        eventPurityStalenessBypass: () => {
+          if (eventPurityStack === undefined || watchlistCoordinator === undefined) {
+            return false;
+          }
+          const maxStaleMs = watchlistCoordinator.stalenessGuard.getMaxStaleMs();
+          const now = Date.now();
+          const blockFresh = lastBlockObservedAtMs > 0 && now - lastBlockObservedAtMs <= maxStaleMs;
+          const oracleFresh = lastOraclePollSuccessAtMs > 0 && now - lastOraclePollSuccessAtMs <= maxStaleMs;
+          const detectionFresh = lastDetectionActivityAtMs > 0 && now - lastDetectionActivityAtMs <= maxStaleMs;
+          return latestKnownBlock > 0n && (blockFresh || oracleFresh || detectionFresh);
+        },
+        emitWatchlistHeartbeat: (reason) => {
+          watchlistCoordinator.emitHeartbeat(reason as WatchlistHeartbeatReason);
         },
       }),
     ...(watchlistCoordinator !== undefined && config.wsRpcUrlPrimary === undefined

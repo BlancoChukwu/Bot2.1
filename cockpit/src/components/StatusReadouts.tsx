@@ -34,6 +34,10 @@ export function StatusReadouts({ telemetry }: { telemetry: CockpitTelemetry }) {
             >
               {String(telemetry.liveTxEnabled)}
             </span>
+            <span className="text-muted"> · Stamp: </span>
+            <span className={telemetry.versionStamp === "LIVE" ? "text-amber" : "text-muted"}>
+              {telemetry.versionStamp}
+            </span>
           </div>
           <div>
             Bot:{" "}

@@ -83,6 +83,16 @@ export interface PipelineOrchestratorConfig {
   readonly watchlistDiagnosticSample?: (
     chain: SupportedChain,
   ) => Promise<readonly { readonly account: Address; readonly healthFactor: bigint }[]>;
+  /** Consecutive critical staleness cycles before paging (default 3). */
+  readonly watchlistCriticalAlertCycles?: number;
+  readonly onWatchlistStaleCritical?: (input: {
+    readonly chain: SupportedChain;
+    readonly ageMs: number;
+    readonly consecutive: number;
+  }) => void | Promise<void>;
+  /** When true, skip execution early-return despite critical watchlist staleness. */
+  readonly eventPurityStalenessBypass?: () => boolean;
+  readonly emitWatchlistHeartbeat?: (reason: string) => void;
 }
 
 export interface PipelineRunSummary {
@@ -137,6 +147,7 @@ export class PipelineDeadLetterQueue {
 
 export class PipelineOrchestrator {
   private readonly maxCacheAgeMs: number;
+  private consecutiveWatchlistCritical = 0;
 
   public constructor(private readonly config: PipelineOrchestratorConfig) {
     this.maxCacheAgeMs = config.maxCacheAgeMs ?? 30_000;
@@ -215,22 +226,47 @@ export class PipelineOrchestrator {
       }
     }
 
+    this.config.emitWatchlistHeartbeat?.("pipeline_cycle");
+
     const staleness = this.config.watchlistStaleness?.check();
     if (staleness === "critical") {
+      this.consecutiveWatchlistCritical += 1;
+      const ageMs = this.config.watchlistStaleness?.ageMs() ?? 0;
       this.config.logger.error("watchlist_stale_critical", {
         chain,
-        ageMs: this.config.watchlistStaleness?.ageMs(),
+        ageMs,
+        consecutive: this.consecutiveWatchlistCritical,
       });
       this.config.metrics.recordWatchlistStaleEvaluation(chain, "critical");
       this.config.metrics.recordError();
-      return;
-    }
-    if (staleness === "stale") {
-      this.config.logger.warn("watchlist_stale", {
-        chain,
-        ageMs: this.config.watchlistStaleness?.ageMs(),
-      });
-      this.config.metrics.recordWatchlistStaleEvaluation(chain, "stale");
+
+      const alertThreshold = this.config.watchlistCriticalAlertCycles ?? 3;
+      if (this.consecutiveWatchlistCritical >= alertThreshold) {
+        void this.config.onWatchlistStaleCritical?.({
+          chain,
+          ageMs,
+          consecutive: this.consecutiveWatchlistCritical,
+        });
+      }
+
+      if (this.config.eventPurityStalenessBypass?.() === true) {
+        this.config.logger.warn("watchlist_stale_bypassed_event_purity_healthy", {
+          chain,
+          ageMs,
+          consecutive: this.consecutiveWatchlistCritical,
+        });
+      } else {
+        return;
+      }
+    } else {
+      this.consecutiveWatchlistCritical = 0;
+      if (staleness === "stale") {
+        this.config.logger.warn("watchlist_stale", {
+          chain,
+          ageMs: this.config.watchlistStaleness?.ageMs(),
+        });
+        this.config.metrics.recordWatchlistStaleEvaluation(chain, "stale");
+      }
     }
 
     if (this.config.sequencerGuard !== undefined) {

@@ -84,4 +84,36 @@ describe("WatchlistCoordinator staleness heartbeat", () => {
     expect(coordinator.stalenessGuard.check()).toBe("fresh");
     vi.useRealTimers();
   });
+
+  it("emitHeartbeat logs structured watchlist_heartbeat", () => {
+    const logger = createLogger("silent");
+    const lines: string[] = [];
+    const originalInfo = logger.info.bind(logger);
+    logger.info = (msg: string, meta?: Record<string, unknown>) => {
+      lines.push(JSON.stringify({ msg, ...meta }));
+      originalInfo(msg, meta);
+    };
+    const coordinator = new WatchlistCoordinator({
+      chain: "base",
+      protocol: {
+        listBorrowerAddresses: async () => [],
+        getLiquidatablePositions: async () => [],
+      },
+      registry,
+      readClient: { getBlockNumber: async () => 1n } as never,
+      poolAddress: getChainConfig("base").aave.pool,
+      logger,
+      metrics: createBotMetrics(),
+      minDebtBase: 0n,
+      maxStaleMs: 60_000,
+      reserveAllowlist: [],
+    });
+
+    coordinator.emitHeartbeat("oracle_poll", { blockNumber: "123" });
+
+    const heartbeat = lines.find((line) => line.includes("watchlist_heartbeat"));
+    expect(heartbeat).toBeDefined();
+    expect(heartbeat).toContain("oracle_poll");
+    expect(heartbeat).toContain("\"staleness\":\"fresh\"");
+  });
 });

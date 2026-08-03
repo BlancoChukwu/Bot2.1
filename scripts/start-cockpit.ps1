@@ -83,4 +83,27 @@ if ($Release) {
 
 Write-Host "Starting Tauri desktop cockpit (dev)..." -ForegroundColor Cyan
 Write-Host "After the window opens: click CONNECT once to start live telemetry." -ForegroundColor DarkGray
+
+# Free Vite port + clear transform cache so an old preview/build cannot keep serving the previous UI.
+function Stop-PortListeners([int]$Port) {
+  $pids = @()
+  netstat -ano | Select-String ":$Port\s+.*LISTENING" | ForEach-Object {
+    if ($_ -match '\s(\d+)\s*$') { $pids += [int]$Matches[1] }
+  }
+  $pids = $pids | Select-Object -Unique
+  foreach ($procId in $pids) {
+    if ($procId -gt 0) {
+      Write-Host "Stopping PID $procId holding port $Port..." -ForegroundColor Yellow
+      Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+Stop-PortListeners -Port 5179
+$ViteCache = Join-Path $CockpitDir "node_modules\.vite"
+if (Test-Path -LiteralPath $ViteCache) {
+  Write-Host "Clearing Vite cache..." -ForegroundColor Yellow
+  Remove-Item -LiteralPath $ViteCache -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 npm run tauri:dev

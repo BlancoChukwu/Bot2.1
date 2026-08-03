@@ -25,4 +25,8 @@ export class StalenessGuard {
   public ageMs(): number {
     return Date.now() - this.lastUpdate;
   }
+
+  public getMaxStaleMs(): number {
+    return this.maxStaleMs;
+  }
 }
