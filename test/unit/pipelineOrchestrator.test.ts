@@ -488,7 +488,9 @@ describe("PipelineOrchestrator", () => {
       metrics: createBotMetrics(),
       watchlistStaleness: guard,
       watchlistCriticalAlertCycles: 2,
-      onWatchlistStaleCritical: (input) => alerts.push(input),
+      onWatchlistStaleCritical: (input) => {
+        alerts.push(input);
+      },
       buildExecutionRequest: (candidate) => requestFor(candidate.account),
     });
 

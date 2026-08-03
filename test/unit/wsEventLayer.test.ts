@@ -41,8 +41,20 @@ describe("WsEventLayer reconnect observability", () => {
   it("logs reconnect and notifies onWsReconnected after disconnect", async () => {
     const logs: Array<{ msg: string; meta?: Record<string, unknown> }> = [];
     const logger = createLogger("silent");
-    logger.info = (msg: string, meta?: Record<string, unknown>) => logs.push({ msg, meta });
-    logger.warn = (msg: string, meta?: Record<string, unknown>) => logs.push({ msg, meta });
+    logger.info = (msg: string, meta?: Record<string, unknown>) => {
+      if (meta === undefined) {
+        logs.push({ msg });
+      } else {
+        logs.push({ msg, meta });
+      }
+    };
+    logger.warn = (msg: string, meta?: Record<string, unknown>) => {
+      if (meta === undefined) {
+        logs.push({ msg });
+      } else {
+        logs.push({ msg, meta });
+      }
+    };
 
     const reconnects: Array<{ downtimeMs: number | undefined }> = [];
     const layer = new WsEventLayer({
@@ -53,12 +65,12 @@ describe("WsEventLayer reconnect observability", () => {
         getBlockNumber: async () => 100n,
         getLogs: async () => [],
       } as never,
-      feedRegistry: { base: {} },
+      feedRegistry: { optimism: {}, arbitrum: {}, base: {} },
       checkpoint: {
         loadLastProcessedBlock: async () => 100n,
         saveLastProcessedBlock: async () => undefined,
         close: async () => undefined,
-      },
+      } as never,
       logger,
       onEvent: () => undefined,
       onFlashblockTick: () => undefined,
