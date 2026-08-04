@@ -32,7 +32,11 @@ import { createChainRegistry } from "./config/chainRegistry";
 import type { FlashLoanProviderId } from "./config/chainRegistry";
 import { createLiquidationActions, LiquidationExecutor } from "./executors/liquidationExecutor";
 import { buildArbitrageExecutionRequest } from "./executors/arbitrageExecutorAdapter";
-import { buildLiquidationExecutionRequest, estimateMinimumDebtOut } from "./executors/liquidationExecutionAdapter";
+import {
+  buildLiquidationExecutionRequest,
+  quoteExactDebtOut,
+  runQuoteFloorGatePhase,
+} from "./executors/liquidationExecutionAdapter";
 import {
   assertUniswapV3FeeTier,
   type UniswapV3FeeTier,
@@ -191,6 +195,10 @@ export interface RuntimeConfig {
   readonly minProfitMarginBps: number;
   readonly flashLoanFeeBps: number;
   readonly flashLoanSlippageFloorBps: number;
+  /** On-chain LiquidationFlashReceiver.swapSlippageBps (oracle floor haircut). */
+  readonly liquidationSwapSlippageBps: number;
+  /** Soft buffer applied after oracle floor before rejecting a Quoter-based candidate. */
+  readonly quoteGateBufferBps: number;
   readonly gasOracleCacheMs: number;
   readonly simulationMode: boolean;
   readonly telegramBotToken: string | undefined;
@@ -306,6 +314,18 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
       defaultFlashLoanSlippageFloorBps,
       0,
       "FLASH_LOAN_SLIPPAGE_FLOOR_BPS",
+    ),
+    liquidationSwapSlippageBps: parseBoundedBps(
+      parsedEnv.LIQUIDATION_SWAP_SLIPPAGE_BPS,
+      200,
+      1_000,
+      "LIQUIDATION_SWAP_SLIPPAGE_BPS",
+    ),
+    quoteGateBufferBps: parseBoundedBps(
+      parsedEnv.QUOTE_GATE_BUFFER_BPS,
+      75,
+      9_999,
+      "QUOTE_GATE_BUFFER_BPS",
     ),
     gasOracleCacheMs: parseMinNumber(parsedEnv.GAS_ORACLE_CACHE_MS, 30_000, 1, "GAS_ORACLE_CACHE_MS"),
     simulationMode,
@@ -1731,30 +1751,66 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
       const uniswap = getDexesForChain(config.chain).find((dex) => dex.name === "UniswapV3");
       let advisoryMinDebtOut = 0n;
       if (uniswap !== undefined && candidate.collateralReceivedWei !== undefined) {
-        try {
-          advisoryMinDebtOut = await estimateMinimumDebtOut({
+        const advisorySlippageBps = Math.max(config.slippageBps, config.flashLoanSlippageFloorBps);
+        const model = eventPurityStack?.model;
+        // LocalPositionModel.prices are wad18 (1e18 USD). On-chain getAssetPrice is base-8.
+        // Using the same scale on BOTH legs leaves the fairDebtOut ratio unchanged
+        // (the 1e10 factors cancel) — do not "fix" one leg to base-8 without the other.
+        const priceCollateral = model?.prices.get(candidate.collateralAsset.toLowerCase());
+        const priceDebt = model?.prices.get(candidate.debtAsset.toLowerCase());
+        const collateralDecimals = model?.reserveConfig.get(candidate.collateralAsset.toLowerCase())?.decimals;
+        const debtDecimals = model?.reserveConfig.get(candidate.debtAsset.toLowerCase())?.decimals;
+        const phase = await runQuoteFloorGatePhase({
+          quote: () => quoteExactDebtOut({
             candidate,
-            slippageBps: Math.max(config.slippageBps, config.flashLoanSlippageFloorBps),
+            slippageBps: advisorySlippageBps,
             fee: plan.fee,
             quoteEngine,
             client: publicClient,
             dex: uniswap,
+          }),
+          collateralBal: candidate.collateralReceivedWei,
+          priceCollateral,
+          priceDebt,
+          collateralDecimals,
+          debtDecimals,
+          swapSlippageBps: config.liquidationSwapSlippageBps,
+          quoteGateBufferBps: config.quoteGateBufferBps,
+          advisorySlippageBps,
+        });
+        if (phase.outcome === "reject") {
+          metrics.recordCandidateRejectedQuoteFloorGate();
+          logger.warn("liquidation_quote_floor_gate_rejected", {
+            user: candidate.account,
+            collateralAsset: candidate.collateralAsset,
+            debtAsset: candidate.debtAsset,
+            quotedOut: phase.quotedOut.toString(),
+            minAcceptable: phase.minAcceptable.toString(),
+            floor: phase.floor.toString(),
           });
+          return undefined;
+        }
+        if (phase.outcome === "unavailable") {
+          metrics.recordQuoteGateUnavailable();
+          logger.warn("liquidation_quote_floor_gate_unavailable", {
+            user: candidate.account,
+            reason: phase.reason,
+          });
+        } else {
           logger.info("liquidation_advisory_min_debt_out", {
             user: candidate.account,
             collateralAsset: candidate.collateralAsset,
             debtAsset: candidate.debtAsset,
             collateralReceivedWei: candidate.collateralReceivedWei.toString(),
             fee: plan.fee,
-            advisoryMinDebtOut: advisoryMinDebtOut.toString(),
+            quotedOut: phase.quotedOut.toString(),
+            advisoryMinDebtOut: phase.advisoryMinDebtOut.toString(),
+            floor: phase.floor.toString(),
+            minAcceptable: phase.minAcceptable.toString(),
             note: "Quote-based advisory only; on-chain amountOutMinimum is Aave-oracle floor",
           });
-        } catch (error) {
-          logger.warn("liquidation_advisory_min_debt_out_failed", {
-            user: candidate.account,
-            error: error instanceof Error ? error.message : String(error),
-          });
         }
+        advisoryMinDebtOut = phase.advisoryMinDebtOut;
       }
       return buildLiquidationExecutionRequest(config.chain, candidate, {
         account: account.address,
@@ -1833,18 +1889,49 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         const uniswap = getDexesForChain(config.chain).find((dex) => dex.name === "UniswapV3");
         let advisoryMinDebtOut = 0n;
         if (uniswap !== undefined && candidate.collateralReceivedWei !== undefined) {
-          try {
-            advisoryMinDebtOut = await estimateMinimumDebtOut({
+          const advisorySlippageBps = Math.max(config.slippageBps, config.flashLoanSlippageFloorBps);
+          const model = eventPurityStack?.model;
+          // LocalPositionModel.prices are wad18 (1e18 USD). On-chain getAssetPrice is base-8.
+          // Using the same scale on BOTH legs leaves the fairDebtOut ratio unchanged
+          // (the 1e10 factors cancel) — do not "fix" one leg to base-8 without the other.
+          const priceCollateral = model?.prices.get(candidate.collateralAsset.toLowerCase());
+          const priceDebt = model?.prices.get(candidate.debtAsset.toLowerCase());
+          const collateralDecimals = model?.reserveConfig.get(candidate.collateralAsset.toLowerCase())?.decimals;
+          const debtDecimals = model?.reserveConfig.get(candidate.debtAsset.toLowerCase())?.decimals;
+          const phase = await runQuoteFloorGatePhase({
+            quote: () => quoteExactDebtOut({
               candidate,
-              slippageBps: Math.max(config.slippageBps, config.flashLoanSlippageFloorBps),
+              slippageBps: advisorySlippageBps,
               fee: plan.fee,
               quoteEngine,
               client: publicClient,
               dex: uniswap,
+            }),
+            collateralBal: candidate.collateralReceivedWei,
+            priceCollateral,
+            priceDebt,
+            collateralDecimals,
+            debtDecimals,
+            swapSlippageBps: config.liquidationSwapSlippageBps,
+            quoteGateBufferBps: config.quoteGateBufferBps,
+            advisorySlippageBps,
+          });
+          if (phase.outcome === "reject") {
+            metrics.recordCandidateRejectedQuoteFloorGate();
+            logger.warn("liquidation_quote_floor_gate_rejected", {
+              user: candidate.account,
+              collateralAsset: candidate.collateralAsset,
+              debtAsset: candidate.debtAsset,
+              quotedOut: phase.quotedOut.toString(),
+              minAcceptable: phase.minAcceptable.toString(),
+              floor: phase.floor.toString(),
             });
-          } catch {
-            // advisory only
+            return undefined;
           }
+          if (phase.outcome === "unavailable") {
+            metrics.recordQuoteGateUnavailable();
+          }
+          advisoryMinDebtOut = phase.advisoryMinDebtOut;
         }
         return buildLiquidationExecutionRequest(config.chain, candidate, {
           account: account.address,
@@ -2670,6 +2757,20 @@ function parseMinNumber(value: string | undefined, fallback: number, min: number
     throw new Error(`${name} must be a number greater than or equal to ${min}`);
   }
 
+  return parsed;
+}
+
+/** Inclusive max; used for BPS knobs that must stay below 10_000 (and often a tighter cap). */
+function parseBoundedBps(
+  value: string | undefined,
+  fallback: number,
+  maxInclusive: number,
+  name: string,
+): number {
+  const parsed = parseMinNumber(value, fallback, 0, name);
+  if (!Number.isInteger(parsed) || parsed > maxInclusive) {
+    throw new Error(`${name} must be an integer between 0 and ${maxInclusive} inclusive`);
+  }
   return parsed;
 }
 

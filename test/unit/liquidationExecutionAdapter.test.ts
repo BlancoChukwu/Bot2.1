@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import { decodeAbiParameters, decodeFunctionData, parseAbiParameters } from "viem";
 import {
   buildLiquidationExecutionRequest,
+  computeOracleMinDebtOut,
   estimateMinimumCollateralOut,
   estimateMinimumDebtOut,
+  runQuoteFloorGatePhase,
 } from "../../src/executors/liquidationExecutionAdapter";
 import { aavePoolAbi } from "../../src/protocols/aaveV3";
 import { QuoteEngine } from "../../src/mirror/quoteEngine";
@@ -186,5 +188,96 @@ describe("estimateMinimumDebtOut (quote-based, debt-asset denominated)", () => {
       },
     });
     expect(minDebtOut).toBe(0n);
+  });
+});
+
+describe("quote floor gate (oracle floor × buffer vs Quoter)", () => {
+  // 1 WETH collateral, $2000 / $1, decimals 18→6, swapSlippage 200, buffer 75.
+  // fairDebtOut = 2_000_000_000; floor = 1_960_000_000; minAcceptable = 1_945_300_000.
+  const collateralBal = 1_000_000_000_000_000_000n;
+  const priceCollateralWad18 = 2_000n * 10n ** 18n;
+  const priceDebtWad18 = 1n * 10n ** 18n;
+  const floorInputs = {
+    collateralBal,
+    priceCollateral: priceCollateralWad18,
+    priceDebt: priceDebtWad18,
+    collateralDecimals: 18,
+    debtDecimals: 6,
+    swapSlippageBps: 200,
+    quoteGateBufferBps: 75,
+    advisorySlippageBps: 200,
+  } as const;
+
+  it("rejects when quotedOut is below minAcceptable", async () => {
+    const floor = computeOracleMinDebtOut({
+      collateralBal,
+      priceCollateral: priceCollateralWad18,
+      priceDebt: priceDebtWad18,
+      collateralDecimals: 18,
+      debtDecimals: 6,
+      swapSlippageBps: 200,
+    });
+    expect(floor).toBe(1_960_000_000n);
+
+    const phase = await runQuoteFloorGatePhase({
+      ...floorInputs,
+      quote: async () => 1_945_299_999n,
+    });
+    expect(phase).toEqual({
+      outcome: "reject",
+      quotedOut: 1_945_299_999n,
+      floor: 1_960_000_000n,
+      minAcceptable: 1_945_300_000n,
+    });
+  });
+
+  it("passes when quotedOut meets or exceeds minAcceptable", async () => {
+    const phase = await runQuoteFloorGatePhase({
+      ...floorInputs,
+      quote: async () => 1_945_300_000n,
+    });
+    expect(phase.outcome).toBe("pass");
+    if (phase.outcome !== "pass") {
+      return;
+    }
+    expect(phase.floor).toBe(1_960_000_000n);
+    expect(phase.minAcceptable).toBe(1_945_300_000n);
+    expect(phase.quotedOut).toBe(1_945_300_000n);
+    // advisory = quoted * (1 - 200/10000)
+    expect(phase.advisoryMinDebtOut).toBe(1_906_394_000n);
+  });
+
+  it("fail-opens (unavailable) when the quote RPC throws — does not reject", async () => {
+    const phase = await runQuoteFloorGatePhase({
+      ...floorInputs,
+      quote: async () => {
+        throw new Error("quoter_timeout");
+      },
+    });
+    expect(phase).toEqual({
+      outcome: "unavailable",
+      reason: "quoter_timeout",
+      advisoryMinDebtOut: 0n,
+    });
+  });
+
+  it("wad18 and base-8 prices yield the same floor (scale-invariant ratio)", () => {
+    const wad18 = computeOracleMinDebtOut({
+      collateralBal,
+      priceCollateral: priceCollateralWad18,
+      priceDebt: priceDebtWad18,
+      collateralDecimals: 18,
+      debtDecimals: 6,
+      swapSlippageBps: 200,
+    });
+    const base8 = computeOracleMinDebtOut({
+      collateralBal,
+      priceCollateral: 2000n * 10n ** 8n,
+      priceDebt: 1n * 10n ** 8n,
+      collateralDecimals: 18,
+      debtDecimals: 6,
+      swapSlippageBps: 200,
+    });
+    expect(wad18).toBe(base8);
   });
 });
