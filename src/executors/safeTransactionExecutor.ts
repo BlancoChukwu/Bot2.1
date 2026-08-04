@@ -212,6 +212,10 @@ export class SafeTransactionExecutor {
         }
         const previewTx = request.buildFlashLoanPreviewTransaction(preflight.route);
         // Preview + final dry-run are independent eth_calls (no shared mutable state).
+        // simulationTsMs marks the start of the concurrent simulation-phase window
+        // (~max of preview and dry-run), not dry-run alone. Downstream:
+        // - pipeline stage "detection_to_simulation_ms" = execute() start → after this window
+        // - pipeline stage "simulation_to_would_submit_ms" = this anchor → would-submit
         simulationTsMs = Date.now();
         const [previewSettled, dryRunSettled] = await Promise.allSettled([
           this.config.client.simulateContract(previewTx, overrides),
@@ -235,9 +239,12 @@ export class SafeTransactionExecutor {
         }
         dryRun = dryRunSettled.value;
       } else {
+        // Solo dry-run: simulation-phase window is the single simulateContract call.
         simulationTsMs = Date.now();
         dryRun = await this.config.client.simulateContract(transaction, overrides);
       }
+      // Stage name is the pipeline segment ending when the simulation phase completes
+      // (concurrent preview+dry-run when both run — not "final simulation only").
       this.recordPipelineLatency(
         "detection_to_simulation_ms",
         request,
