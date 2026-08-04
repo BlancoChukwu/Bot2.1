@@ -193,6 +193,8 @@ export class SafeTransactionExecutor {
           : (preflight.gasPrice < gasCapQuote.maxFeePerGas ? preflight.gasPrice : gasCapQuote.maxFeePerGas),
         nonce: preflight.nonce,
       };
+      let simulationTsMs: number;
+      let dryRun: FinalSimulationResult;
       if (request.buildFlashLoanPreviewTransaction !== undefined) {
         const previewRejectReason = await this.config.rejectBeforePreview?.(request);
         if (previewRejectReason !== undefined) {
@@ -209,7 +211,16 @@ export class SafeTransactionExecutor {
           return { status: "rejected", reason: isDustReject ? "dust_filtered" : "final_simulation_failed" };
         }
         const previewTx = request.buildFlashLoanPreviewTransaction(preflight.route);
-        const preview = await this.config.client.simulateContract(previewTx, overrides);
+        // Preview + final dry-run are independent eth_calls (no shared mutable state).
+        simulationTsMs = Date.now();
+        const [previewSettled, dryRunSettled] = await Promise.allSettled([
+          this.config.client.simulateContract(previewTx, overrides),
+          this.config.client.simulateContract(transaction, overrides),
+        ]);
+        if (previewSettled.status === "rejected") {
+          throw previewSettled.reason;
+        }
+        const preview = previewSettled.value;
         if (!preview.success) {
           this.releaseNonce(request, preflight.nonce);
           this.config.logger.warn("flash_loan_preview_rejected", {
@@ -219,10 +230,14 @@ export class SafeTransactionExecutor {
           });
           return { status: "rejected", reason: "final_simulation_failed" };
         }
+        if (dryRunSettled.status === "rejected") {
+          throw dryRunSettled.reason;
+        }
+        dryRun = dryRunSettled.value;
+      } else {
+        simulationTsMs = Date.now();
+        dryRun = await this.config.client.simulateContract(transaction, overrides);
       }
-
-      const simulationTsMs = Date.now();
-      const dryRun = await this.config.client.simulateContract(transaction, overrides);
       this.recordPipelineLatency(
         "detection_to_simulation_ms",
         request,
