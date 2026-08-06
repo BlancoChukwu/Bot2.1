@@ -31,6 +31,7 @@ const LIQ_COUNT_KEYS = [
   "execution_rejected_single_opportunity_busy",
   "execution_rejected_recent_attempt_inflight",
   "flash_loan_preview_rejected",
+  "liquidation_dust_filtered",
   "execution_circuit_open",
   "transaction_sent",
   "liquidation_executed",
@@ -157,6 +158,8 @@ const counts = {
   watchlist_stale_critical: 0,
   watchlist_heartbeat: 0,
   watchlist_stale_alert_sent: 0,
+  /** Diagnostic HF samples — excluded from liquidations.evaluated. */
+  liquidation_evaluated_diag: 0,
 };
 for (const key of LIQ_COUNT_KEYS) {
   counts[key] = 0;
@@ -221,6 +224,9 @@ for (const rawLine of readLogLines(logPath)) {
 
   if (msg in counts) {
     counts[msg] += 1;
+  }
+  if (msg === "liquidation_evaluated" && row.stage === "pipeline_cycle_sample") {
+    counts.liquidation_evaluated_diag += 1;
   }
 
   if (ATTEMPT_MSGS.has(msg)) {
@@ -311,7 +317,9 @@ const rejectedTotal =
   counts.execution_rejected_hf_not_liquidatable
   + counts.execution_rejected_single_opportunity_busy
   + counts.execution_rejected_recent_attempt_inflight
-  + counts.flash_loan_preview_rejected;
+  + counts.flash_loan_preview_rejected
+  + counts.liquidation_dust_filtered;
+const evaluatedGate = counts.liquidation_evaluated - counts.liquidation_evaluated_diag;
 
 const mode = modeOverride && modeOverride !== "unknown"
   ? modeOverride
@@ -340,7 +348,8 @@ const summary = {
     candidates: counts.event_purity_liquidatable_candidate,
     previews: counts.liquidatable_candidate_preview,
     gateClosed: counts.liquidatable_candidate_detected_gate_closed,
-    evaluated: counts.liquidation_evaluated,
+    evaluated: evaluatedGate,
+    evaluatedDiag: counts.liquidation_evaluated_diag,
     pathCandidates: counts.liquidation_path_candidate,
     dryRuns: counts.liquidation_dry_run_preview,
     firstAttempts: counts.liquidation_first_attempt,
@@ -351,6 +360,7 @@ const summary = {
       busy: counts.execution_rejected_single_opportunity_busy,
       inflight: counts.execution_rejected_recent_attempt_inflight,
       flashPreview: counts.flash_loan_preview_rejected,
+      dustFiltered: counts.liquidation_dust_filtered,
     },
     circuitOpen: counts.execution_circuit_open,
     sent: counts.transaction_sent,
@@ -394,14 +404,15 @@ const modeLabel = isSoak
 console.log("── Liquidations ──");
 console.log(`  Mode:         ${modeLabel}`);
 console.log(`  Candidates:   found=${summary.liquidations.candidates} preview=${summary.liquidations.previews} path=${summary.liquidations.pathCandidates} gate_closed=${summary.liquidations.gateClosed}`);
-console.log(`  Pipeline:     evaluated=${summary.liquidations.evaluated} first_attempt=${summary.liquidations.firstAttempts} traces=${summary.liquidations.opportunityTraces}`);
+console.log(`  Pipeline:     evaluated=${summary.liquidations.evaluated} diag=${summary.liquidations.evaluatedDiag} first_attempt=${summary.liquidations.firstAttempts} traces=${summary.liquidations.opportunityTraces}`);
 console.log(`  Dry-run/sim:  ${summary.liquidations.dryRuns}`);
 console.log(
   `  Rejected:     ${summary.liquidations.rejected}`
   + ` (hf=${summary.liquidations.rejectedDetail.hfNotLiquidatable}`
   + ` busy=${summary.liquidations.rejectedDetail.busy}`
   + ` inflight=${summary.liquidations.rejectedDetail.inflight}`
-  + ` flash=${summary.liquidations.rejectedDetail.flashPreview})`,
+  + ` flash=${summary.liquidations.rejectedDetail.flashPreview}`
+  + ` dust=${summary.liquidations.rejectedDetail.dustFiltered})`,
 );
 if (isSoak) {
   console.log(`  Sent/exec:    n/a in soak (dry-run only) | circuit_open=${summary.liquidations.circuitOpen}`);

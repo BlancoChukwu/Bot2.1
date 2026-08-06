@@ -28,7 +28,7 @@ describe("watch-bot-summary", () => {
   it("counts liquidations and labels soak mode (sent/exec still counted in json)", () => {
     const summary = runSummary([
       { time: "2026-07-26T00:00:00.000Z", msg: "event_purity_liquidatable_candidate", level: 30 },
-      { time: "2026-07-26T00:01:00.000Z", msg: "liquidation_evaluated", level: 30, account: "0xabc" },
+      { time: "2026-07-26T00:01:00.000Z", msg: "liquidation_evaluated", level: 30, account: "0xabc", stage: "pipeline_enqueue", pass: false },
       { time: "2026-07-26T00:02:00.000Z", msg: "liquidation_dry_run_preview", level: 30, account: "0xabc" },
       { time: "2026-07-26T00:03:00.000Z", msg: "execution_rejected_hf_not_liquidatable", level: 40 },
       { time: "2026-07-26T00:04:00.000Z", msg: "ws_event_layer_started", level: 30 },
@@ -37,10 +37,47 @@ describe("watch-bot-summary", () => {
     expect(summary.mode).toBe("soak");
     expect(summary.liquidations.candidates).toBe(1);
     expect(summary.liquidations.evaluated).toBe(1);
+    expect(summary.liquidations.evaluatedDiag).toBe(0);
     expect(summary.liquidations.dryRuns).toBe(1);
     expect(summary.liquidations.rejected).toBe(1);
     expect(summary.wsEventLayerStarted).toBe(true);
     expect(summary.recentAttempts.length).toBeGreaterThan(0);
+  });
+
+  it("excludes pipeline_cycle_sample from evaluated and counts dust in rejected", () => {
+    const summary = runSummary([
+      {
+        time: "2026-08-06T00:00:00.000Z",
+        msg: "liquidation_evaluated",
+        level: 30,
+        account: "0xdiag",
+        stage: "pipeline_cycle_sample",
+        pass: false,
+        hfFloat: 1.2,
+      },
+      {
+        time: "2026-08-06T00:00:01.000Z",
+        msg: "liquidation_evaluated",
+        level: 30,
+        account: "0xgate",
+        stage: "pipeline_enqueue",
+        pass: false,
+        debtUsd: 1,
+      },
+      {
+        time: "2026-08-06T00:00:02.000Z",
+        msg: "liquidation_dust_filtered",
+        level: 30,
+        account: "0xgate",
+        stage: "pipeline_enqueue",
+        dustReason: "below_PROFITABILITY_FLOOR(30.0000)",
+      },
+    ], ["--mode", "live"]);
+
+    expect(summary.liquidations.evaluated).toBe(1);
+    expect(summary.liquidations.evaluatedDiag).toBe(1);
+    expect(summary.liquidations.rejected).toBe(1);
+    expect(summary.liquidations.rejectedDetail.dustFiltered).toBe(1);
   });
 
   it("marks unhealthy when safety gate is blocked", () => {
