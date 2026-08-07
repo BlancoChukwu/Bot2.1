@@ -24,7 +24,7 @@ Record `t_public_ms`, `t_private_ms`, and `latency_delta_ms` in the dry-run rece
 
 ## On-chain race protection
 
-`LiquidationFlashReceiver` V2 (`RECEIVER_VERSION=2`) asserts `getUserAccountData(user).healthFactor < 1e18` before `liquidationCall`.
+`LiquidationFlashReceiver` v5 (`RECEIVER_VERSION=5`) asserts HF < 1e18 before `liquidationCall`, decodes the 8-field production route schema (including validated Uniswap fee `{100,500,3000,10000}`), restricts flash-loan initiator to `authorizedInitiator`, and sets Uniswap `amountOutMinimum` from a live Aave-oracle floor over actual `collateralBal` (owner-settable `swapSlippageBps`, default 200). Field 6 (`minDebtOut`) is advisory only — off-chain `estimateMinimumDebtOut` is quote-based via `QuoteEngine.quoteExactInputSingle` and must never drive the swap floor.
 
 Off-chain: `safeTransactionExecutor` rejects broadcast when HF ≥ 1.0 or detection block is stale by >1 block.
 

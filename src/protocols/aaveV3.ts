@@ -66,6 +66,53 @@ interface AaveReadClient {
   }): Promise<readonly [bigint, bigint, bigint, bigint, bigint, bigint]>;
 }
 
+/** Runtime reader for reserve/debt-token calls (viem PublicClient satisfies this at runtime). */
+interface FlexibleContractReader {
+  readContract(parameters: {
+    readonly address: Address;
+    readonly abi: readonly unknown[];
+    readonly functionName: string;
+    readonly args?: readonly unknown[];
+  }): Promise<unknown>;
+}
+
+/** Minimal Pool.getReserveData fields used to resolve variable-debt token balances. */
+const aaveReserveDataAbi = [
+  {
+    type: "function",
+    name: "getReserveData",
+    stateMutability: "view",
+    inputs: [{ name: "asset", type: "address" }],
+    outputs: [
+      { name: "configuration", type: "uint256" },
+      { name: "liquidityIndex", type: "uint128" },
+      { name: "currentLiquidityRate", type: "uint128" },
+      { name: "variableBorrowIndex", type: "uint128" },
+      { name: "currentVariableBorrowRate", type: "uint128" },
+      { name: "currentStableBorrowRate", type: "uint128" },
+      { name: "lastUpdateTimestamp", type: "uint40" },
+      { name: "id", type: "uint16" },
+      { name: "aTokenAddress", type: "address" },
+      { name: "stableDebtTokenAddress", type: "address" },
+      { name: "variableDebtTokenAddress", type: "address" },
+      { name: "interestRateStrategyAddress", type: "address" },
+      { name: "accruedToTreasury", type: "uint128" },
+      { name: "unbacked", type: "uint128" },
+      { name: "isolationModeTotalDebt", type: "uint128" },
+    ],
+  },
+] as const;
+
+const erc20BalanceOfAbi = [
+  {
+    type: "function",
+    name: "balanceOf",
+    stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+] as const;
+
 interface AaveEventClient {
   watchContractEvent?(parameters: {
     readonly address: Address;
@@ -319,13 +366,40 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
     account: AaveUserAccount,
   ): Promise<Omit<LiquidationCandidate, "account" | "healthFactor">> {
     const pair = selectBestReservePairForAccount(this.chain, account);
+    const debtToCover = await this.readVariableDebtBalance(pair.debtAsset, account.account);
+    // Prefer on-chain debt token balance. Config defaultDebtToCoverWei (1e6) is a placeholder only.
+    const sizedDebt = debtToCover > 0n ? debtToCover : pair.defaultDebtToCoverWei;
+    const repayValueUsd = estimateRepayValueUsd(account.totalDebtBase, sizedDebt, pair);
     return {
       collateralAsset: pair.collateralAsset,
       debtAsset: pair.debtAsset,
-      debtToCover: pair.defaultDebtToCoverWei,
-      repayValueUsd: pair.repayValueUsd,
+      debtToCover: sizedDebt,
+      repayValueUsd,
       liquidationBonusBps: pair.liquidationBonusBps,
     };
+  }
+
+  /** Compounded variable-debt token balance for `debtAsset` (actual wei to cover). */
+  private async readVariableDebtBalance(debtAsset: Address, user: Address): Promise<bigint> {
+    const pool = this.resolveAavePool();
+    const reader = this.publicClient as unknown as FlexibleContractReader;
+    const reserveData = await reader.readContract({
+      address: pool,
+      abi: aaveReserveDataAbi as unknown as readonly unknown[],
+      functionName: "getReserveData",
+      args: [debtAsset],
+    }) as readonly unknown[];
+    const variableDebtToken = reserveData[10];
+    if (typeof variableDebtToken !== "string" || !/^0x[a-fA-F0-9]{40}$/.test(variableDebtToken)) {
+      return 0n;
+    }
+    const balance = await reader.readContract({
+      address: variableDebtToken as Address,
+      abi: erc20BalanceOfAbi as unknown as readonly unknown[],
+      functionName: "balanceOf",
+      args: [user],
+    });
+    return typeof balance === "bigint" ? balance : 0n;
   }
 
   public async listBorrowerAddresses(): Promise<readonly Address[]> {
@@ -410,6 +484,25 @@ async function readUserAccount(
     loanToValue: result[4],
     healthFactor: result[5],
   };
+}
+
+/**
+ * Gate/exec need a USD notion before oracle refresh.
+ * Use totalDebtBase (Aave 8-decimal USD) when debt was sized on-chain; keep pair placeholder only for zero debt.
+ */
+function estimateRepayValueUsd(
+  totalDebtBase: bigint,
+  debtToCover: bigint,
+  pair: AaveReservePair,
+): number {
+  if (debtToCover <= 0n) {
+    return 0;
+  }
+  if (debtToCover === pair.defaultDebtToCoverWei) {
+    return pair.repayValueUsd;
+  }
+  const fromBase = Number(totalDebtBase) / 1e8;
+  return Number.isFinite(fromBase) && fromBase > 0 ? fromBase : pair.repayValueUsd;
 }
 
 async function fetchAllBorrowers(graphClient: AaveGraphClient, pageSize: number): Promise<Address[]> {

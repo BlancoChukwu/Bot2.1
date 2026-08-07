@@ -1,7 +1,7 @@
 import type { Address, PublicClient } from "viem";
 import type { EventPurityConfig } from "../config/eventPurityConfig";
 import type { LoggerLike } from "../bot";
-import { MAX_HF_WAD, type LocalPositionModel } from "./localPositionModel";
+import { MAX_HF_WAD, type LocalPositionModel, type UserPosition } from "./localPositionModel";
 import { computeShadowDriftBps } from "./localPositionHfPolicy";
 import {
   collectPositionAssets,
@@ -43,13 +43,17 @@ export interface ShadowMetricsSnapshot {
   readonly totalSamples: number;
   readonly nonEMode: ShadowMetricsBucket;
   readonly eMode: ShadowMetricsBucket;
+  readonly freshNonEMode: ShadowMetricsBucket;
+  readonly staleNonEMode: ShadowMetricsBucket;
   readonly shadowDriftNonEModeBps: number;
   readonly shadowDriftEModeBps: number;
+  readonly shadowDriftFreshBps: number;
+  readonly shadowDriftStaleBps: number;
   readonly shadowFnRateNonEModePct: number;
   readonly shadowFnRateEModePct: number;
   readonly driftToleranceBps: number;
   readonly fnRateTargetPct: number;
-  readonly tuningBucket: "non_eMode";
+  readonly tuningBucket: "non_eMode_fresh";
   readonly driftByAsset: readonly AssetDriftAttribution[];
 }
 
@@ -77,6 +81,10 @@ export class ShadowValidator {
   private skippedDueToConcurrency = 0;
   private readonly nonEModeBucket: BucketAccumulator = emptyBucket();
   private readonly eModeBucket: BucketAccumulator = emptyBucket();
+  /** Tuning mean — chainlink-only / fresh prices (excludes gap-fill / aave / peg). */
+  private readonly freshNonEModeBucket: BucketAccumulator = emptyBucket();
+  /** Diagnostic — gap-fill or stale-adjacent price sources. */
+  private readonly staleNonEModeBucket: BucketAccumulator = emptyBucket();
   private readonly assetDriftBuckets = new Map<string, DriftBucketAccumulator>();
   private lastAggregateLogAt = 0;
   private readonly startedAtMs: number;
@@ -236,6 +244,19 @@ export class ShadowValidator {
     }
 
     const position = this.config.model.positions.get(account.toLowerCase());
+    const priceMeta = resolvePositionPriceMeta(this.config.model, position, Math.floor(Date.now() / 1000));
+    if (!isEMode) {
+      const priceBucket = priceMeta.freshForTuning ? this.freshNonEModeBucket : this.staleNonEModeBucket;
+      priceBucket.sampleCount += 1;
+      priceBucket.driftSumBps += driftBps;
+      if (driftBps > priceBucket.maxDriftBps) {
+        priceBucket.maxDriftBps = driftBps;
+      }
+      if (isFalseNegative) {
+        priceBucket.falseNegativeCount += 1;
+      }
+    }
+
     if (position !== undefined) {
       recordAssetDrift(
         this.assetDriftBuckets,
@@ -255,6 +276,7 @@ export class ShadowValidator {
       isEMode,
       eModeCategoryId,
     };
+    const sampleAssets = position === undefined ? [] : collectPositionAssets(position);
     this.config.logger.info("shadow_validation_sample", {
       account: result.account,
       localHf: Number(localHfWad) / 1e18,
@@ -265,6 +287,11 @@ export class ShadowValidator {
       blockNumber: Number(blockNumber),
       isEMode: result.isEMode,
       eModeCategoryId: result.eModeCategoryId,
+      priceAgeMs: priceMeta.priceAgeMs,
+      priceSource: priceMeta.priceSource,
+      freshForTuning: priceMeta.freshForTuning,
+      // Asset list enables post-hoc correlation of max-drift spikes across pairs.
+      assets: sampleAssets,
     });
 
     if (bucket.sampleCount % 25 === 0) {
@@ -282,17 +309,23 @@ export class ShadowValidator {
     const fnRateTargetPct = this.config.purity.shadowFnRateTargetPct;
     const nonEMode = finalizeBucket(this.nonEModeBucket, driftToleranceBps, fnRateTargetPct);
     const eMode = finalizeBucket(this.eModeBucket, driftToleranceBps, fnRateTargetPct);
+    const freshNonEMode = finalizeBucket(this.freshNonEModeBucket, driftToleranceBps, fnRateTargetPct);
+    const staleNonEMode = finalizeBucket(this.staleNonEModeBucket, driftToleranceBps, fnRateTargetPct);
     return {
       totalSamples: nonEMode.sampleCount + eMode.sampleCount,
       nonEMode,
       eMode,
+      freshNonEMode,
+      staleNonEMode,
       shadowDriftNonEModeBps: nonEMode.meanDriftBps,
       shadowDriftEModeBps: eMode.meanDriftBps,
+      shadowDriftFreshBps: freshNonEMode.meanDriftBps,
+      shadowDriftStaleBps: staleNonEMode.meanDriftBps,
       shadowFnRateNonEModePct: nonEMode.falseNegativeRatePct,
       shadowFnRateEModePct: eMode.falseNegativeRatePct,
       driftToleranceBps,
       fnRateTargetPct,
-      tuningBucket: "non_eMode",
+      tuningBucket: "non_eMode_fresh",
       driftByAsset: topAssetDriftAttribution(this.assetDriftBuckets, SHADOW_DRIFT_ATTRIBUTION_TOP_N),
     };
   }
@@ -310,18 +343,23 @@ export class ShadowValidator {
       tuningBucket: snapshot.tuningBucket,
       shadow_drift_non_eMode_bps: snapshot.shadowDriftNonEModeBps,
       shadow_drift_eMode_bps: snapshot.shadowDriftEModeBps,
+      shadow_drift_fresh_bps: snapshot.shadowDriftFreshBps,
+      shadow_drift_stale_bps: snapshot.shadowDriftStaleBps,
       shadow_fn_rate_non_eMode_pct: snapshot.shadowFnRateNonEModePct,
       shadow_fn_rate_eMode_pct: snapshot.shadowFnRateEModePct,
       non_eMode_sample_count: snapshot.nonEMode.sampleCount,
       eMode_sample_count: snapshot.eMode.sampleCount,
+      fresh_non_eMode_sample_count: snapshot.freshNonEMode.sampleCount,
+      stale_non_eMode_sample_count: snapshot.staleNonEMode.sampleCount,
       non_eMode_false_negative_count: snapshot.nonEMode.falseNegativeCount,
       eMode_false_negative_count: snapshot.eMode.falseNegativeCount,
       non_eMode_max_drift_bps: snapshot.nonEMode.maxDriftBps,
       eMode_max_drift_bps: snapshot.eMode.maxDriftBps,
-      non_eMode_within_drift_tolerance: snapshot.nonEMode.withinDriftTolerance,
+      non_eMode_within_drift_tolerance: snapshot.freshNonEMode.withinDriftTolerance,
       non_eMode_within_fn_target: snapshot.nonEMode.withinFnRateTarget,
       drift_tolerance_bps: snapshot.driftToleranceBps,
       fn_rate_target_pct: snapshot.fnRateTargetPct,
+      shadow_drift_by_asset_counting: "per_sample_unique_assets",
       shadow_drift_by_asset: snapshot.driftByAsset,
     });
   }
@@ -361,6 +399,43 @@ function finalizeBucket(
     maxDriftBps: bucket.maxDriftBps,
     withinDriftTolerance: meanDriftBps <= driftToleranceBps,
     withinFnRateTarget: falseNegativeRatePct <= fnRateTargetPct,
+  };
+}
+
+/**
+ * Fresh-for-tuning = all position assets priced from chainlink (not aave/peg gap-fill).
+ * priceAgeMs = max age across feeds; priceSource = dominant / worst source label.
+ */
+function resolvePositionPriceMeta(
+  model: LocalPositionModel,
+  position: UserPosition | undefined,
+  nowSec: number,
+): { readonly priceAgeMs: number; readonly priceSource: string; readonly freshForTuning: boolean } {
+  if (position === undefined) {
+    return { priceAgeMs: 0, priceSource: "unknown", freshForTuning: false };
+  }
+  const assets = collectPositionAssets(position);
+  let maxAgeSec = 0;
+  let freshForTuning = assets.length > 0;
+  const sources = new Set<string>();
+  for (const asset of assets) {
+    const feed = model.feedStates.get(asset.toLowerCase());
+    if (feed === undefined) {
+      freshForTuning = false;
+      sources.add("missing");
+      continue;
+    }
+    const source = feed.source ?? "unknown";
+    sources.add(source);
+    if (source !== "chainlink") {
+      freshForTuning = false;
+    }
+    maxAgeSec = Math.max(maxAgeSec, Math.max(0, nowSec - feed.updatedAt));
+  }
+  return {
+    priceAgeMs: maxAgeSec * 1_000,
+    priceSource: [...sources].sort().join(",") || "unknown",
+    freshForTuning,
   };
 }
 

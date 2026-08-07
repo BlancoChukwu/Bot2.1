@@ -51,11 +51,30 @@ describe("ViemAaveV3Protocol", () => {
     });
   });
 
-  it("uses the active chain reserve pair for liquidation candidate fields", async () => {
+  it("sizes debtToCover from on-chain variable-debt balance, not the 1 USDC placeholder", async () => {
+    const debtToken = "0x2222222222222222222222222222222222222222";
+    const user = "0x0000000000000000000000000000000000000001";
+    const calls: string[] = [];
     const protocol = new ViemAaveV3Protocol(
       {
-        readContract: async () => [1n, 2n, 3n, 4n, 5n, 6n] as const,
-      },
+        readContract: async (parameters: { functionName: string }) => {
+          calls.push(parameters.functionName);
+          if (parameters.functionName === "getReserveData") {
+            return [
+              0n, 0n, 0n, 0n, 0n, 0n, 0n, 0,
+              "0x1111111111111111111111111111111111111111",
+              "0x0000000000000000000000000000000000000000",
+              debtToken,
+              "0x0000000000000000000000000000000000000000",
+              0n, 0n, 0n,
+            ] as const;
+          }
+          if (parameters.functionName === "balanceOf") {
+            return 136_290_821_072n;
+          }
+          return [1n, 2n, 3n, 4n, 5n, 6n] as const;
+        },
+      } as never,
       getChainConfig("optimism"),
       undefined,
       undefined,
@@ -64,9 +83,9 @@ describe("ViemAaveV3Protocol", () => {
     );
 
     const pair = await protocol.getBestLiquidationPair({
-      account: "0x0000000000000000000000000000000000000001",
-      totalCollateralBase: 1n,
-      totalDebtBase: 2n,
+      account: user as `0x${string}`,
+      totalCollateralBase: 200_000_00000n,
+      totalDebtBase: 136_290_82107n,
       availableBorrowsBase: 0n,
       currentLiquidationThreshold: 8_000n,
       loanToValue: 7_500n,
@@ -74,7 +93,11 @@ describe("ViemAaveV3Protocol", () => {
     });
 
     expect(pair.collateralAsset).toBe(getChainConfig("optimism").aave.reservePairs[0]?.collateralAsset);
-    expect(pair.debtToCover).toBeGreaterThan(0n);
+    expect(pair.debtToCover).toBe(136_290_821_072n);
+    expect(pair.debtToCover).not.toBe(1_000_000n);
+    expect(pair.repayValueUsd).toBeGreaterThan(1);
+    expect(calls).toContain("getReserveData");
+    expect(calls).toContain("balanceOf");
   });
 
   it("calculates health factor from account debt and threshold", () => {

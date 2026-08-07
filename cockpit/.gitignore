@@ -1,0 +1,9 @@
+node_modules
+dist
+dist-v2
+.DS_Store
+*.local
+.vite
+src-tauri/target
+_cul_extract
+*.log

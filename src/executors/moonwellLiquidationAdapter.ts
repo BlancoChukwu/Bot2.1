@@ -28,8 +28,9 @@ export function buildMoonwellLiquidationExecutionRequest(input: {
     debtAsset: input.candidate.debtAsset,
     user: input.candidate.account,
     debtToCover: input.candidate.debtToCover,
-    minCollateralOut: 1n,
+    minDebtOut: 1n,
     receiveAToken: false,
+    fee: 3_000,
   });
   return {
     chain: input.chain,

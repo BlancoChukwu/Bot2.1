@@ -12,6 +12,7 @@ coverage/
 
 # Local runtime (RPC benchmarks, dry-run receipts, locks, redis, foundry, heap dumps)
 .runtime/
+.tools/
 
 # Session logs & audit output
 logs/

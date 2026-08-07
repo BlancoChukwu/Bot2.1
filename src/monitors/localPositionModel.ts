@@ -19,13 +19,16 @@ import {
   resolveEffectiveAssetPriceWad18,
   type PegReferenceHealthInput,
 } from "../oracle/healthyPegAsset";
+import type { EModeCategoryConfig } from "./aaveEmode";
+import { isReserveEnabledOnBitmap } from "./reserveConfiguration";
 
 export type PositionConfidence = "high" | "low";
 export type PositionTier = "healthy" | "watch" | "urgent" | "liquidatable";
 
 const WAD = 1_000_000_000_000_000_000n;
 const BPS = 10_000n;
-const BASE_LT_BPS = 8500n;
+/** Fallback only until PDP/config hydration; never treat as protocol truth. */
+export const BASE_LT_BPS = 8500n;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const DEFAULT_FEED_DECIMALS = 8;
 
@@ -56,6 +59,13 @@ export interface ReserveConfig {
   variableBorrowIndex: bigint;
   indexUpdatedAtBlock: bigint;
   liquidationBonus: bigint | null;
+  /** Pool reserve id (bit index into eMode collateral bitmap). */
+  reserveId?: number;
+  /**
+   * ERC20 decimals from on-chain `decimals()`. Required before HF.
+   * Never invent a default (especially not 18) — missing means fail loud.
+   */
+  decimals?: number;
 }
 
 export interface UserPosition {
@@ -68,6 +78,12 @@ export interface UserPosition {
   confidence: PositionConfidence;
   isFullySeeded: boolean;
   lastConfirmedBlock: bigint;
+  /**
+   * Block of the on-chain snapshot used to seed this position.
+   * Balance-mutating pool events with meta.blockNumber <= seededAtBlock are
+   * already reflected in the Maps and must not be re-applied (gap-fill replay).
+   */
+  seededAtBlock: bigint;
   lastActivityBlock: bigint;
   eModeCategoryId: number;
   lastTotalCollateralBase?: bigint;
@@ -115,6 +131,7 @@ export class LocalPositionModel {
   readonly prices = new Map<string, bigint>();
   readonly feedStates = new Map<string, FeedState>();
   readonly reserveConfig = new Map<string, ReserveConfig>();
+  readonly eModeCategories = new Map<number, EModeCategoryConfig>();
   private readonly allowlistSet: ReadonlySet<string> | undefined;
   private flashblockTickCount = 0n;
   private evictionTotal = 0;
@@ -168,18 +185,77 @@ export class LocalPositionModel {
     this.reserveConfig.set(key, { ...reserve, liquidationBonus: bonus });
   }
 
-  public registerReserve(asset: Address, liquidationThresholdBps = BASE_LT_BPS): void {
+  public setReserveLiquidationThreshold(asset: Address, liquidationThresholdBps: bigint): void {
+    this.registerReserve(asset, liquidationThresholdBps);
+  }
+
+  public setReserveId(asset: Address, reserveId: number): void {
     const key = asset.toLowerCase();
-    if (!this.reserveConfig.has(key)) {
+    const existing = this.reserveConfig.get(key);
+    if (existing === undefined) {
+      this.registerReserve(asset);
+    }
+    const reserve = this.reserveConfig.get(key);
+    if (reserve === undefined) {
+      return;
+    }
+    this.reserveConfig.set(key, { ...reserve, reserveId });
+  }
+
+  public setEModeCategory(category: EModeCategoryConfig): void {
+    this.eModeCategories.set(category.categoryId, category);
+  }
+
+  /**
+   * Register or update a reserve. When `liquidationThresholdBps` is omitted on an
+   * existing reserve, the previously hydrated LT is preserved (do not overwrite with 8500).
+   */
+  public registerReserve(
+    asset: Address,
+    liquidationThresholdBps?: bigint,
+    decimals?: number,
+  ): void {
+    const key = asset.toLowerCase();
+    const existing = this.reserveConfig.get(key);
+    if (existing === undefined) {
       this.reserveConfig.set(key, {
         asset,
-        liquidationThresholdBps,
+        liquidationThresholdBps: liquidationThresholdBps ?? BASE_LT_BPS,
         liquidityIndex: WAD,
         variableBorrowIndex: WAD,
         indexUpdatedAtBlock: 0n,
         liquidationBonus: null,
+        ...(decimals === undefined ? {} : { decimals: assertReserveDecimals(decimals, asset) }),
       });
+      return;
     }
+    const next: ReserveConfig = {
+      ...existing,
+      ...(liquidationThresholdBps === undefined
+        ? {}
+        : { liquidationThresholdBps }),
+      ...(decimals === undefined || existing.decimals !== undefined
+        ? {}
+        : { decimals: assertReserveDecimals(decimals, asset) }),
+    };
+    this.reserveConfig.set(key, next);
+  }
+
+  /** Cache on-chain ERC20 decimals. Throws on invalid or conflicting values — never defaults to 18. */
+  public setReserveDecimals(asset: Address, decimals: number): void {
+    const validated = assertReserveDecimals(decimals, asset);
+    this.registerReserve(asset);
+    const key = asset.toLowerCase();
+    const reserve = this.reserveConfig.get(key);
+    if (reserve === undefined) {
+      throw new Error(`reserve_decimals_missing_config:${asset}`);
+    }
+    if (reserve.decimals !== undefined && reserve.decimals !== validated) {
+      throw new Error(
+        `reserve_decimals_conflict:${asset}:have=${reserve.decimals}:got=${validated}`,
+      );
+    }
+    this.reserveConfig.set(key, { ...reserve, decimals: validated });
   }
 
   public onFlashblockTick(_blockNumber: bigint): boolean {
@@ -204,6 +280,7 @@ export class LocalPositionModel {
   }
 
   public applyAaveEvent(event: ParsedAavePoolEvent): AaveEventApplyResult {
+    // Index-only: always apply, including historical gap-fill (no balance mutation).
     if (event.name === "ReserveDataUpdated") {
       this.registerReserve(event.reserve);
       this.applyReserveIndexUpdate(event);
@@ -224,6 +301,18 @@ export class LocalPositionModel {
     this.registerReserve(event.reserve);
     const isNew = existing === undefined;
     const position = this.getOrCreate(account, event.meta.blockNumber);
+
+    // Fully-seeded snapshot already includes balance effects through seededAtBlock.
+    // Replaying Supply/Borrow/Repay/... at or before that block double-counts.
+    // Apply only strictly later events: event.block > seededAtBlock.
+    if (
+      position.isFullySeeded
+      && isBalanceMutatingPoolEvent(event.name)
+      && event.meta.blockNumber <= position.seededAtBlock
+    ) {
+      return { changes: [] };
+    }
+
     position.lastActivityBlock = event.meta.blockNumber;
 
     switch (event.name) {
@@ -293,12 +382,14 @@ export class LocalPositionModel {
     const assetKey = asset.toLowerCase();
     const normalizedPrice = answer * 10n ** BigInt(18 - decimals);
     this.prices.set(assetKey, normalizedPrice);
+    // Tag Chainlink so gap-fill (source=aave/peg) and feed freshness never collide on source.
     this.feedStates.set(assetKey, {
       answer,
       decimals,
       updatedAt: updatedAtSec,
       feedAddress: feed,
       asset,
+      source: "chainlink",
     });
 
     const pegChanges = this.syncDerivedPegPrices(updatedAtSec, asset);
@@ -443,6 +534,7 @@ export class LocalPositionModel {
     position.confidence = "high";
     position.isFullySeeded = true;
     position.lastConfirmedBlock = input.blockNumber;
+    position.seededAtBlock = input.blockNumber;
     position.lastActivityBlock = input.blockNumber;
     position.lastTotalCollateralBase = input.totalCollateralBase;
     position.lastTotalDebtBase = input.totalDebtBase;
@@ -564,6 +656,18 @@ export class LocalPositionModel {
         return { status: "price_stale", staleAssets };
       }
 
+      const missingDecimals = collectMissingDecimalsAssets(position, this.reserveConfig);
+      if (missingDecimals.length > 0) {
+        this.config.logger?.error("RESERVE_DECIMALS_MISSING", {
+          account: position.account,
+          assets: missingDecimals,
+        });
+        return {
+          status: "error",
+          reason: `missing_reserve_decimals:${missingDecimals.join(",")}`,
+        };
+      }
+
       let weightedCollateral = 0n;
       let totalDebt = 0n;
 
@@ -573,8 +677,12 @@ export class LocalPositionModel {
         if (reserve === undefined || price === undefined || amount === 0n) {
           continue;
         }
+        const decimals = requireReserveDecimals(reserve);
+        const scale = 10n ** BigInt(decimals);
         const scaled = this.scaleCollateralAmount(position, assetKey, amount, reserve);
-        weightedCollateral += (scaled * price * reserve.liquidationThresholdBps) / BPS;
+        const ltBps = this.resolveCollateralLtBps(position, reserve);
+        // Multiply first, divide last — truncating `scaled / 10^decimals` zeros dust legs.
+        weightedCollateral += (scaled * price * ltBps) / (BPS * scale);
       }
 
       for (const [assetKey, amount] of position.debt) {
@@ -583,8 +691,10 @@ export class LocalPositionModel {
         if (reserve === undefined || price === undefined || amount === 0n) {
           continue;
         }
+        const decimals = requireReserveDecimals(reserve);
+        const scale = 10n ** BigInt(decimals);
         const scaled = this.scaleDebtAmount(position, assetKey, amount, reserve);
-        totalDebt += scaled * price;
+        totalDebt += (scaled * price) / scale;
       }
 
       if (totalDebt === 0n) {
@@ -596,6 +706,34 @@ export class LocalPositionModel {
     } catch (error) {
       return { status: "error", reason: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  /**
+   * Recompute tiers for positions touching any of `assets` after a gap-fill price write.
+   * `registerBootstrapPrice` / `registerAavePrice` update prices+feedStates but do not emit
+   * TierChanges — without this, gap-fill-only books stay on stale cached HF until the next
+   * Chainlink or Aave event (execution-order / write-gap race with the oracle poll).
+   */
+  public recomputeTiersForAssets(
+    assets: readonly Address[],
+    nowSec: number = Math.floor(Date.now() / 1000),
+  ): TierChange[] {
+    if (assets.length === 0) {
+      return [];
+    }
+    const seen = new Set<string>();
+    const changes: TierChange[] = [];
+    for (const asset of assets) {
+      for (const change of this.recomputeTierChangesForAsset(asset, nowSec)) {
+        const key = change.account.toLowerCase();
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        changes.push(change);
+      }
+    }
+    return changes;
   }
 
   private recomputeTierChangesForAsset(asset: Address, nowSec: number): TierChange[] {
@@ -688,6 +826,25 @@ export class LocalPositionModel {
     return this.allowlistSet.has(reserve.toLowerCase());
   }
 
+  /**
+   * Per-asset LT for local HF: eMode category LT when user is in eMode and the
+   * reserve is set in that category's collateral bitmap; otherwise base reserve LT.
+   */
+  private resolveCollateralLtBps(position: UserPosition, reserve: ReserveConfig): bigint {
+    const categoryId = position.eModeCategoryId;
+    if (categoryId === 0) {
+      return reserve.liquidationThresholdBps;
+    }
+    const category = this.eModeCategories.get(categoryId);
+    if (category === undefined || reserve.reserveId === undefined) {
+      return reserve.liquidationThresholdBps;
+    }
+    if (!isReserveEnabledOnBitmap(category.collateralBitmap, reserve.reserveId)) {
+      return reserve.liquidationThresholdBps;
+    }
+    return category.liquidationThresholdBps;
+  }
+
   private getOrCreate(account: Address, blockNumber: bigint): UserPosition {
     const key = account.toLowerCase();
     const existing = this.positions.get(key);
@@ -704,6 +861,7 @@ export class LocalPositionModel {
       confidence: "low",
       isFullySeeded: false,
       lastConfirmedBlock: 0n,
+      seededAtBlock: 0n,
       lastActivityBlock: blockNumber,
       eModeCategoryId: 0,
     };
@@ -903,6 +1061,34 @@ function collectPositionAssets(position: UserPosition): Address[] {
   return assets;
 }
 
+function assertReserveDecimals(decimals: number, asset: Address): number {
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) {
+    throw new Error(`invalid_reserve_decimals:${asset}:${decimals}`);
+  }
+  return decimals;
+}
+
+function requireReserveDecimals(reserve: ReserveConfig): number {
+  if (reserve.decimals === undefined) {
+    throw new Error(`missing_reserve_decimals:${reserve.asset}`);
+  }
+  return reserve.decimals;
+}
+
+function collectMissingDecimalsAssets(
+  position: UserPosition,
+  reserveConfig: ReadonlyMap<string, ReserveConfig>,
+): Address[] {
+  const missing: Address[] = [];
+  for (const assetKey of collectPositionAssets(position)) {
+    const reserve = reserveConfig.get(assetKey.toLowerCase());
+    if (reserve === undefined || reserve.decimals === undefined) {
+      missing.push(assetKey);
+    }
+  }
+  return missing;
+}
+
 function collectMissingPriceAssets(
   position: UserPosition,
   input: PegReferenceHealthInput,
@@ -964,6 +1150,23 @@ function resolveUserAddress(event: ParsedAavePoolEvent): Address | undefined {
     return undefined;
   }
   return raw;
+}
+
+function isBalanceMutatingPoolEvent(name: ParsedAavePoolEvent["name"]): boolean {
+  switch (name) {
+    case "Supply":
+    case "Withdraw":
+    case "Borrow":
+    case "Repay":
+    case "LiquidationCall":
+      return true;
+    case "ReserveDataUpdated":
+      return false;
+    default: {
+      const _exhaustive: never = name;
+      return _exhaustive;
+    }
+  }
 }
 
 function positionTouchesAsset(position: UserPosition, asset: Address): boolean {

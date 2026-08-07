@@ -224,7 +224,12 @@ export async function refreshGapFillPrices(input: {
   readonly logger: LoggerLike;
   readonly oracle?: Address;
   readonly nowSec?: number;
-}): Promise<{ refreshed: number; failed: readonly Address[]; targetCount: number }> {
+}): Promise<{
+  refreshed: number;
+  failed: readonly Address[];
+  targetCount: number;
+  refreshedAssets: readonly Address[];
+}> {
   const oracle = input.oracle ?? BASE_AAVE_ORACLE;
   const nowSec = input.nowSec ?? Math.floor(Date.now() / 1000);
   const assets = BASE_GAP_FILL_ASSETS.filter((asset) =>
@@ -236,7 +241,7 @@ export async function refreshGapFillPrices(input: {
       reason: "no_registered_gap_fill_reserves",
       targetCount: 0,
     });
-    return { refreshed: 0, failed: [], targetCount: 0 };
+    return { refreshed: 0, failed: [], targetCount: 0, refreshedAssets: [] };
   }
 
   input.logger.info("oracle_gap_fill_refresh_start", {
@@ -248,7 +253,7 @@ export async function refreshGapFillPrices(input: {
     const aaveAssets = assets.filter((asset) => !isUsdbcAsset(asset));
     const aavePrices = await fetchAaveAssetPrices(input.client, oracle, aaveAssets);
 
-    let refreshed = 0;
+    const refreshedAssets: Address[] = [];
     const failed: Address[] = [];
 
     for (const asset of aaveAssets) {
@@ -259,7 +264,7 @@ export async function refreshGapFillPrices(input: {
         continue;
       }
       registerAavePrice(input.model, asset, price, oracle, input.logger, nowSec);
-      refreshed += 1;
+      refreshedAssets.push(asset);
     }
 
     for (const asset of assets.filter(isUsdbcAsset)) {
@@ -271,7 +276,7 @@ export async function refreshGapFillPrices(input: {
       const healthyPegPrice = pegUsdbcPriceFromHealthyReference(healthInput);
       if (healthyPegPrice !== undefined) {
         registerPegPrice(input.model, asset, healthyPegPrice, BASE_USDC, input.logger, nowSec);
-        refreshed += 1;
+        refreshedAssets.push(asset);
         continue;
       }
       const usdcPrice = input.model.prices.get(BASE_USDC.toLowerCase());
@@ -293,19 +298,24 @@ export async function refreshGapFillPrices(input: {
         });
       }
       registerPegPrice(input.model, asset, pegPrice, BASE_USDC, input.logger, nowSec);
-      refreshed += 1;
+      refreshedAssets.push(asset);
     }
 
     input.logger.info("oracle_gap_fill_refresh_complete", {
-      refreshed,
+      refreshed: refreshedAssets.length,
       failedCount: failed.length,
       targetCount: assets.length,
       failed: failed.slice(0, 20),
     });
-    return { refreshed, failed, targetCount: assets.length };
+    return {
+      refreshed: refreshedAssets.length,
+      failed,
+      targetCount: assets.length,
+      refreshedAssets,
+    };
   } catch (error) {
     input.logger.warn("oracle_gap_fill_refresh_failed", { error: String(error) });
-    return { refreshed: 0, failed: assets, targetCount: assets.length };
+    return { refreshed: 0, failed: assets, targetCount: assets.length, refreshedAssets: [] };
   }
 }
 

@@ -9,7 +9,7 @@ export const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11" a
 // https://docs.chain.link/data-feeds/l2-sequencer-feeds
 export const BASE_SEQUENCER_UPTIME_FEED = "0xBCF85224fc0756B9Fa45aA7892530B47e10b6433" as const;
 
-export const BASE_PROTOCOL_DATA_PROVIDER = "0x2d8A3C5677189723C4cB8873CfC9C8976dfe292C" as const;
+export const BASE_PROTOCOL_DATA_PROVIDER = "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A" as const;
 
 // Keyed by Chainlink aggregator address (lowercase lookup at runtime).
 // Heartbeat in seconds. Default 3600s + WARN log for unknown feeds.

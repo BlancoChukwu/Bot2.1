@@ -37,6 +37,8 @@ export interface WsEventLayerConfig {
   readonly onEvent: (event: ParsedIngestionEvent) => void | Promise<void>;
   readonly onFlashblockTick: (blockNumber: bigint) => void | Promise<void>;
   readonly onGapFillComplete?: () => void;
+  readonly onWsDisconnected?: () => void;
+  readonly onWsReconnected?: (meta: { readonly downtimeMs: number | undefined }) => void;
 }
 
 export class WsEventLayer {
@@ -45,6 +47,8 @@ export class WsEventLayer {
   private seenOrder: string[] = [];
   private started = false;
   private lastFlashblockBlock = 0n;
+  private wsEverConnected = false;
+  private disconnectedAtMs: number | undefined;
 
   public constructor(private readonly config: WsEventLayerConfig) {}
 
@@ -79,9 +83,23 @@ export class WsEventLayer {
         void this.config.onFlashblockTick(payload.blockNumber);
       },
       onDisconnect: () => {
+        this.disconnectedAtMs = Date.now();
         this.config.logger.warn("ws_event_layer_disconnected", { chain: this.config.chain });
+        this.config.onWsDisconnected?.();
       },
       onConnect: () => {
+        const downtimeMs = this.disconnectedAtMs === undefined
+          ? undefined
+          : Date.now() - this.disconnectedAtMs;
+        if (this.wsEverConnected) {
+          this.config.logger.info("ws_event_layer_reconnected", {
+            chain: this.config.chain,
+            downtimeMs,
+          });
+          this.config.onWsReconnected?.({ downtimeMs });
+        }
+        this.wsEverConnected = true;
+        this.disconnectedAtMs = undefined;
         void this.runBootstrapOrGapFill();
       },
     });

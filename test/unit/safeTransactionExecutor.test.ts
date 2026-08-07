@@ -3,6 +3,7 @@ import { createAsset, createAssetAmount } from "../../src/utils/typedAssetMath";
 import { createBotMetrics, createLogger } from "../../src/bot";
 import { createChainRegistry } from "../../src/config/chainRegistry";
 import { LocalNonceManager } from "../../src/executors/nonceManager";
+import { InFlightExecutionRegistry } from "../../src/executors/inFlightExecutionRegistry";
 import {
   SafeTransactionExecutor,
   type ExecutionPreflightClient,
@@ -152,7 +153,31 @@ describe("SafeTransactionExecutor", () => {
     expect(sends).toBe(0);
   });
 
-  it("runs flash-loan preview simulation before final simulation when provided", async () => {
+  it("rejects when another liquidation is already in flight (single-opportunity)", async () => {
+    const inFlight = new InFlightExecutionRegistry();
+    inFlight.trackSubmitted("other-op", "0xdead");
+    const executor = new SafeTransactionExecutor({
+      registry: registry(),
+      router: { selectBestRoute: async () => routeSelected() },
+      nonceManager: new LocalNonceManager(),
+      client: {
+        estimateGas: async () => 900_000n,
+        getGasPrice: async () => 1_000_000_000n,
+        getPendingNonce: async () => 3,
+        simulateContract: async () => ({ success: true }),
+        send: async () => "0xabc",
+        waitForReceipt: async () => ({ status: "included" }),
+      },
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      inFlightRegistry: inFlight,
+    });
+
+    const result = await executor.execute(request());
+    expect(result).toEqual({ status: "rejected", reason: "single_opportunity_busy" });
+  });
+
+  it("runs flash-loan preview and final simulations when preview builder is provided", async () => {
     const calls: string[] = [];
     const req = {
       ...request(),
@@ -185,7 +210,59 @@ describe("SafeTransactionExecutor", () => {
     const result = await executor.execute(req);
 
     expect(result).toEqual({ status: "simulated" });
-    expect(calls).toEqual(["0x99", "0x1234"]);
+    // Both sims must run; order is nondeterministic under Promise.allSettled.
+    expect(calls).toHaveLength(2);
+    expect(calls).toEqual(expect.arrayContaining(["0x99", "0x1234"]));
+  });
+
+  it("runs flash-loan preview and final simulations concurrently (wall-clock ≈ max not sum)", async () => {
+    const delayMs = 50;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const started: string[] = [];
+    const req = {
+      ...request(),
+      buildFlashLoanPreviewTransaction: () => ({
+        to: "0x0000000000000000000000000000000000000003" as const,
+        data: "0x99" as const,
+        provider: "aaveV3" as const,
+      }),
+    };
+    const executor = new SafeTransactionExecutor({
+      registry: registry(),
+      router: { selectBestRoute: async () => routeSelected() },
+      nonceManager: new LocalNonceManager(),
+      client: {
+        estimateGas: async () => 900_000n,
+        getGasPrice: async () => 1_000_000_000n,
+        getPendingNonce: async () => 3,
+        simulateContract: async (transaction) => {
+          started.push(transaction.data);
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          inFlight -= 1;
+          return { success: true };
+        },
+        send: async () => "0xabc",
+        waitForReceipt: async () => ({ status: "included" }),
+      },
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      dryRunMode: true,
+    });
+
+    const wallStarted = Date.now();
+    const result = await executor.execute(req);
+    const elapsedMs = Date.now() - wallStarted;
+
+    expect(result).toEqual({ status: "simulated" });
+    expect(started).toHaveLength(2);
+    expect(started).toEqual(expect.arrayContaining(["0x99", "0x1234"]));
+    expect(maxInFlight).toBe(2);
+    // Sequential would be ~2*delayMs; concurrent should finish near one delay.
+    expect(elapsedMs).toBeGreaterThanOrEqual(delayMs);
+    expect(elapsedMs).toBeLessThan(delayMs * 2 - 10);
   });
 
   it("returns simulated without submitting when dry-run mode is enabled", async () => {

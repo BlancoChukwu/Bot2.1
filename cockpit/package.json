@@ -1,0 +1,32 @@
+{
+  "name": "liquidator-cockpit",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node ./node_modules/vite/bin/vite.js",
+    "build": "tsc -p tsconfig.app.json --noEmit && node ./node_modules/vite/bin/vite.js build",
+    "preview": "node ./node_modules/vite/bin/vite.js preview",
+    "tauri": "node ./node_modules/@tauri-apps/cli/tauri.js",
+    "tauri:dev": "node ./node_modules/@tauri-apps/cli/tauri.js dev",
+    "tauri:build": "node ./node_modules/@tauri-apps/cli/tauri.js build",
+    "launch": "powershell -ExecutionPolicy Bypass -File ../scripts/start-cockpit.ps1"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.5.0",
+    "@tauri-apps/plugin-dialog": "^2.2.1",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "uplot": "^1.6.32"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.11",
+    "@tauri-apps/cli": "^2.5.0",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "tailwindcss": "^4.1.11",
+    "typescript": "~5.8.3",
+    "vite": "^6.3.5"
+  }
+}

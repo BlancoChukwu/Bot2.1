@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Address } from "viem";
 import { createBotMetrics, createLogger } from "../../src/bot";
 import { createChainRegistry, type CircuitBreakerName, type CircuitBreakerState } from "../../src/config/chainRegistry";
 import { PipelineDeadLetterQueue, PipelineOrchestrator, type PipelineDetection } from "../../src/orchestrator/pipelineOrchestrator";
 import { ReserveAwareBorrowerCache, type BorrowerSnapshot } from "../../src/monitors/reserveAwareBorrowerCache";
+import { StalenessGuard } from "../../src/monitors/stalenessGuard";
 import type { SafeExecutionRequest, SafeExecutionResult } from "../../src/executors/safeTransactionExecutor";
 import { createAsset, createAssetAmount } from "../../src/utils/typedAssetMath";
 
@@ -466,5 +467,71 @@ describe("PipelineOrchestrator", () => {
     await orchestrator.runLoop({ pollIntervalMs: 0, signal: controller.signal });
 
     expect(cycles).toBe(3);
+  });
+
+  it("pages after N consecutive watchlist critical cycles", async () => {
+    vi.useFakeTimers();
+    const guard = new StalenessGuard(1_000);
+    guard.record();
+    vi.advanceTimersByTime(3_500);
+
+    const cache = new ReserveAwareBorrowerCache();
+    const alerts: Array<{ consecutive: number; ageMs: number }> = [];
+    const orchestrator = new PipelineOrchestrator({
+      registry: registry(),
+      detection: detection(cache),
+      executor: {
+        execute: async () => ({ status: "sent", txHash: "0xabc" }),
+      },
+      deadLetters: new PipelineDeadLetterQueue(),
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      watchlistStaleness: guard,
+      watchlistCriticalAlertCycles: 2,
+      onWatchlistStaleCritical: (input) => {
+        alerts.push(input);
+      },
+      buildExecutionRequest: (candidate) => requestFor(candidate.account),
+    });
+
+    await orchestrator.runOnce();
+    await orchestrator.runOnce();
+
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.consecutive).toBe(2);
+    vi.useRealTimers();
+  });
+
+  it("bypasses critical staleness when event-purity health predicate is true", async () => {
+    vi.useFakeTimers();
+    const guard = new StalenessGuard(1_000);
+    guard.record();
+    vi.advanceTimersByTime(3_500);
+
+    const cache = new ReserveAwareBorrowerCache();
+    cache.upsert(snapshot());
+    const executed: SafeExecutionRequest[] = [];
+    const orchestrator = new PipelineOrchestrator({
+      registry: registry(),
+      detection: detection(cache),
+      executor: {
+        execute: async (request) => {
+          executed.push(request);
+          return { status: "sent", txHash: "0xabc" };
+        },
+      },
+      deadLetters: new PipelineDeadLetterQueue(),
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      watchlistStaleness: guard,
+      eventPurityStalenessBypass: () => true,
+      buildExecutionRequest: (candidate) => requestFor(candidate.account),
+    });
+
+    const summary = await orchestrator.runOnce();
+
+    expect(summary.sent).toBe(1);
+    expect(executed).toHaveLength(1);
+    vi.useRealTimers();
   });
 });

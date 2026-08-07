@@ -14,9 +14,8 @@ module.exports = {
       merge_logs: false,
       out_file: process.env.BOT_LOGFILE,
       error_file: process.env.BOT_ERRFILE,
-      // Fine while ENABLE_LIVE_TX=false; before live tx, confirm shutdown.addHook chain
-      // (checkpoint close, in-flight execution drain) completes within this window.
-      kill_timeout: 15_000,
+      // Live-tx: in-flight drain bound is 60s; kill_timeout must exceed that with slack.
+      kill_timeout: 75_000,
       env: {
         NODE_ENV: "production",
       },

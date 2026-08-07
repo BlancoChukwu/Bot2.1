@@ -5,6 +5,7 @@ cd "$ROOT"
 
 echo "Aave V3 — EVENT-PURITY PRODUCTION (live)"
 echo "Profile: .env.event-purity-production"
+echo "WARNING: Requires deployed v5 receiver + dry-run receipt within 15 minutes"
 if [[ ! -f "$ROOT/.env.event-purity-production" ]]; then
   echo "Missing .env.event-purity-production — run: npm run env:bootstrap"
   exit 1

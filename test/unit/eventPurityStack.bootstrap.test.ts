@@ -82,4 +82,36 @@ describe("EventPurityStack bootstrap gating", () => {
 
     expect(enqueueSpy).toHaveBeenCalledWith(user);
   });
+
+  it("enqueues confirmations for liquidatable tier (not only urgent/watch)", async () => {
+    const purity = parseEventPurityConfig({});
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const client = {} as PublicClient;
+    const stack = new EventPurityStack({
+      chain: "base",
+      poolAddress: pool,
+      ingestionWsUrl: "wss://example.invalid",
+      executionClient: client,
+      feedRegistry: makeRegistry(),
+      purity,
+      logger,
+    });
+
+    stack.model.markPricesBootstrapped();
+    const enqueueSpy = vi.spyOn(stack.confirmQueue, "enqueueUrgent");
+    vi.spyOn(stack.confirmQueue, "flushUrgent").mockResolvedValue([]);
+    const change = {
+      account: user,
+      tier: "liquidatable" as const,
+      localHfWad: 944_000_000_000_000_000n,
+      isNew: false,
+      isFullySeeded: true,
+    };
+
+    await (stack as unknown as {
+      handleTierChanges: (changes: typeof change[], blockNumber: bigint) => Promise<void>;
+    }).handleTierChanges([change], 100n);
+
+    expect(enqueueSpy).toHaveBeenCalledWith(user);
+  });
 });

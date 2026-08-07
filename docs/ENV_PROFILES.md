@@ -79,22 +79,28 @@ npm run env:merge-example -- --target .env.event-purity-production
 
 Launchers run `scripts/preflight-event-purity-env.mjs` (requires `WS_RPC_URL_PRIMARY`, execution RPC, `FLASHBLOCKS_ENABLED=true`).
 
-## Recommended VM run (Jun 2026 — revised-live-bot)
+## Recommended VM run (Jul 2026 — feat/receiver-v5 branch)
 
-Shadow soak after oracle + USDbC peg fixes:
+Shadow soak first (safe; no live transactions):
 
 | Item | Value |
 | --- | --- |
 | Env file | `.env.event-purity-soak` |
 | Starter | `./start-event-purity-soak.sh` |
-| Branch | `revised-live-bot` (tip ≥ `153837dc`) |
+| Branch | `feat/receiver-v5-oracle-floor-quote-estimator` (or your checked-out tip) |
 | Mode | `SIMULATION_MODE=true`, `ENABLE_LIVE_TX=false`, `RPC_BUDGET_MODE=true` |
+| Receiver | `LIQUIDATION_RECEIVER_EXPECTED_VERSION=5` |
+| Swap fee | Leave `LIQUIDATION_SWAP_POOL_FEE` **unset** (per-pair map) |
+| Slippage | `LIQUIDATION_SWAP_SLIPPAGE_BPS=200` |
 | Oracle feeds | `PRICE_FEED_REGISTRY_JSON` **empty** (canonical USDC/WETH/cbBTC) |
 | Peg tuning | `PEG_DERIVATION_FRESHNESS_MULTIPLIER=2.5` (optional env override) |
 
 ```bash
-git fetch origin && git checkout revised-live-bot && git pull
-npm run env:merge-example -- --target .env.event-purity-soak   # adds new template keys only
+git fetch origin
+git checkout feat/receiver-v5-oracle-floor-quote-estimator
+git pull --ff-only
+npm run env:merge-example -- --target .env.event-purity-soak
+npm run env:sync-receiver-v5
 # Edit secrets/RPC in .env.event-purity-soak if needed (file is gitignored)
 chmod +x start-event-purity-soak.sh scripts/launcher-run-bot-detached.sh watch-bot.sh
 ./start-event-purity-soak.sh
@@ -103,6 +109,13 @@ tail -f logs/event-purity-soak-*.log
 
 Soak success signals: `usdbc_healthy_peg_materialized_from_usdc`, USDbC absent from `hf_price_gap_summary` gaps, no `price_oracle_invalid_feed_address`.
 
-Live after soak: `.env.event-purity-production` + `./start-event-purity-production.sh` (`RPC_BUDGET_MODE=false`, `ENABLE_LIVE_TX=true`, run `npm run dry-run:receipt:event-purity-production` first).
+**Do not start live** until: (1) 48h soak is clean, (2) v5 `LiquidationFlashReceiver` is deployed and set in `.env.event-purity-production`, (3) Sepolia/funding gates your team requires are done. Then:
+
+```bash
+npm run env:merge-example -- --target .env.event-purity-production
+npm run env:sync-receiver-v5
+npm run dry-run:receipt:event-purity-production
+./start-event-purity-production.sh   # within 15 minutes of the receipt
+```
 
 Legacy `.env` remains a convenience copy; launchers do **not** load it unless you set `DOTENV_CONFIG_PATH` manually.

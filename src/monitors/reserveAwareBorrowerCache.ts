@@ -1,4 +1,9 @@
 import type { Address } from "viem";
+import {
+  applyCloseFactorToDebtWei,
+  applyCloseFactorToUsd,
+  resolveCloseFactorBps,
+} from "../config/closeFactor";
 import type { SupportedChain } from "../config/chains";
 import type { LiquidationCandidate } from "../protocols/aaveV3";
 import {
@@ -155,16 +160,28 @@ function toCandidates(snapshot: BorrowerSnapshot): LiquidationCandidate[] {
     return [];
   }
 
+  const collateralUsd = collaterals.reduce(
+    (sum, reserve) => sum + toDecimalNumber(quoteReserveCollateral(reserve)),
+    0,
+  );
+
   return debts.map((debtReserve) => {
     const debt = totalDebt(debtReserve);
+    const fullDebtUsd = toDecimalNumber(convertToQuote(debt, debtReserve.priceInQuote));
+    const closeFactorBps = resolveCloseFactorBps({
+      healthFactorWad: snapshot.healthFactor,
+      collateralUsd,
+      debtUsd: fullDebtUsd,
+    });
     return {
       account: snapshot.account,
       collateralAsset: bestCollateral.assetAddress,
       debtAsset: debtReserve.assetAddress,
-      debtToCover: debt.raw,
-      repayValueUsd: toDecimalNumber(convertToQuote(debt, debtReserve.priceInQuote)),
+      debtToCover: applyCloseFactorToDebtWei(debt.raw, closeFactorBps),
+      repayValueUsd: applyCloseFactorToUsd(fullDebtUsd, closeFactorBps),
       liquidationBonusBps: bestCollateral.liquidationBonusBps,
       healthFactor: snapshot.healthFactor,
+      closeFactorBps,
     };
   });
 }

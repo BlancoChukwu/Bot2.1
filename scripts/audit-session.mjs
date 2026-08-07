@@ -5,6 +5,7 @@
 import { config } from "dotenv";
 import { readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { rssGrowthMbPerHour, rssGrowthMbPerHourFullWindow } from "./rssGrowth.mjs";
 
 config({ path: join(process.cwd(), ".env") });
 
@@ -212,7 +213,7 @@ const metrics = [
     id: 8,
     name: "memory_rss_growth_rate",
     pass: rssGrowthMbPerHour(rssSamples) < maxRssGrowthMbPerHour,
-    detail: `${rssGrowthMbPerHour(rssSamples).toFixed(2)} MB/hour (limit < ${maxRssGrowthMbPerHour} MB/hour)`,
+    detail: `${rssGrowthMbPerHour(rssSamples).toFixed(2)} MB/hour post-warmup (full-window ${rssGrowthMbPerHourFullWindow(rssSamples).toFixed(2)}; limit < ${maxRssGrowthMbPerHour} MB/hour)`,
   },
   {
     id: 5,
@@ -234,20 +235,9 @@ const audit = {
   notes: [
     "flash_loan_route_selected should stay 0 during shadow validation (no preview storm)",
     "critical_errors (level 50) should stay 0",
+    "RSS growth uses post-warmup window (skip first 30 minutes)",
   ],
 };
 
 console.log(JSON.stringify(audit, null, 2));
 
-function rssGrowthMbPerHour(samples) {
-  if (samples.length < 2) {
-    return 0;
-  }
-  const first = samples[0];
-  const last = samples[samples.length - 1];
-  const elapsedHours = (last.timeMs - first.timeMs) / 3_600_000;
-  if (!Number.isFinite(elapsedHours) || elapsedHours <= 0) {
-    return 0;
-  }
-  return (last.rssMb - first.rssMb) / elapsedHours;
-}

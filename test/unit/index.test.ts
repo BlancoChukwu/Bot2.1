@@ -119,7 +119,7 @@ describe("parseRuntimeConfig", () => {
         PRICE_FEED_REGISTRY_JSON: JSON.stringify({
           base: {
             "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913": {
-              feed: "0x2d8A3C5677189723C4cB8873CfC9C8976dfe292C",
+              feed: "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A",
               priceDecimals: 8,
             },
             "0x4200000000000000000000000000000000000006": {

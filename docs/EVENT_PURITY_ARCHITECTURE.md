@@ -51,3 +51,37 @@
 - `rpc_pending_getlogs_total == 0`
 - `position_cache_size` stable with meaningful bootstrap coverage %
 - Review eMode bucket volume/drift — pull full eMode LT math to P0 if material
+
+## Tiered pre-stage (Stages A–C)
+
+### Config knobs
+
+| Env | Default | Notes |
+|---|---|---|
+| `PRESTAGE_ENABLED` | true when `USE_EVENT_WATCHLIST=true` | Prep-only; never speculative submit |
+| `PRESTAGE_HF_UPPER` | `1.02` | Band upper (inclusive) above HF 1.0 |
+| `PRESTAGE_TOP_N` | `10` | Full Quoter/encode only for top-N |
+| `PRESTAGE_TTL_MS` | `15000` | Payload TTL |
+| `PRESTAGE_MIN_REFRESH_INTERVAL_MS` | `1500` | Per-account refresh backstop |
+| `LIQUIDATION_SWAP_SLIPPAGE_BPS` | `200` | Shared oracle-floor **and** prestage price-invalidate threshold |
+
+### Close-factor SSoT
+
+`resolveCloseFactorBps` in `src/config/closeFactor.ts`: 100% if HF ≤ 0.95 **or** collateral/debt &lt; $2000; else 50%. Applied at `createReserveAwareCandidates`; `eligibleCandidate` never double-haircuts.
+
+### Verify greps
+
+```bash
+rg 'pipeline_cycle_sample' logs/… | rg debtUsd
+rg 'evUncapped' logs/… | rg evCapped
+rg '"msg":"prestage_enter"' logs/…
+rg '"msg":"prestage_promote_to_hot".*"cacheHit":true' logs/…
+rg '"msg":"prestage_send".*"reusedPayload":true' logs/…
+rg shadow_validation_aggregate logs/… | rg 'shadow_drift_fresh|shadow_drift_stale'
+```
+
+### Pinned fork fixture (Stage B merge blocker)
+
+- File: `test/fixtures/historical-liquidation-base.json`
+- Block `46925615` / snapshot `46925614` / user `0x4118BB35A8068732da2c4fb49b12AbA59D39Adec`
+- Test: `test/integration/prestageHistoricalLiquidation.fork.test.ts` — enter → promote → encode with CF + capped `debtToCover`

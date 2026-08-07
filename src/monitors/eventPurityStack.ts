@@ -22,13 +22,26 @@ import { TieredConfirmQueue, type ConfirmResult } from "./tieredConfirmQueue";
 import { WsEventLayer } from "./wsEventLayer";
 import type { ParsedIngestionEvent } from "./aaveEventParser";
 import { runPartialBootstrapSweep, type PartialBootstrapCoverage } from "./partialBootstrapSweep";
+import { computeLivePositionCoveragePct } from "./livePositionCoverage";
 import { createBootstrapLogClients } from "./bootstrapRpcClients";
 import { setBootstrapRuntimeStatus } from "../runtime/bootstrapRuntimeStatus";
 import { pollLocalFeedFreshness } from "./localFeedFreshnessPoll";
 import { reconcileAndSeedPosition } from "./positionOnChainReconcile";
+import {
+  reconcileFirstTouchWithRetry,
+  type NeedsManualReconcileEntry,
+} from "./firstTouchReconcile";
 import { bootstrapAaveOracleGapFill, refreshGapFillPrices } from "../oracle/aaveOraclePrice";
+import {
+  collectEventReserveAssets,
+  hydrateReserveDecimals,
+} from "./reserveDecimals";
 import { aavePoolAbi } from "../protocols/aaveV3";
-import { poolEmodeAbi } from "./aaveEmode";
+import { parseEModeCategoryData, poolEmodeAbi } from "./aaveEmode";
+import {
+  decodeLiquidationThresholdBps,
+  parseReserveConfigurationData,
+} from "./reserveConfiguration";
 
 const WAD = 1_000_000_000_000_000_000n;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -107,17 +120,6 @@ function parseFeedDecimals(result: unknown): number | undefined {
   }
   if (typeof result === "bigint") {
     return Number(result);
-  }
-  return undefined;
-}
-
-function parseLiquidationBonus(result: unknown): bigint | undefined {
-  if (typeof result === "object" && result !== null && "liquidationBonus" in result) {
-    const bonus = (result as { liquidationBonus: unknown }).liquidationBonus;
-    return typeof bonus === "bigint" ? bonus : undefined;
-  }
-  if (Array.isArray(result) && typeof result[3] === "bigint") {
-    return result[3];
   }
   return undefined;
 }
@@ -213,6 +215,7 @@ function registerFeedIfWarm(input: {
     updatedAt,
     feedAddress: feedAddr,
     asset: assetAddr,
+    source: "chainlink",
   });
   bootstrappedPrices.set(assetAddr, { feed: feedAddr, price: normalizedPrice, decimals });
 
@@ -239,7 +242,31 @@ export interface EventPurityStackConfig {
     readonly account: Address;
     readonly confirmed: ConfirmResult;
   }) => void | Promise<void>;
+  /**
+   * Full-entry prestage invalidation. account undefined = clear all.
+   * bumpSource must match PrestageBumpSource literals.
+   */
+  readonly onPrestageInvalidate?: (
+    account: Address | undefined,
+    bumpSource:
+      | "Borrow"
+      | "Repay"
+      | "LiquidationCall"
+      | "ReserveIndexUpdate"
+      | "OracleFeedSwitch"
+      | "OraclePriceMove"
+      | "ConfigReload"
+      | "TtlExpiry"
+      | "Manual"
+      | "PromoteFail",
+  ) => void;
+  /** Opportunistic prestage tick (isolated by caller). */
+  readonly onPrestageTick?: () => void;
   readonly onBlockObserved?: (blockNumber: bigint) => void;
+  readonly onWsDisconnected?: () => void;
+  readonly onWsReconnected?: (meta: { readonly downtimeMs: number | undefined }) => void;
+  /** Test seam for first-touch reconcile backoff. */
+  readonly sleepMs?: (ms: number) => Promise<void>;
 }
 
 export class EventPurityStack {
@@ -254,9 +281,15 @@ export class EventPurityStack {
   private bootstrapCoveragePct: number | undefined;
   private bootstrapStatus: PartialBootstrapCoverage | undefined;
   private pricesBootstrapped = false;
+  private readonly needsManualReconcile = new Map<string, NeedsManualReconcileEntry>();
 
   public isPricesBootstrapped(): boolean {
     return this.pricesBootstrapped;
+  }
+
+  /** Dead-lettered first-touch accounts awaiting manual / later reconcile. */
+  public getNeedsManualReconcile(): ReadonlyMap<string, NeedsManualReconcileEntry> {
+    return this.needsManualReconcile;
   }
 
   public constructor(private readonly config: EventPurityStackConfig) {
@@ -322,6 +355,7 @@ export class EventPurityStack {
       if (coverage.cacheHit) {
         await this.refreshReserveIndices();
       }
+      await this.hydrateAllReserveDecimals();
     } else {
       this.config.logger.info("partial_bootstrap_skipped", {
         reason: "BOOTSTRAP_ENABLED=false",
@@ -340,6 +374,7 @@ export class EventPurityStack {
         failed: gapFill.failed,
       });
     }
+    await this.hydrateAllReserveDecimals();
     this.pricesBootstrapped = bootstrapResult.pricesBootstrapped;
 
     const head = await this.config.executionClient.getBlockNumber();
@@ -358,6 +393,12 @@ export class EventPurityStack {
       bootstrapFromBlock: this.config.bootstrapFromBlock ?? bootstrapFromBlock,
       onEvent: (event) => this.handleEvent(event),
       onFlashblockTick: (blockNumber) => this.handleFlashblockTick(blockNumber),
+      ...(this.config.onWsDisconnected === undefined
+        ? {}
+        : { onWsDisconnected: () => this.config.onWsDisconnected?.() }),
+      ...(this.config.onWsReconnected === undefined
+        ? {}
+        : { onWsReconnected: (meta) => this.config.onWsReconnected?.(meta) }),
     });
     await this.wsLayer.start();
   }
@@ -418,6 +459,7 @@ export class EventPurityStack {
       refreshed: result.refreshed,
       failedCount: result.failed.length,
       targetCount: result.targetCount,
+      refreshedAssetCount: result.refreshedAssets.length,
     });
     if (result.failed.length > 0) {
       this.config.logger.warn("oracle_gap_fill_refresh_partial", {
@@ -425,6 +467,13 @@ export class EventPurityStack {
         failedCount: result.failed.length,
         failed: result.failed,
       });
+    }
+    // Close the write-gap: prices/feedStates were updated by registerAavePrice, but tiers
+    // only recompute on TierChange. Force HF recompute for positions touching refreshed assets.
+    if (result.refreshedAssets.length > 0) {
+      const changes = this.model.recomputeTiersForAssets(result.refreshedAssets);
+      const head = await this.config.executionClient.getBlockNumber().catch(() => 0n);
+      await this.handleTierChanges(changes, head);
     }
   }
 
@@ -457,48 +506,72 @@ export class EventPurityStack {
     }
     if (event.kind === "chainlink_price") {
       const changes = this.model.applyPriceEvent(event);
+      this.config.onPrestageInvalidate?.(undefined, "OraclePriceMove");
       await this.handleTierChanges(changes, event.meta.blockNumber);
       return;
     }
+    await hydrateReserveDecimals({
+      client: this.config.executionClient,
+      model: this.model,
+      assets: collectEventReserveAssets(event),
+      logger: this.config.logger,
+    });
     const result = this.model.applyAaveEvent(event);
+    this.notifyPrestagePoolEvent(event);
     if (result.firstTouchReconcile !== undefined) {
       await this.reconcileFirstTouch(result.firstTouchReconcile, event.meta.blockNumber);
     }
     await this.handleTierChanges(result.changes, event.meta.blockNumber);
   }
 
+  private notifyPrestagePoolEvent(event: Extract<ParsedIngestionEvent, { kind: "aave_pool" }>): void {
+    const name = event.name;
+    if (name === "Borrow" || name === "Repay" || name === "LiquidationCall") {
+      const account = event.user;
+      if (account !== undefined) {
+        this.config.onPrestageInvalidate?.(account, name);
+      }
+      return;
+    }
+    if (name === "ReserveDataUpdated") {
+      this.config.onPrestageInvalidate?.(undefined, "ReserveIndexUpdate");
+    }
+  }
+
   private async reconcileFirstTouch(account: Address, blockNumber: bigint): Promise<void> {
     const chainConfig = getChainConfig(this.config.chain);
-    const seeded = await reconcileAndSeedPosition({
-      client: this.config.executionClient,
-      model: this.model,
-      poolAddress: this.config.poolAddress,
-      poolAddressesProvider: chainConfig.aave.poolAddressesProvider,
-      uiPoolDataProvider: chainConfig.aave.uiPoolDataProvider,
+    const terminal = await reconcileFirstTouchWithRetry({
+      chain: this.config.chain,
       account,
       blockNumber,
       logger: this.config.logger,
-      ...(this.config.reserveAllowlist === undefined
-        ? {}
-        : { reserveAllowlist: this.config.reserveAllowlist }),
-    });
-    if (seeded) {
-      this.config.logger.info("position_first_touch_reconciled", {
-        chain: this.config.chain,
+      needsManualReconcile: this.needsManualReconcile,
+      removePartialPosition: () => {
+        this.model.removePosition(account);
+      },
+      attemptReconcile: () => reconcileAndSeedPosition({
+        client: this.config.executionClient,
+        model: this.model,
+        poolAddress: this.config.poolAddress,
+        poolAddressesProvider: chainConfig.aave.poolAddressesProvider,
+        uiPoolDataProvider: chainConfig.aave.uiPoolDataProvider,
         account,
-        blockNumber: Number(blockNumber),
-      });
+        blockNumber,
+        logger: this.config.logger,
+        ...(this.config.reserveAllowlist === undefined
+          ? {}
+          : { reserveAllowlist: this.config.reserveAllowlist }),
+      }),
+      ...(this.config.sleepMs === undefined ? {} : { sleepMs: this.config.sleepMs }),
+    });
+
+    if (terminal.status === "seeded") {
+      await this.hydrateAllReserveDecimals();
       const change = this.model.tierChangeForAccount(account, true);
       if (change !== undefined && this.model.isPricesBootstrapped()) {
         await this.handleTierChanges([change], blockNumber);
       }
-      return;
     }
-    this.config.logger.info("position_first_touch_reconcile_skipped", {
-      chain: this.config.chain,
-      account,
-      blockNumber: Number(blockNumber),
-    });
   }
 
   private async handleTierChanges(
@@ -523,7 +596,8 @@ export class EventPurityStack {
       }
       if (change.isNew && change.tier !== "healthy") {
         this.confirmQueue.enqueueUrgent(change.account);
-      } else if (change.tier === "urgent") {
+      } else if (change.tier === "urgent" || change.tier === "liquidatable") {
+        // liquidatable must confirm+exec — shadow alone does not feed the pipeline
         this.confirmQueue.enqueueUrgent(change.account);
       } else if (change.tier === "watch") {
         this.confirmQueue.enqueueWatch(change.account);
@@ -563,11 +637,24 @@ export class EventPurityStack {
     this.flashblockTickCount += 1n;
     if (this.flashblockTickCount % 1_800n === 0n) {
       this.shadow.logMetricsSnapshot("flashblock_interval");
+      const positionCacheSize = this.model.size();
+      const usersSeeded = this.bootstrapStatus?.usersSeeded ?? 0;
+      const hardCap = this.config.purity.positionCacheHardCap;
+      const livePositionCoveragePct = computeLivePositionCoveragePct(
+        positionCacheSize,
+        usersSeeded,
+      );
       this.config.logger.info("event_purity_runtime_snapshot", {
-        position_cache_size: this.model.size(),
-        bootstrap_coverage_pct: this.bootstrapCoveragePct,
+        position_cache_size: positionCacheSize,
+        // Historical bootstrap debtor ratio (withDebt/discovered) — frozen at boot.
+        bootstrap_debtor_coverage_pct_at_boot: this.bootstrapCoveragePct,
+        // Live gauge: recomputed every snapshot from cache size / usersSeeded.
+        bootstrap_coverage_pct: livePositionCoveragePct,
+        live_position_coverage_pct: livePositionCoveragePct,
+        position_cache_hard_cap: hardCap,
+        position_cache_at_hard_cap: positionCacheSize >= hardCap,
         bootstrapSource: this.bootstrapStatus?.discoverySource,
-        usersSeeded: this.bootstrapStatus?.usersSeeded,
+        usersSeeded,
         shadow_false_negative_total: this.shadow.getFalseNegativeTotal(),
         blockNumber: Number(blockNumber),
       });
@@ -583,6 +670,8 @@ export class EventPurityStack {
     this.indexRefreshInFlight = true;
     try {
       await this.refreshReserveIndices();
+      this.config.onPrestageInvalidate?.(undefined, "ReserveIndexUpdate");
+      this.config.onPrestageTick?.();
       await this.checkpoint?.saveLastProcessedBlock(blockNumber);
     } finally {
       this.indexRefreshInFlight = false;
@@ -622,11 +711,34 @@ export class EventPurityStack {
           functionName: "getReserveData",
           args: [reserve.asset],
         });
+        const configuration = BigInt(data[0]);
+        const configLt = decodeLiquidationThresholdBps(configuration);
+        let liquidationThresholdBps = reserve.liquidationThresholdBps;
+        if (configLt > 0n) {
+          if (
+            reserve.liquidationThresholdBps === 8500n
+            && configLt !== 8500n
+          ) {
+            // Still on registerReserve fallback — adopt on-chain config bits.
+            liquidationThresholdBps = configLt;
+          } else if (configLt !== reserve.liquidationThresholdBps) {
+            this.config.logger.warn("reserve_lt_config_mismatch", {
+              asset: reserve.asset,
+              pdpLt: reserve.liquidationThresholdBps.toString(),
+              configBitsLt: configLt.toString(),
+              preferred: "pdp",
+            });
+            // Prefer PDP-hydrated LT on mismatch.
+            liquidationThresholdBps = reserve.liquidationThresholdBps;
+          }
+        }
         this.model.reserveConfig.set(reserve.asset.toLowerCase(), {
           ...reserve,
+          liquidationThresholdBps,
           liquidityIndex: BigInt(data[1]),
           variableBorrowIndex: BigInt(data[3]),
           indexUpdatedAtBlock: 0n,
+          reserveId: Number(data[7]),
         });
       } catch (error) {
         this.config.logger.warn("reserve_index_refresh_failed", {
@@ -634,6 +746,76 @@ export class EventPurityStack {
           error: String(error),
         });
       }
+    }
+    await this.hydrateAllReserveDecimals();
+    await this.hydrateKnownEModeCategories();
+  }
+
+  private async hydrateKnownEModeCategories(): Promise<void> {
+    const categoryIds = new Set<number>();
+    for (const position of this.model.positions.values()) {
+      if (position.eModeCategoryId > 0) {
+        categoryIds.add(position.eModeCategoryId);
+      }
+    }
+    for (const categoryId of this.model.eModeCategories.keys()) {
+      categoryIds.add(categoryId);
+    }
+    // Probe common Base liquid-eMode ids when none known yet (cheap view calls).
+    if (categoryIds.size === 0) {
+      for (let id = 1; id <= 8; id += 1) {
+        categoryIds.add(id);
+      }
+    }
+    for (const categoryId of categoryIds) {
+      await this.hydrateEModeCategory(categoryId);
+    }
+  }
+
+  private async hydrateEModeCategory(categoryId: number): Promise<void> {
+    if (categoryId <= 0 || categoryId > 255) {
+      return;
+    }
+    try {
+      const [data, bitmap] = await Promise.all([
+        this.config.executionClient.readContract({
+          address: this.config.poolAddress,
+          abi: poolEmodeAbi,
+          functionName: "getEModeCategoryData",
+          args: [categoryId],
+        }),
+        this.config.executionClient.readContract({
+          address: this.config.poolAddress,
+          abi: poolEmodeAbi,
+          functionName: "getEModeCategoryCollateralBitmap",
+          args: [categoryId],
+        }),
+      ]);
+      const parsed = parseEModeCategoryData(categoryId, data, BigInt(bitmap));
+      if (parsed === undefined || parsed.liquidationThresholdBps === 0n) {
+        return;
+      }
+      this.model.setEModeCategory(parsed);
+    } catch (error) {
+      this.config.logger.warn("emode_category_hydrate_failed", {
+        categoryId,
+        error: String(error),
+      });
+    }
+  }
+
+  private async hydrateAllReserveDecimals(): Promise<void> {
+    const result = await hydrateReserveDecimals({
+      client: this.config.executionClient,
+      model: this.model,
+      logger: this.config.logger,
+    });
+    if (result.hydrated > 0 || result.failed.length > 0) {
+      this.config.logger.info("reserve_decimals_hydrate", {
+        hydrated: result.hydrated,
+        failedCount: result.failed.length,
+        failed: result.failed.slice(0, 20),
+      });
     }
   }
 
@@ -676,6 +858,7 @@ export class EventPurityStack {
           }
           const data = row.result as unknown as readonly [bigint, bigint, bigint, bigint, bigint, bigint];
           const emode = emodeResults[j];
+          const eModeCategoryId = emode?.status === "success" ? Number(emode.result) : 0;
           this.model.confirmOnChain(
             address,
             data[0],
@@ -683,8 +866,11 @@ export class EventPurityStack {
             data[3],
             data[5],
             blockNumber,
-            emode?.status === "success" ? Number(emode.result) : 0,
+            eModeCategoryId,
           );
+          if (eModeCategoryId > 0 && !this.model.eModeCategories.has(eModeCategoryId)) {
+            await this.hydrateEModeCategory(eModeCategoryId);
+          }
         }
       }
       this.config.logger.info("aggregate_refresh_complete", {
@@ -856,14 +1042,14 @@ export async function runOraclePriceBootstrap(
         input.model.setReserveLiquidationBonus(entry.asset, null);
         continue;
       }
-      const liquidationBonus = parseLiquidationBonus(response.result);
-      if (liquidationBonus === undefined) {
+      const parsed = parseReserveConfigurationData(response.result);
+      if (parsed === undefined) {
         input.logger.warn("RESERVE_CONFIG_FETCH_FAILED", { asset: entry.asset, reason: "parse_failed" });
         input.model.setReserveLiquidationBonus(entry.asset, null);
         continue;
       }
-      input.model.registerReserve(entry.asset);
-      input.model.setReserveLiquidationBonus(entry.asset, liquidationBonus);
+      input.model.registerReserve(entry.asset, parsed.liquidationThresholdBps);
+      input.model.setReserveLiquidationBonus(entry.asset, parsed.liquidationBonus);
       continue;
     }
 

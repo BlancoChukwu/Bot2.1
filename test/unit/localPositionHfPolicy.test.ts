@@ -25,6 +25,7 @@ function makePosition(overrides: Partial<UserPosition> = {}): UserPosition {
     confidence: "high",
     isFullySeeded: true,
     lastConfirmedBlock: 1n,
+    seededAtBlock: 1n,
     lastActivityBlock: 1n,
     eModeCategoryId: 0,
     lastTotalCollateralBase: 51_444n,

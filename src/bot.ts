@@ -103,6 +103,8 @@ export interface BotMetrics {
   recordOnChainLiquidatedByOther(chain: string, protocol: string, asset: string): void;
   recordDustFiltered(count?: number): void;
   recordCooldownBlock(count?: number): void;
+  recordCandidateRejectedQuoteFloorGate(count?: number): void;
+  recordQuoteGateUnavailable(count?: number): void;
   recordSubgraphLag?(blocksBehind: number): void;
   recordError(): void;
   recordLatency(stage: BotLatencyStage, durationSeconds: number, labels?: { readonly chain?: string }): void;
@@ -384,6 +386,16 @@ export function createBotMetrics(): BotMetrics {
     help: "Execution attempts blocked by post-dead-letter borrower cooldown",
     registers: [registry],
   });
+  const candidateRejectedQuoteFloorGateTotal = new client.Counter({
+    name: "candidate_rejected_quote_floor_gate_total",
+    help: "Liquidation candidates rejected because Quoter output was below the oracle-floor gate",
+    registers: [registry],
+  });
+  const quoteGateUnavailableTotal = new client.Counter({
+    name: "quote_gate_unavailable_total",
+    help: "Quote-floor gate skipped due to quote RPC failure or missing live price/decimals cache",
+    registers: [registry],
+  });
   const subgraphLagTotal = new client.Counter({
     name: "subgraph_lag_detected_total",
     help: "Borrower watchlist rescans that observed subgraph indexing lag",
@@ -510,6 +522,12 @@ export function createBotMetrics(): BotMetrics {
     },
     recordCooldownBlock(count = 1) {
       cooldownBlocksTotal.inc(count);
+    },
+    recordCandidateRejectedQuoteFloorGate(count = 1) {
+      candidateRejectedQuoteFloorGateTotal.inc(count);
+    },
+    recordQuoteGateUnavailable(count = 1) {
+      quoteGateUnavailableTotal.inc(count);
     },
     recordSubgraphLag(blocksBehind) {
       subgraphLagTotal.inc(Math.max(1, blocksBehind));

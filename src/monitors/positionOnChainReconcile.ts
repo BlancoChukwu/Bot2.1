@@ -21,25 +21,34 @@ export interface ParsedOnChainAccountSnapshot {
   readonly reserves: readonly OnChainReserveRow[];
 }
 
+export type ReconcileSeedOutcome =
+  | { readonly status: "seeded" }
+  | { readonly status: "benign_skip"; readonly reason: "no_debt" | "allowlist_miss" }
+  | { readonly status: "failed"; readonly error: string };
+
 export async function fetchOnChainAccountSnapshot(input: {
   readonly client: PublicClient;
   readonly poolAddress: Address;
   readonly poolAddressesProvider: Address;
   readonly uiPoolDataProvider: Address;
   readonly account: Address;
+  readonly blockNumber?: bigint;
 }): Promise<ParsedOnChainAccountSnapshot | undefined> {
+  const blockOpt = input.blockNumber === undefined ? {} : { blockNumber: input.blockNumber };
   const [accountResult, reserveResult] = await Promise.all([
     input.client.readContract({
       address: input.poolAddress,
       abi: aavePoolAbi,
       functionName: "getUserAccountData",
       args: [input.account],
+      ...blockOpt,
     }),
     input.client.readContract({
       address: input.uiPoolDataProvider,
       abi: uiPoolDataProviderAbi,
       functionName: "getUserReservesData",
       args: [input.poolAddressesProvider, input.account],
+      ...blockOpt,
     }),
   ]);
 
@@ -103,6 +112,11 @@ export function seedModelFromAccountSnapshot(
   });
 }
 
+/**
+ * Seed a live position from on-chain snapshot.
+ * Benign skips remove the partial position. Failures leave the model untouched
+ * so the caller can retry / dead-letter.
+ */
 export async function reconcileAndSeedPosition(input: {
   readonly client: PublicClient;
   readonly model: LocalPositionModel;
@@ -113,32 +127,37 @@ export async function reconcileAndSeedPosition(input: {
   readonly blockNumber: bigint;
   readonly reserveAllowlist?: readonly Address[];
   readonly logger: LoggerLike;
-}): Promise<boolean> {
+}): Promise<ReconcileSeedOutcome> {
   try {
+    // Pin eth_call to a fresh head so seededAtBlock matches snapshot state
+    // (do not use the triggering event block — call reads latest otherwise).
+    const seedBlock = await input.client.getBlockNumber();
     const snapshot = await fetchOnChainAccountSnapshot({
       client: input.client,
       poolAddress: input.poolAddress,
       poolAddressesProvider: input.poolAddressesProvider,
       uiPoolDataProvider: input.uiPoolDataProvider,
       account: input.account,
+      blockNumber: seedBlock,
     });
     if (snapshot === undefined) {
       input.model.removePosition(input.account);
-      return false;
+      return { status: "benign_skip", reason: "no_debt" };
     }
     if (input.reserveAllowlist !== undefined
       && input.reserveAllowlist.length > 0
       && !reservesTouchAllowlist(snapshot.reserves, input.reserveAllowlist)) {
       input.model.removePosition(input.account);
-      return false;
+      return { status: "benign_skip", reason: "allowlist_miss" };
     }
-    seedModelFromAccountSnapshot(input.model, snapshot, input.blockNumber);
-    return true;
+    seedModelFromAccountSnapshot(input.model, snapshot, seedBlock);
+    return { status: "seeded" };
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     input.logger.warn("position_on_chain_reconcile_failed", {
       account: input.account,
-      error: String(error),
+      error: message,
     });
-    return false;
+    return { status: "failed", error: message };
   }
 }
