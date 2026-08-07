@@ -61,7 +61,7 @@ describe("shadowValidator segmented metrics", () => {
     expect(snapshot.shadowDriftEModeBps).toBeGreaterThan(0);
     expect(snapshot.nonEMode.falseNegativeCount).toBe(1);
     expect(snapshot.eMode.falseNegativeCount).toBe(0);
-    expect(snapshot.tuningBucket).toBe("non_eMode");
+    expect(snapshot.tuningBucket).toBe("non_eMode_fresh");
   });
 
   it("logs aggregate fields with segmented metric names", async () => {
@@ -80,10 +80,12 @@ describe("shadowValidator segmented metrics", () => {
     expect(aggregateCall?.[1]).toMatchObject({
       shadow_drift_non_eMode_bps: expect.any(Number),
       shadow_drift_eMode_bps: expect.any(Number),
+      shadow_drift_fresh_bps: expect.any(Number),
+      shadow_drift_stale_bps: expect.any(Number),
       shadow_fn_rate_non_eMode_pct: expect.any(Number),
       shadow_fn_rate_eMode_pct: expect.any(Number),
       shadow_drift_by_asset: expect.any(Array),
-      tuningBucket: "non_eMode",
+      tuningBucket: "non_eMode_fresh",
     });
   });
 

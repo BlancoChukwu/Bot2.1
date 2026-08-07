@@ -61,6 +61,12 @@ import { EventPurityStack } from "./monitors/eventPurityStack";
 import { dedupeRpcUrls } from "./monitors/bootstrapRpcClients";
 import { getBootstrapRuntimeStatus } from "./runtime/bootstrapRuntimeStatus";
 import { parseEventPurityConfig, type EventPurityConfig } from "./config/eventPurityConfig";
+import { parsePrestageConfig } from "./config/prestageConfig";
+import {
+  PrestageController,
+  safePrestageInvalidate,
+  safePrestageTick,
+} from "./monitors/prestagePipeline";
 import {
   getDexesForChain,
   getEscapeHatchPairs,
@@ -101,7 +107,7 @@ import {
 import { PipelineDetectionAdapter } from "./orchestrator/pipelineDetectionAdapter";
 import { PipelineDeadLetterQueue, PipelineOrchestrator } from "./orchestrator/pipelineOrchestrator";
 import { BayesianHazardModel, NoRegretOpportunityRanker } from "./optimization/hazardPrediction";
-import { buildLiquidationCallParams, ViemAaveV3Protocol, type LiquidationCandidate } from "./protocols/aaveV3";
+import { aavePoolAbi, buildLiquidationCallParams, ViemAaveV3Protocol, type LiquidationCandidate } from "./protocols/aaveV3";
 import { FlashLoanProviderRouter } from "./profitability/flashLoanProviderRouter";
 import { ProfitabilityEngine } from "./profitability/profitabilityEngine";
 import { ReplayHarness } from "./backtesting/replayHarness";
@@ -1162,6 +1168,8 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
   let rpcHealthTimer: NodeJS.Timeout | undefined;
   let ammMirrorLogSource: AmmMirrorLogSource | undefined;
   let nearLiqAcceleratedPoller: NearLiquidationAcceleratedPoller | undefined;
+  let prestageController: PrestageController | undefined;
+  const prestageConfig = parsePrestageConfig(process.env as Record<string, string | undefined>);
   const eventPurityWsUrl = config.wsRpcUrlPrimary ?? config.wsRpcUrl;
   if (useEventWatchlist && config.flashblocksEnabled) {
     if (eventPurityWsUrl === undefined || eventPurityWsUrl.trim() === "") {
@@ -1224,11 +1232,29 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
           account: candidate.account,
           healthFactor: Number(candidate.confirmed.healthFactor) / 1e18,
         });
+
+        let promote:
+          | Awaited<ReturnType<PrestageController["promote"]>>
+          | undefined;
+        if (prestageController !== undefined) {
+          try {
+            promote = await prestageController.promote(candidate.account);
+          } catch (error) {
+            logger.warn("prestage_promote_failed_isolated", {
+              chain: config.chain,
+              account: candidate.account,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+
         if (!config.eventPurity.enableLiveTx) {
           logger.info("liquidatable_candidate_detected_gate_closed", {
             chain: config.chain,
             account: candidate.account,
             reason: "enable_live_tx_false",
+            prestageCacheHit: promote?.cacheHit ?? false,
+            reusedPayload: promote?.reusedPayload ?? false,
           });
           return;
         }
@@ -1237,11 +1263,60 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
             chain: config.chain,
             account: candidate.account,
             healthFactor: Number(candidate.confirmed.healthFactor) / 1e18,
+            prestageCacheHit: promote?.cacheHit ?? false,
+            reusedPayload: promote?.reusedPayload ?? false,
           });
           return;
         }
-        // Event-purity confirm does not populate ReserveAwareBorrowerCache by itself.
-        // Mirror near-liq: refresh+upsert the confirmed account, otherwise runOnce scans 0.
+
+        if (promote?.reusedPayload === true && promote.entry !== undefined) {
+          const entry = promote.entry;
+          const gasCostUsd = await resolveDynamicGasCostUsd();
+          const flashFeeBps = await resolveFlashLoanFeeBps();
+          const liqCandidate = {
+            account: entry.account,
+            collateralAsset: entry.collateralAsset,
+            debtAsset: entry.debtAsset,
+            debtToCover: entry.debtToCover,
+            repayValueUsd: entry.debtUsd * entry.closeFactorBps / 10_000,
+            liquidationBonusBps: 500,
+            healthFactor: candidate.confirmed.healthFactor,
+            closeFactorBps: entry.closeFactorBps,
+          };
+          const request = buildLiquidationExecutionRequest(config.chain, liqCandidate, {
+            account: account.address,
+            minProfitUsd: config.minProfitUsd,
+            gasCostUsd,
+            slippageBps: config.slippageBps,
+            minimumMarginBps: config.minProfitMarginBps,
+            flashFeeBps,
+            slippageBufferFloorBps: config.flashLoanSlippageFloorBps,
+            requireFlashLoanWrapper: true,
+            poolAddress: activePoolAddress,
+            advisoryMinDebtOut: entry.encodeInputs.minDebtOut,
+            swapFee: entry.fee,
+            ...(config.liquidationReceiverAddress === undefined
+              ? {}
+              : { flashLoanReceiverAddress: config.liquidationReceiverAddress }),
+          });
+          logger.info("prestage_send", {
+            chain: config.chain,
+            account: entry.account,
+            prepAtMs: promote.prepAtMs,
+            promoteAtMs: promote.promoteAtMs,
+            sendAtMs: Date.now(),
+            payloadAgeMs: promote.promoteAtMs - (promote.prepAtMs ?? promote.promoteAtMs),
+            reusedPayload: true,
+            promoteRefresh: promote.promoteRefresh,
+            freshOracleQuoteOnPromote: promote.freshOracleQuoteOnPromote,
+            closeFactorBps: entry.closeFactorBps,
+            coldRebuild: false,
+          });
+          await executor.execute(request);
+          return;
+        }
+
+        // Cold path — full refreshBorrowers + runOnce when prestage miss/stale.
         if (watchlistCoordinator === undefined) {
           logger.warn("liquidatable_candidate_cache_upsert_skipped", {
             chain: config.chain,
@@ -1276,6 +1351,63 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
         }
         await orchestrator.runOnce();
       },
+      onPrestageInvalidate: (account, bumpSource) => {
+        if (prestageController === undefined) {
+          return;
+        }
+        void safePrestageInvalidate(
+          prestageController,
+          account,
+          bumpSource,
+          logger,
+          config.chain,
+        );
+      },
+      onPrestageTick: () => {
+        if (prestageController === undefined) {
+          return;
+        }
+        void safePrestageTick(prestageController, logger, config.chain);
+      },
+    });
+    prestageController = new PrestageController({
+      config: prestageConfig,
+      model: eventPurityStack.model,
+      logger,
+      chain: config.chain,
+      resolveGasCostUsd: resolveDynamicGasCostUsd,
+      resolveFlashFeeBps: resolveFlashLoanFeeBps,
+      minDebtUsd: config.minLiquidationDebtUsd,
+      minProfitUsd: config.minProfitUsd,
+      getUserAccountData: async (acct) => {
+        const data = await publicClient.readContract({
+          address: activePoolAddress,
+          abi: aavePoolAbi,
+          functionName: "getUserAccountData",
+          args: [acct],
+        }) as readonly [bigint, bigint, bigint, bigint, bigint, bigint];
+        return {
+          totalCollateralBase: data[0],
+          totalDebtBase: data[1],
+          healthFactor: data[5],
+        };
+      },
+      ...(watchlistCoordinator === undefined
+        ? {}
+        : {
+          refreshBorrowers: async (accounts) => {
+            await watchlistCoordinator.refreshBorrowers(config.chain, [...accounts]);
+          },
+        }),
+    });
+    logger.info("prestage_controller_ready", {
+      chain: config.chain,
+      enabled: prestageConfig.enabled,
+      hfUpper: prestageConfig.hfUpper,
+      topN: prestageConfig.topN,
+      ttlMs: prestageConfig.ttlMs,
+      minRefreshIntervalMs: prestageConfig.minRefreshIntervalMs,
+      oracleInvalidateBps: prestageConfig.oracleInvalidateBps,
     });
     eventPurityStackRef = eventPurityStack;
   }
@@ -1584,6 +1716,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
           return reads.map((row) => ({
             account: row.address,
             healthFactor: row.healthFactor,
+            debtUsd: Number(row.totalDebtBase) / 1e8,
           }));
         },
         watchlistCriticalAlertCycles: parseMinNumber(

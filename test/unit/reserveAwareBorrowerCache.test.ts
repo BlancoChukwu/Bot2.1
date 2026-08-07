@@ -68,7 +68,44 @@ describe("ReserveAwareBorrowerCache", () => {
       debtToCover: 2_000_000_000n,
       liquidationBonusBps: 500,
       repayValueUsd: 2_000,
+      closeFactorBps: 10_000,
     });
+  });
+
+  it("applies 50% close factor to large HF>0.95 liquidatable positions", () => {
+    const cache = new ReserveAwareBorrowerCache();
+    cache.upsert({
+      ...liquidatableSnapshot(),
+      healthFactor: 990_000_000_000_000_000n,
+      reserves: [
+        {
+          assetAddress: wethAddress,
+          asset: weth,
+          collateralBalance: createAssetAmount(weth, 100_000_000_000_000_000_000n),
+          variableDebt: createAssetAmount(weth, 0n),
+          stableDebt: createAssetAmount(weth, 0n),
+          priceInQuote: createAssetAmount(usd, 300_000_000_000n),
+          usageAsCollateralEnabled: true,
+          liquidationBonusBps: 500,
+        },
+        {
+          assetAddress: usdcAddress,
+          asset: usdc,
+          collateralBalance: createAssetAmount(usdc, 0n),
+          variableDebt: createAssetAmount(usdc, 15_000_000_000_000n),
+          stableDebt: createAssetAmount(usdc, 0n),
+          priceInQuote: createAssetAmount(usd, 100_000_000n),
+          usageAsCollateralEnabled: false,
+          liquidationBonusBps: 0,
+        },
+      ],
+    });
+
+    const candidates = createReserveAwareCandidates(cache, "optimism");
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]?.closeFactorBps).toBe(5_000);
+    expect(candidates[0]?.repayValueUsd).toBe(7_500_000);
+    expect(candidates[0]?.debtToCover).toBe(7_500_000_000_000n);
   });
 
   it("does not emit candidates for healthy borrowers", () => {

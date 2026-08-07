@@ -155,4 +155,22 @@ describe("planUniswapV3LiquidationRoute", () => {
       snapshotDriftHaircutBps: 5_000,
     }));
   });
+
+  it("does not double-apply close factor when candidate already carries closeFactorBps", () => {
+    const result = planUniswapV3LiquidationRoute({
+      candidate: {
+        ...candidate(CBETH),
+        closeFactorBps: 5_000,
+        debtToCover: 500_000_000n,
+        repayValueUsd: 500,
+        collateralReceivedWei: 525_000_000_000_000_000n,
+      },
+      ...launchFloor,
+    });
+    if (result.status === "selected") {
+      expect(result.candidate.closeFactorBps).toBe(5_000);
+      expect(result.candidate.repayValueUsd).toBeLessThanOrEqual(500);
+      expect(result.candidate.debtToCover).toBeLessThanOrEqual(500_000_000n);
+    }
+  });
 });

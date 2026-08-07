@@ -27,6 +27,10 @@ const LIQ_COUNT_KEYS = [
   "liquidation_first_attempt",
   "opportunity_trace_cycle",
   "liquidation_path_candidate",
+  "prestage_enter",
+  "prestage_promote_to_hot",
+  "prestage_send",
+  "prestage_drop",
   "execution_rejected_hf_not_liquidatable",
   "execution_rejected_single_opportunity_busy",
   "execution_rejected_recent_attempt_inflight",
@@ -351,6 +355,16 @@ const summary = {
     evaluated: evaluatedGate,
     evaluatedDiag: counts.liquidation_evaluated_diag,
     pathCandidates: counts.liquidation_path_candidate,
+    prestageEnter: counts.prestage_enter,
+    prestagePromote: counts.prestage_promote_to_hot,
+    prestageSend: counts.prestage_send,
+    prestageDrop: counts.prestage_drop,
+    // Event-purity path equivalent: prefer prestage/preview over classic pathCandidates.
+    pathEquivalent:
+      counts.liquidation_path_candidate
+      + counts.prestage_enter
+      + counts.prestage_promote_to_hot
+      + counts.liquidatable_candidate_preview,
     dryRuns: counts.liquidation_dry_run_preview,
     firstAttempts: counts.liquidation_first_attempt,
     opportunityTraces: counts.opportunity_trace_cycle,
@@ -403,7 +417,7 @@ const modeLabel = isSoak
 
 console.log("── Liquidations ──");
 console.log(`  Mode:         ${modeLabel}`);
-console.log(`  Candidates:   found=${summary.liquidations.candidates} preview=${summary.liquidations.previews} path=${summary.liquidations.pathCandidates} gate_closed=${summary.liquidations.gateClosed}`);
+console.log(`  Candidates:   found=${summary.liquidations.candidates} preview=${summary.liquidations.previews} path=${summary.liquidations.pathCandidates} pathEq=${summary.liquidations.pathEquivalent} prestage_enter=${summary.liquidations.prestageEnter} promote=${summary.liquidations.prestagePromote} gate_closed=${summary.liquidations.gateClosed}`);
 console.log(`  Pipeline:     evaluated=${summary.liquidations.evaluated} diag=${summary.liquidations.evaluatedDiag} first_attempt=${summary.liquidations.firstAttempts} traces=${summary.liquidations.opportunityTraces}`);
 console.log(`  Dry-run/sim:  ${summary.liquidations.dryRuns}`);
 console.log(

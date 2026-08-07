@@ -242,6 +242,26 @@ export interface EventPurityStackConfig {
     readonly account: Address;
     readonly confirmed: ConfirmResult;
   }) => void | Promise<void>;
+  /**
+   * Full-entry prestage invalidation. account undefined = clear all.
+   * bumpSource must match PrestageBumpSource literals.
+   */
+  readonly onPrestageInvalidate?: (
+    account: Address | undefined,
+    bumpSource:
+      | "Borrow"
+      | "Repay"
+      | "LiquidationCall"
+      | "ReserveIndexUpdate"
+      | "OracleFeedSwitch"
+      | "OraclePriceMove"
+      | "ConfigReload"
+      | "TtlExpiry"
+      | "Manual"
+      | "PromoteFail",
+  ) => void;
+  /** Opportunistic prestage tick (isolated by caller). */
+  readonly onPrestageTick?: () => void;
   readonly onBlockObserved?: (blockNumber: bigint) => void;
   readonly onWsDisconnected?: () => void;
   readonly onWsReconnected?: (meta: { readonly downtimeMs: number | undefined }) => void;
@@ -486,6 +506,7 @@ export class EventPurityStack {
     }
     if (event.kind === "chainlink_price") {
       const changes = this.model.applyPriceEvent(event);
+      this.config.onPrestageInvalidate?.(undefined, "OraclePriceMove");
       await this.handleTierChanges(changes, event.meta.blockNumber);
       return;
     }
@@ -496,10 +517,25 @@ export class EventPurityStack {
       logger: this.config.logger,
     });
     const result = this.model.applyAaveEvent(event);
+    this.notifyPrestagePoolEvent(event);
     if (result.firstTouchReconcile !== undefined) {
       await this.reconcileFirstTouch(result.firstTouchReconcile, event.meta.blockNumber);
     }
     await this.handleTierChanges(result.changes, event.meta.blockNumber);
+  }
+
+  private notifyPrestagePoolEvent(event: Extract<ParsedIngestionEvent, { kind: "aave_pool" }>): void {
+    const name = event.name;
+    if (name === "Borrow" || name === "Repay" || name === "LiquidationCall") {
+      const account = event.user;
+      if (account !== undefined) {
+        this.config.onPrestageInvalidate?.(account, name);
+      }
+      return;
+    }
+    if (name === "ReserveDataUpdated") {
+      this.config.onPrestageInvalidate?.(undefined, "ReserveIndexUpdate");
+    }
   }
 
   private async reconcileFirstTouch(account: Address, blockNumber: bigint): Promise<void> {
@@ -634,6 +670,8 @@ export class EventPurityStack {
     this.indexRefreshInFlight = true;
     try {
       await this.refreshReserveIndices();
+      this.config.onPrestageInvalidate?.(undefined, "ReserveIndexUpdate");
+      this.config.onPrestageTick?.();
       await this.checkpoint?.saveLastProcessedBlock(blockNumber);
     } finally {
       this.indexRefreshInFlight = false;

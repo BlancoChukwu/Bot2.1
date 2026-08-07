@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_MIN_NET_PROFIT_USD,
+  compareCloseFactorEv,
   evaluateLiquidationProfitability,
 } from "../../src/profitability/liquidationProfitabilityGate";
 
@@ -61,5 +62,29 @@ describe("evaluateLiquidationProfitability", () => {
     // bonus = 10, gas = 8, flash ≈ 0.1 → net ≈ 1.9 < max(45, 16)
     expect(result.netProfitPass).toBe(false);
     expect(result.pass).toBe(false);
+  });
+
+  it("whale EV uses capped debt (not 2× full-debt EV) when CF=5000", () => {
+    const shared = {
+      liquidationBonusBps: 500,
+      gasCostUsd: 10,
+      flashFeeBps: 9,
+      hardFloorUsd: 50,
+      minNetProfitUsd: 45,
+      minNetProfitGasMultiple: 2,
+    };
+    const capped = evaluateLiquidationProfitability({ ...shared, debtUsd: 7_500_000 });
+    const uncapped = evaluateLiquidationProfitability({ ...shared, debtUsd: 15_000_000 });
+    expect(capped.netProfitUsd).toBeLessThan(uncapped.netProfitUsd * 0.6);
+    expect(capped.netProfitUsd).toBeCloseTo(7_500_000 * 0.05 - 10 - 7_500_000 * 0.0009, 0);
+
+    const compare = compareCloseFactorEv({
+      ...shared,
+      cappedDebtUsd: 7_500_000,
+      closeFactorBps: 5_000,
+    });
+    expect(compare.evCapped).toBe(capped.netProfitUsd);
+    expect(compare.evUncapped).toBe(uncapped.netProfitUsd);
+    expect(compare.evDeltaUsd).toBeCloseTo(uncapped.netProfitUsd - capped.netProfitUsd, 6);
   });
 });

@@ -1,6 +1,7 @@
 import type { Address } from "viem";
 import type { LiquidationCandidate } from "../protocols/aaveV3";
 import type { UniswapV3FeeTier } from "../protocols/liquidationFlashLoanReceiver";
+import type { LiquidationRejectReason } from "../types/liquidationRejectReason";
 import { defaultCloseFactorBps, resolveAavePoolVersion } from "./aavePoolVersion";
 
 export const LIQUIDATION_ROUTE_SNAPSHOT = {
@@ -118,7 +119,7 @@ export type LiquidationRoutePlan =
   }
   | {
     readonly status: "rejected";
-    readonly reason: "unmapped_pair" | "thin_cap_unprofitable";
+    readonly reason: Extract<LiquidationRejectReason, "unmapped_pair" | "thin_cap_unprofitable">;
     readonly fee?: UniswapV3FeeTier;
     readonly cappedRepayValueUsd?: number;
     readonly expectedProfitUsd?: number;
@@ -199,9 +200,15 @@ function planThinRoute(
   };
 }
 
-function eligibleCandidate(candidate: LiquidationCandidate): LiquidationCandidate {
-  const closeFactorBps = candidate.closeFactorBps
-    ?? defaultCloseFactorBps(resolveAavePoolVersion(), candidate.healthFactor);
+/**
+ * Apply close-factor sizing only when the candidate has not already been capped.
+ * If closeFactorBps is set, return as-is — double-haircut is impossible.
+ */
+export function eligibleCandidate(candidate: LiquidationCandidate): LiquidationCandidate {
+  if (candidate.closeFactorBps !== undefined) {
+    return candidate;
+  }
+  const closeFactorBps = defaultCloseFactorBps(resolveAavePoolVersion(), candidate.healthFactor);
   const debtToCover = (candidate.debtToCover * BigInt(closeFactorBps)) / 10_000n;
   return {
     ...candidate,

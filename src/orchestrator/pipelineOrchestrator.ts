@@ -82,7 +82,11 @@ export interface PipelineOrchestratorConfig {
   /** Rotating HF multicall sample — feeds pipeline_cycle_diagnostics each cycle. */
   readonly watchlistDiagnosticSample?: (
     chain: SupportedChain,
-  ) => Promise<readonly { readonly account: Address; readonly healthFactor: bigint }[]>;
+  ) => Promise<readonly {
+    readonly account: Address;
+    readonly healthFactor: bigint;
+    readonly debtUsd?: number;
+  }[]>;
   /** Consecutive critical staleness cycles before paging (default 3). */
   readonly watchlistCriticalAlertCycles?: number;
   readonly onWatchlistStaleCritical?: (input: {

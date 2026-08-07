@@ -8,7 +8,7 @@ import {
   computeDebtUsdFromWei,
   type DustFilterDecision,
 } from "../protocols/liquidationCandidateFilter";
-import { evaluateLiquidationProfitability } from "../profitability/liquidationProfitabilityGate";
+import { evaluateLiquidationProfitability, compareCloseFactorEv } from "../profitability/liquidationProfitabilityGate";
 import type { BorrowerCooldownRegistry } from "../utils/borrowerCooldown";
 import { shouldApplyBorrowerCooldown } from "../utils/borrowerCooldownPolicy";
 import { DustLogCooldown } from "../utils/dustLogCooldown";
@@ -97,6 +97,18 @@ export class LiquidationCandidateGate {
           ? {}
           : { minNetProfitUsd: this.config.minProfitUsd }),
       });
+      const closeFactorBps = candidate.closeFactorBps ?? 10_000;
+      const evCompare = compareCloseFactorEv({
+        cappedDebtUsd: resolved.debtUsd,
+        closeFactorBps,
+        liquidationBonusBps: candidate.liquidationBonusBps,
+        gasCostUsd,
+        flashFeeBps,
+        hardFloorUsd: this.config.minDebtUsd,
+        ...(this.config.minProfitUsd === undefined
+          ? {}
+          : { minNetProfitUsd: this.config.minProfitUsd }),
+      });
       const gatePass = resolved.trusted && profitability.pass;
       let sanityPass = true;
       if (this.config.oracleSanityCheck !== undefined) {
@@ -132,9 +144,28 @@ export class LiquidationCandidateGate {
         account: candidate.account,
         stage,
         debtUsd: resolved.debtUsd,
+        closeFactorBps,
+        evUncapped: evCompare.evUncapped,
+        evCapped: evCompare.evCapped,
+        evDeltaUsd: evCompare.evDeltaUsd,
         ...profitability,
         pass: finalPass,
       });
+      if (evCompare.unexpectedAnomaly) {
+        this.config.logger.warn("ev_cap_soak_anomaly", {
+          chain,
+          account: candidate.account,
+          stage,
+          reason: "unexpected_decision_flip",
+          closeFactorBps,
+          debtUsd: resolved.debtUsd,
+          evUncapped: evCompare.evUncapped,
+          evCapped: evCompare.evCapped,
+          evDeltaUsd: evCompare.evDeltaUsd,
+          uncappedPass: evCompare.uncappedPass,
+          cappedPass: evCompare.cappedPass,
+        });
+      }
       const diagnosticRow = {
         kind: "liquidation" as const,
         account: candidate.account,
@@ -184,7 +215,11 @@ export class LiquidationCandidateGate {
 
   public recordHealthFactorDiagnostics(
     chain: SupportedChain,
-    reads: readonly { readonly account: Address; readonly healthFactor: bigint }[],
+    reads: readonly {
+      readonly account: Address;
+      readonly healthFactor: bigint;
+      readonly debtUsd?: number;
+    }[],
     stage: string,
   ): void {
     const hfScale = 1_000_000_000_000_000_000n;
@@ -197,6 +232,7 @@ export class LiquidationCandidateGate {
       }
       const hfFloat = Number(hf) / Number(hfScale);
       const nearLiquidation = hf < nearLiquidationHf;
+      const debtUsd = row.debtUsd;
       getCycleDiagnosticsCollector().record({
         kind: "liquidation",
         account: row.account,
@@ -215,6 +251,7 @@ export class LiquidationCandidateGate {
         healthFactor: hf.toString(),
         hfFloat,
         nearLiquidation,
+        ...(debtUsd === undefined ? {} : { debtUsd }),
         pass: false,
       });
     }
