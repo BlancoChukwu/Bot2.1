@@ -240,6 +240,8 @@ export interface EventPurityStackConfig {
     readonly confirmed: ConfirmResult;
   }) => void | Promise<void>;
   readonly onBlockObserved?: (blockNumber: bigint) => void;
+  /** Fired on flashblock ticks so watchlist staleness can stay fresh under event-purity (no poll sweep). */
+  readonly onIngestionHeartbeat?: () => void;
 }
 
 export class EventPurityStack {
@@ -560,6 +562,7 @@ export class EventPurityStack {
 
   private async handleFlashblockTick(blockNumber: bigint): Promise<void> {
     this.config.onBlockObserved?.(blockNumber);
+    this.config.onIngestionHeartbeat?.();
     this.flashblockTickCount += 1n;
     if (this.flashblockTickCount % 1_800n === 0n) {
       this.shadow.logMetricsSnapshot("flashblock_interval");
