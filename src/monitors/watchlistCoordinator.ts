@@ -288,10 +288,23 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
       return;
     }
     this.config.onSnapshots?.(snapshots);
+    this.stalenessGuard.record();
+    this.publishWatchlistMetrics();
     this.config.logger.info("watchlist_event_target_refresh_complete", {
       chain: this.config.chain,
       touchedAccounts: accounts.length,
       refreshed: snapshots.length,
+    });
+  }
+
+  /** Mark the watchlist freshness clock after a live on-chain confirm / refresh. */
+  public markFresh(reason: string): void {
+    this.stalenessGuard.record();
+    this.publishWatchlistMetrics();
+    this.config.logger.info("watchlist_staleness_marked_fresh", {
+      chain: this.config.chain,
+      reason,
+      ageMs: this.stalenessGuard.ageMs(),
     });
   }
 
