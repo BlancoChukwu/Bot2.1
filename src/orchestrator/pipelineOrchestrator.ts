@@ -172,12 +172,15 @@ export class PipelineOrchestrator {
     }
   }
 
-  public async runOnce(): Promise<PipelineRunSummary> {
+  public async runOnce(options?: {
+    readonly bypassWatchlistStaleCritical?: boolean;
+    readonly bypassReason?: string;
+  }): Promise<PipelineRunSummary> {
     const startedAt = Date.now();
     const summary = mutableSummary();
     try {
       for (const chain of this.config.registry.listChains()) {
-        await this.runChain(chain, summary);
+        await this.runChain(chain, summary, options);
         if (this.config.watchlistDiagnosticSample !== undefined && this.config.liquidationGate !== undefined) {
           const hfReads = await this.config.watchlistDiagnosticSample(chain);
           if (hfReads.length > 0) {
@@ -205,7 +208,14 @@ export class PipelineOrchestrator {
     }
   }
 
-  private async runChain(chain: SupportedChain, summary: MutablePipelineRunSummary): Promise<void> {
+  private async runChain(
+    chain: SupportedChain,
+    summary: MutablePipelineRunSummary,
+    options?: {
+      readonly bypassWatchlistStaleCritical?: boolean;
+      readonly bypassReason?: string;
+    },
+  ): Promise<void> {
     if (this.config.watchlistSweep !== undefined) {
       try {
         await this.config.watchlistSweep(chain);
@@ -217,13 +227,22 @@ export class PipelineOrchestrator {
 
     const staleness = this.config.watchlistStaleness?.check();
     if (staleness === "critical") {
-      this.config.logger.error("watchlist_stale_critical", {
-        chain,
-        ageMs: this.config.watchlistStaleness?.ageMs(),
-      });
-      this.config.metrics.recordWatchlistStaleEvaluation(chain, "critical");
-      this.config.metrics.recordError();
-      return;
+      if (options?.bypassWatchlistStaleCritical === true) {
+        this.config.logger.warn("watchlist_stale_critical_bypassed_fresh_candidate", {
+          chain,
+          ageMs: this.config.watchlistStaleness?.ageMs(),
+          reason: options.bypassReason ?? "fresh_event_purity_candidate",
+        });
+        this.config.metrics.recordWatchlistStaleEvaluation(chain, "critical");
+      } else {
+        this.config.logger.error("watchlist_stale_critical", {
+          chain,
+          ageMs: this.config.watchlistStaleness?.ageMs(),
+        });
+        this.config.metrics.recordWatchlistStaleEvaluation(chain, "critical");
+        this.config.metrics.recordError();
+        return;
+      }
     }
     if (staleness === "stale") {
       this.config.logger.warn("watchlist_stale", {
