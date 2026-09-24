@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Address } from "viem";
 import { createBotMetrics, createLogger } from "../../src/bot";
 import { createChainRegistry, type CircuitBreakerName, type CircuitBreakerState } from "../../src/config/chainRegistry";
 import { PipelineDeadLetterQueue, PipelineOrchestrator, type PipelineDetection } from "../../src/orchestrator/pipelineOrchestrator";
 import { ReserveAwareBorrowerCache, type BorrowerSnapshot } from "../../src/monitors/reserveAwareBorrowerCache";
+import { StalenessGuard } from "../../src/monitors/stalenessGuard";
 import type { SafeExecutionRequest, SafeExecutionResult } from "../../src/executors/safeTransactionExecutor";
 import { createAsset, createAssetAmount } from "../../src/utils/typedAssetMath";
 
@@ -428,6 +429,45 @@ describe("PipelineOrchestrator", () => {
 
     expect(attempts).toBe(0);
     expect(summary.attempted).toBe(0);
+  });
+
+  it("aborts the cycle on watchlist_stale_critical unless bypassed for a fresh candidate", async () => {
+    vi.useFakeTimers();
+    const cache = new ReserveAwareBorrowerCache();
+    cache.upsert(snapshot());
+    const guard = new StalenessGuard(1_000);
+    guard.record();
+    vi.advanceTimersByTime(4_000);
+    expect(guard.check()).toBe("critical");
+
+    let attempts = 0;
+    const orchestrator = new PipelineOrchestrator({
+      registry: registry(),
+      detection: detection(cache),
+      executor: {
+        execute: async () => {
+          attempts += 1;
+          return { status: "simulated" };
+        },
+      },
+      deadLetters: new PipelineDeadLetterQueue(),
+      logger: createLogger("silent"),
+      metrics: createBotMetrics(),
+      watchlistStaleness: guard,
+      buildExecutionRequest: (candidate) => requestFor(candidate.account),
+    });
+
+    const blocked = await orchestrator.runOnce();
+    expect(attempts).toBe(0);
+    expect(blocked.attempted).toBe(0);
+
+    const armed = await orchestrator.runOnce({
+      bypassWatchlistStaleCritical: true,
+      bypassReason: "fresh_event_purity_candidate",
+    });
+    expect(attempts).toBe(1);
+    expect(armed.attempted).toBe(1);
+    vi.useRealTimers();
   });
 
   it("rejects invalid dead-letter queue capacity", () => {
