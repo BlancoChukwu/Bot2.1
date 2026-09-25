@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { getChainConfig, selectReservePairMatchingAssets } from "../../src/config/chains";
-import { selectBestReservePairForAccount } from "../../src/protocols/aaveV3";
+import { selectBestReservePairForAccount } from "../../src/config/reservePairPolicy";
 
 const baseWeth = "0x4200000000000000000000000000000000000006";
 const baseUsdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
@@ -16,15 +16,21 @@ describe("Base Aave executable reserve pairs", () => {
 
   it("selects a higher-bonus pair when the account is collateral-heavy", () => {
     const pair = selectBestReservePairForAccount(getChainConfig("base"), {
-      account: "0x0000000000000000000000000000000000000001",
       totalCollateralBase: 10_000n,
       totalDebtBase: 1_000n,
-      availableBorrowsBase: 0n,
-      currentLiquidationThreshold: 7_800n,
-      loanToValue: 7_300n,
-      healthFactor: 1_200_000_000_000_000_000n,
     });
     expect(pair.liquidationBonusBps).toBeGreaterThanOrEqual(750);
+  });
+
+  it("uses the exact configured pair when collateral and debt are known", () => {
+    const pair = selectBestReservePairForAccount(getChainConfig("base"), {
+      totalCollateralBase: 10_000n,
+      totalDebtBase: 1_000n,
+      collateralAsset: baseCbBtc as `0x${string}`,
+      debtAsset: baseUsdc as `0x${string}`,
+    });
+    expect(pair.collateralAsset.toLowerCase()).toBe(baseCbBtc.toLowerCase());
+    expect(pair.debtAsset.toLowerCase()).toBe(baseUsdc.toLowerCase());
   });
 
   it("keeps WETH/USDC as the first configured pair for conservative fallback", () => {
