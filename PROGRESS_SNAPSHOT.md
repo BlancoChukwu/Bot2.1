@@ -1,24 +1,18 @@
 # Progress snapshot
 
-**Date:** 2026-05-22 (branch `new-team-in-town`)
+**Date:** 2026-09-25 (branch `Grok-Work`)
 
 ## Shipped on this branch
 
-- **Memory:** `memoryMonitor.checkNow()` on every `hybrid_detection_failure` plus 60s `memory_stats` backup.
-- **Arbitrage diagnostics:** `arbitrage_quotes_fetched`, `arbitrage_evaluation_skipped`; audit script extended.
-- **WSS:** `wss_provider_unstable_host_detected` for Dwellir-tier hosts; README WSS checklist.
-- **newHeads:** Primary WSS block subscription → debounced watchlist rescan (`block_triggered_watchlist_rescan`).
-- **Subgraph lag:** `subgraph_lag_detected` guard on borrower watchlist rescans.
-- **Multi-protocol discovery:** Moonwell + Seamless subgraph adapters (env-gated); execution gated by `ENABLE_NON_AAVE_LIQUIDATION=false`.
-- **PM2:** `ecosystem.config.cjs` with `max_memory_restart: 3G`.
+- Extra Base Aave executable pairs beyond WETH/USDC.
+- MultiProtocolFlashReceiver Moonwell route with initiator gate, mToken map, ETH wrap after mWETH redeem.
+- Quote-based Moonwell slippage encode.
+- Historical-account fork proof on borrower `0x5F58cAB4A66fCb95B06455b3f1c39b0f355e6324`.
+- `ENABLE_NON_AAVE_LIQUIDATION` remains false until the new receiver is deployed on Base.
 
-## Ops after 12h clean session
+## Next
 
-1. `node scripts/audit-session.mjs logs/<session>.log` — all metrics PASS, `hybrid_detection_failure=0`.
-2. Set `MIN_LIQUIDATION_DEBT_USD=0.35` (not `0` until discovery is live).
-3. `pm2 start ecosystem.config.cjs`.
-
-## Deferred
-
-- Morpho Blue / Compound V3 adapters.
-- FTRL provider scoring upgrade (`docs/plans/ftrl-provider-scoring-upgrade.plan.md`).
+1. Compile receiver artifact on this branch and deploy to Base when ready.
+2. Point `MULTI_PROTOCOL_RECEIVER_ADDRESS` at the new bytecode.
+3. Only then flip `ENABLE_NON_AAVE_LIQUIDATION`.
+4. Morpho route stays reserved.
