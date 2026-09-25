@@ -6,6 +6,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
 import { getChainConfig } from "../src/config/chains";
 import { getDexesForChain } from "../src/config/dexRegistry";
+import { moonwellConstructorLists } from "../src/config/moonwellBase";
 
 interface ReceiverArtifact {
   readonly abi: readonly unknown[];
@@ -113,10 +114,12 @@ async function main(): Promise<void> {
   console.log("Deployed at:", deployed);
   console.log(`Set LIQUIDATION_RECEIVER_ADDRESS=${deployed}`);
 
+  const moonwellMarkets = moonwellConstructorLists();
+  const authorizedInitiator = (process.env.AUTHORIZED_INITIATOR?.trim() || account.address) as `0x${string}`;
   const v2Hash = await walletClient.deployContract({
     abi: v2Artifact.abi,
     bytecode: v2Artifact.bytecode,
-    args: [pool, uniswap.router, swapFee],
+    args: [pool, uniswap.router, swapFee, authorizedInitiator, moonwellMarkets.underlyings, moonwellMarkets.mTokens],
     maxFeePerGas,
     maxPriorityFeePerGas,
   });
