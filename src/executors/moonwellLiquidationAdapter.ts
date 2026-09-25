@@ -1,8 +1,10 @@
 import { encodeFunctionData, type Address } from "viem";
+import { MOONWELL_LIQUIDATOR_BONUS_BPS } from "../config/moonwellBase";
 import { aavePoolAbi } from "../protocols/aaveV3";
 import { encodeMoonwellRoute } from "../protocols/liquidationFlashLoanReceiver";
-import type { SafeExecutionRequest } from "./safeTransactionExecutor";
 import { createAssetAmount, createAsset, type Asset } from "../utils/typedAssetMath";
+import { estimateMinimumCollateralOut } from "./liquidationExecutionAdapter";
+import type { SafeExecutionRequest } from "./safeTransactionExecutor";
 
 const usdAsset: Asset = createAsset({ symbol: "USD", decimals: 8 });
 
@@ -23,12 +25,25 @@ export function buildMoonwellLiquidationExecutionRequest(input: {
   readonly referralCode?: number;
   readonly candidate: MoonwellLiquidationCandidate;
 }): SafeExecutionRequest {
+  const bonusBps = input.candidate.liquidationBonusBps > 0
+    ? input.candidate.liquidationBonusBps
+    : MOONWELL_LIQUIDATOR_BONUS_BPS;
+  const minCollateralOut = estimateMinimumCollateralOut({
+    account: input.candidate.account,
+    collateralAsset: input.candidate.collateralAsset,
+    debtAsset: input.candidate.debtAsset,
+    debtToCover: input.candidate.debtToCover,
+    repayValueUsd: input.candidate.repayValueUsd,
+    liquidationBonusBps: bonusBps,
+    healthFactor: 900_000_000_000_000_000n,
+    closeFactorBps: 5_000,
+  }, 50);
   const routeParams = encodeMoonwellRoute({
     collateralAsset: input.candidate.collateralAsset,
     debtAsset: input.candidate.debtAsset,
     user: input.candidate.account,
     debtToCover: input.candidate.debtToCover,
-    minCollateralOut: 1n,
+    minCollateralOut,
     receiveAToken: false,
   });
   return {
@@ -59,4 +74,3 @@ export function buildMoonwellLiquidationExecutionRequest(input: {
     }),
   };
 }
-
