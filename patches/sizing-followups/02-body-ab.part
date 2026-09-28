@@ -1,0 +1,873 @@
+current !== undefined && current !== null; depth += 1) {
++    const candidate = (current as { data?: unknown }).data;
++    if (typeof candidate === "string" && candidate.startsWith("0x")) {
++      return candidate;
++    }
++    if (typeof candidate === "object" && candidate !== null && typeof (candidate as { data?: unknown }).data === "string") {
++      return (candidate as { data: string }).data;
++    }
++    current = (current as { cause?: unknown }).cause;
++  }
++  return undefined;
++}
++
++function isExecutionRevert(error: unknown): boolean {
++  let current: unknown = error;
++  for (let depth = 0; depth < 8 && current !== undefined && current !== null; depth += 1) {
++    const text = `${(current as { name?: string }).name ?? ""} ${(current as { message?: string }).message ?? ""} ${(current as { details?: string }).details ?? ""}`;
++    if (/execution reverted|ExecutionRevertedError|ContractFunctionRevertedError/i.test(text)) {
++      return true;
++    }
++    current = (current as { cause?: unknown }).cause;
++  }
++  return false;
++}
++
++function firstLine(error: unknown): string {
++  const message = error instanceof Error ? error.message : String(error);
++  return message.split("\n")[0] ?? message;
+ }
+diff --git a/src/protocols/aaveReservePositions.ts b/src/protocols/aaveReservePositions.ts
+index 0745168..3d6ea7b 100644
+--- a/src/protocols/aaveReservePositions.ts
++++ b/src/protocols/aaveReservePositions.ts
+@@ -13,6 +13,13 @@ import { uiPoolDataProviderAbi } from "./uiPoolDataProvider";
+  * DOWN, variable debt rounds UP — this reproduces getUserAccountData.totalDebtBase exactly (verified on the
+  * 0xf20e replay: 10 scaled sats cbBTC -> 11 sats debt -> 923715 base).
+  * Stable debt is not exposed by the v3.2+ UserReserveData struct (stable rate removed) and is reported as 0.
++ *
++ * Liquidation bonus (fail closed, never from pair config): Pool.getConfiguration(asset) per tracked asset in the
++ * same batch (bits 32-47 liquidation bonus, 152-167 liquidation protocol fee, 16-31 LT). For accounts in an eMode
++ * category (getUserReservesData[1] != 0) a second small multicall reads getEModeCategoryCollateralConfig(id) +
++ * getEModeCategoryCollateralBitmap(id); the eMode bonus applies iff the collateral reserve id is in the bitmap
++ * (exactly LiquidationLogic v3.3+). Reserve ids come from Pool.getReserveData(asset).id (cached; immutable).
++ * Any failure leaves the bonus undefined (or fails the account) so sizing skips it with a log reason.
+  */
+ 
+ const RAY = 10n ** 27n;
+@@ -76,6 +83,115 @@ export const erc20DecimalsAbi = [
+   },
+ ] as const;
+ 
++export const aavePoolReserveConfigAbi = [
++  {
++    type: "function",
++    name: "getConfiguration",
++    stateMutability: "view",
++    inputs: [{ name: "asset", type: "address" }],
++    outputs: [{ name: "", type: "uint256" }],
++  },
++  {
++    type: "function",
++    name: "getReserveData",
++    stateMutability: "view",
++    inputs: [{ name: "asset", type: "address" }],
++    outputs: [{
++      name: "",
++      type: "tuple",
++      components: [
++        { name: "configuration", type: "uint256" },
++        { name: "liquidityIndex", type: "uint128" },
++        { name: "currentLiquidityRate", type: "uint128" },
++        { name: "variableBorrowIndex", type: "uint128" },
++        { name: "currentVariableBorrowRate", type: "uint128" },
++        { name: "currentStableBorrowRate", type: "uint128" },
++        { name: "lastUpdateTimestamp", type: "uint40" },
++        { name: "id", type: "uint16" },
++        { name: "aTokenAddress", type: "address" },
++        { name: "stableDebtTokenAddress", type: "address" },
++        { name: "variableDebtTokenAddress", type: "address" },
++        { name: "interestRateStrategyAddress", type: "address" },
++        { name: "accruedToTreasury", type: "uint128" },
++        { name: "unbacked", type: "uint128" },
++        { name: "isolationModeTotalDebt", type: "uint128" },
++      ],
++    }],
++  },
++  {
++    type: "function",
++    name: "getEModeCategoryCollateralConfig",
++    stateMutability: "view",
++    inputs: [{ name: "id", type: "uint8" }],
++    outputs: [{
++      name: "",
++      type: "tuple",
++      components: [
++        { name: "ltv", type: "uint16" },
++        { name: "liquidationThreshold", type: "uint16" },
++        { name: "liquidationBonus", type: "uint16" },
++      ],
++    }],
++  },
++  {
++    type: "function",
++    name: "getEModeCategoryCollateralBitmap",
++    stateMutability: "view",
++    inputs: [{ name: "id", type: "uint8" }],
++    outputs: [{ name: "", type: "uint128" }],
++  },
++] as const;
++
++export interface DecodedReserveConfiguration {
++  readonly ltvBps: number;
++  readonly liquidationThresholdBps: number;
++  /** Raw Aave value, e.g. 10500 = 105%. */
++  readonly liquidationBonusRaw: number;
++  readonly decimals: number;
++  readonly active: boolean;
++  readonly frozen: boolean;
++  readonly borrowingEnabled: boolean;
++  readonly paused: boolean;
++  readonly liquidationProtocolFeeBps: number;
++}
++
++function bits(value: bigint, start: number, width: number): number {
++  return Number((value >> BigInt(start)) & ((1n << BigInt(width)) - 1n));
++}
++
++/** ReserveConfiguration bit layout (aave-v3-origin ReserveConfiguration.sol). */
++export function decodeReserveConfiguration(data: bigint): DecodedReserveConfiguration {
++  return {
++    ltvBps: bits(data, 0, 16),
++    liquidationThresholdBps: bits(data, 16, 16),
++    liquidationBonusRaw: bits(data, 32, 16),
++    decimals: bits(data, 48, 8),
++    active: bits(data, 56, 1) === 1,
++    frozen: bits(data, 57, 1) === 1,
++    borrowingEnabled: bits(data, 58, 1) === 1,
++    paused: bits(data, 60, 1) === 1,
++    liquidationProtocolFeeBps: bits(data, 152, 16),
++  };
++}
++
++/** Encode (for tests / fixtures) the subset of ReserveConfiguration fields sizing reads. */
++export function encodeReserveConfiguration(input: {
++  readonly ltvBps?: number;
++  readonly liquidationThresholdBps?: number;
++  readonly liquidationBonusRaw: number;
++  readonly decimals: number;
++  readonly liquidationProtocolFeeBps?: number;
++  readonly borrowingEnabled?: boolean;
++}): bigint {
++  return BigInt(input.ltvBps ?? 0)
++    | (BigInt(input.liquidationThresholdBps ?? 0) << 16n)
++    | (BigInt(input.liquidationBonusRaw) << 32n)
++    | (BigInt(input.decimals) << 48n)
++    | (1n << 56n)
++    | ((input.borrowingEnabled ?? true) ? 1n << 58n : 0n)
++    | (BigInt(input.liquidationProtocolFeeBps ?? 0) << 152n);
++}
++
+ export interface AaveReservePosition {
+   readonly asset: Address;
+   readonly decimals: number;
+@@ -85,6 +201,14 @@ export interface AaveReservePosition {
+   readonly variableDebt: bigint;
+   readonly stableDebt: bigint;
+   readonly usageAsCollateralEnabled: boolean;
++  /**
++   * ON-CHAIN effective liquidation bonus for this reserve as collateral, bps over 100% (500 = 105%), eMode-aware.
++   * Undefined when the configuration read failed or the reserve has no bonus (cannot be liquidated as collateral).
++   */
++  readonly liquidationBonusBps?: number;
++  readonly liquidationProtocolFeeBps?: number;
++  /** "reserve" (getConfiguration) or "emode:<id>" when the account's eMode category bonus applies. */
++  readonly liquidationBonusSource?: string;
+ }
+ 
+ export interface UntrackedReserveHolding {
+@@ -96,6 +220,8 @@ export interface UntrackedReserveHolding {
+ export interface AaveAccountReservePositions {
+   readonly account: Address;
+   readonly reserves: readonly AaveReservePosition[];
++  /** getUserReservesData userEmodeCategoryId (0 = none). */
++  readonly eModeCategoryId?: number;
+   /** Held reserves outside the tracked (configured-pair) asset set — cannot be liquidated by this bot. */
+   readonly untrackedReserves?: readonly UntrackedReserveHolding[];
+ }
+@@ -131,6 +257,8 @@ export interface ResolveReservePositionsInput {
+   /** Reserves relevant to liquidation (configured pair assets). */
+   readonly assets: readonly Address[];
+   readonly decimalsCache?: Map<string, number>;
++  /** Reserve id cache (Pool.getReserveData(asset).id; immutable once listed). */
++  readonly reserveIdCache?: Map<string, number>;
+   readonly blockNumber?: bigint;
+   readonly maxAccountsPerCall?: number;
+ }
+@@ -140,6 +268,12 @@ interface AssetMarketData {
+   readonly variableBorrowIndex: bigint;
+   readonly priceUsd8: bigint;
+   readonly decimals: number;
++  readonly configuration?: DecodedReserveConfiguration;
++}
++
++interface EModeCategoryData {
++  readonly liquidationBonusRaw: number;
++  readonly collateralBitmap: bigint;
+ }
+ 
+ interface UserReserveRow {
+@@ -195,11 +329,13 @@ export async function resolveAccountReservePositions(
+   }
+   const assets = dedupe(input.assets);
+   const decimalsCache = input.decimalsCache ?? new Map<string, number>();
++  const reserveIdCache = input.reserveIdCache ?? new Map<string, number>();
+   const chunkSize = Math.max(1, input.maxAccountsPerCall ?? 100);
+ 
+   for (let offset = 0; offset < accounts.length; offset += chunkSize) {
+     const chunk = accounts.slice(offset, offset + chunkSize);
+     const uncachedDecimals = assets.filter((asset) => !decimalsCache.has(asset.toLowerCase()));
++    const uncachedIds = assets.filter((asset) => !reserveIdCache.has(asset.toLowerCase()));
+     const contracts: unknown[] = [
+       ...chunk.map((account) => ({
+         address: input.addresses.uiPoolDataProvider,
+@@ -211,8 +347,12 @@ export async function resolveAccountReservePositions(
+         { address: input.addresses.pool, abi: aavePoolIndexAbi, functionName: "getReserveNormalizedIncome", args: [asset] },
+         { address: input.addresses.pool, abi: aavePoolIndexAbi, functionName: "getReserveNormalizedVariableDebt", args: [asset] },
+         { address: input.oracle, abi: aaveOracleAssetPriceAbi, functionName: "getAssetPrice", args: [asset] },
++        { address: input.addresses.pool, abi: aavePoolReserveConfigAbi, functionName: "getConfiguration", args: [asset] },
+       ]),
+       ...uncachedDecimals.map((asset) => ({ address: asset, abi: erc20DecimalsAbi, functionName: "decimals" })),
++      ...uncachedIds.map((asset) => ({
++        address: input.addresses.pool, abi: aavePoolReserveConfigAbi, functionName: "getReserveData", args: [asset],
++      })),
+     ];
+     const results = await input.client.multicall({
+       contracts,
+@@ -223,7 +363,16 @@ export async function resolveAccountReservePositions(
+       throw new Error(`multicall returned ${results.length} results for ${contracts.length} calls`);
+     }
+ 
+-    const decimalsOffset = chunk.length + assets.length * 3;
++    const perAsset = 4;
++    const decimalsOffset = chunk.length + assets.length * perAsset;
++    const idsOffset = decimalsOffset + uncachedDecimals.length;
++    uncachedIds.forEach((asset, index) => {
++      const response = results[idsOffset + index];
++      const id = response?.status === "success" ? (response.result as { id?: unknown } | undefined)?.id : undefined;
++      if (typeof id === "number" || typeof id === "bigint") {
++        reserveIdCache.set(asset.toLowerCase(), Number(id));
++      }
++    });
+     uncachedDecimals.forEach((asset, index) => {
+       const response = results[decimalsOffset + index];
+       if (response?.status === "success") {
+@@ -237,10 +386,11 @@ export async function resolveAccountReservePositions(
+     const market = new Map<string, AssetMarketData>();
+     const marketErrors: string[] = [];
+     assets.forEach((asset, index) => {
+-      const base = chunk.length + index * 3;
++      const base = chunk.length + index * perAsset;
+       const income = results[base];
+       const variable = results[base + 1];
+       const price = results[base + 2];
++      const configuration = results[base + 3];
+       const decimals = decimalsCache.get(asset.toLowerCase());
+       if (
+         income?.status !== "success" || variable?.status !== "success" || price?.status !== "success"
+@@ -255,9 +405,50 @@ export async function resolveAccountReservePositions(
+         variableBorrowIndex: variable.result,
+         priceUsd8: price.result,
+         decimals,
++        ...(configuration?.status === "success" && typeof configuration.result === "bigint"
++          ? { configuration: decodeReserveConfiguration(configuration.result) }
++          : {}),
+       });
+     });
+ 
++    // eMode categories used by accounts in this chunk (second, small multicall; fail closed per account).
++    const accountEMode = new Map<string, number>();
++    chunk.forEach((account, index) => {
++      const response = results[index];
++      if (response?.status === "success" && Array.isArray(response.result)) {
++        const category = Number(response.result[1] ?? 0);
++        accountEMode.set(account.toLowerCase(), Number.isInteger(category) ? category : 0);
++      }
++    });
++    const categories = [...new Set([...accountEMode.values()].filter((category) => category !== 0))];
++    const eModeData = new Map<number, EModeCategoryData>();
++    if (categories.length > 0) {
++      const eModeContracts = categories.flatMap((category) => [
++        { address: input.addresses.pool, abi: aavePoolReserveConfigAbi, functionName: "getEModeCategoryCollateralConfig", args: [category] },
++        { address: input.addresses.pool, abi: aavePoolReserveConfigAbi, functionName: "getEModeCategoryCollateralBitmap", args: [category] },
++      ]);
++      let eModeResults: readonly MulticallResultLike[] = [];
++      try {
++        eModeResults = await input.client.multicall({
++          contracts: eModeContracts,
++          allowFailure: true,
++          ...(input.blockNumber === undefined ? {} : { blockNumber: input.blockNumber }),
++        });
++      } catch {
++        eModeResults = [];
++      }
++      categories.forEach((category, index) => {
++        const config = eModeResults[index * 2];
++        const bitmap = eModeResults[index * 2 + 1];
++        const bonus = config?.status === "success"
++          ? Number((config.result as { liquidationBonus?: unknown } | undefined)?.liquidationBonus)
++          : Number.NaN;
++        if (bitmap?.status === "success" && typeof bitmap.result === "bigint" && Number.isInteger(bonus)) {
++          eModeData.set(category, { liquidationBonusRaw: bonus, collateralBitmap: bitmap.result });
++        }
++      });
++    }
++
+     chunk.forEach((account, index) => {
+       const key = account.toLowerCase();
+       const response = results[index];
+@@ -270,6 +461,12 @@ export async function resolveAccountReservePositions(
+         out.set(key, { ok: false, error: "getUserReservesData_malformed" });
+         return;
+       }
++      const eModeCategoryId = accountEMode.get(key) ?? 0;
++      const eMode = eModeCategoryId === 0 ? undefined : eModeData.get(eModeCategoryId);
++      if (eModeCategoryId !== 0 && eMode === undefined) {
++        out.set(key, { ok: false, error: `emode_config_failed:${eModeCategoryId}` });
++        return;
++      }
+       const reserves: AaveReservePosition[] = [];
+       const untrackedReserves: UntrackedReserveHolding[] = [];
+       let missingMarket: string | undefined;
+@@ -299,18 +496,54 @@ export async function resolveAccountReservePositions(
+           variableDebt: rayMulCeil(row.scaledVariableDebt, data.variableBorrowIndex),
+           stableDebt: 0n,
+           usageAsCollateralEnabled: row.usageAsCollateralEnabledOnUser,
++          ...effectiveBonus(data, eModeCategoryId, eMode, reserveIdCache.get(assetKey)),
+         });
+       }
+       if (missingMarket !== undefined) {
+         out.set(key, { ok: false, error: `reserve_market_data_failed:${missingMarket}` });
+         return;
+       }
+-      out.set(key, { ok: true, positions: { account, reserves, untrackedReserves } });
++      out.set(key, { ok: true, positions: { account, reserves, untrackedReserves, eModeCategoryId } });
+     });
+   }
+   return out;
+ }
+ 
++/**
++ * LiquidationLogic v3.3+: eMode bonus iff borrower eMode != 0 AND collateral reserve id is in the category
++ * collateral bitmap; otherwise the reserve bonus. Returns {} (bonus unknown -> sizing fails closed) when inputs
++ * are missing or the bonus is <= 100%.
++ */
++function effectiveBonus(
++  data: AssetMarketData,
++  eModeCategoryId: number,
++  eMode: EModeCategoryData | undefined,
++  reserveId: number | undefined,
++): Pick<AaveReservePosition, "liquidationBonusBps" | "liquidationProtocolFeeBps" | "liquidationBonusSource"> {
++  if (data.configuration === undefined) {
++    return {};
++  }
++  let raw = data.configuration.liquidationBonusRaw;
++  let source = "reserve";
++  if (eModeCategoryId !== 0) {
++    if (eMode === undefined || reserveId === undefined) {
++      return {};
++    }
++    if (((eMode.collateralBitmap >> BigInt(reserveId)) & 1n) === 1n) {
++      raw = eMode.liquidationBonusRaw;
++      source = `emode:${eModeCategoryId}`;
++    }
++  }
++  if (raw <= 10_000) {
++    return {};
++  }
++  return {
++    liquidationBonusBps: raw - 10_000,
++    liquidationProtocolFeeBps: data.configuration.liquidationProtocolFeeBps,
++    liquidationBonusSource: source,
++  };
++}
++
+ function extractRows(result: unknown): readonly UserReserveRow[] | undefined {
+   if (!Array.isArray(result)) {
+     return undefined;
+diff --git a/src/protocols/aaveV3.ts b/src/protocols/aaveV3.ts
+index 943a9e9..8dbfb2c 100644
+--- a/src/protocols/aaveV3.ts
++++ b/src/protocols/aaveV3.ts
+@@ -48,6 +48,17 @@ export interface LiquidationCandidate {
+   /** getUserAccountData.totalDebtBase / 1e8. */
+   readonly totalDebtUsd?: number;
+   readonly sizingCappedBy?: "actual_debt" | "close_factor" | "collateral";
++  /** v3.3 MustNotLeaveDust adjustment applied by sizing. */
++  readonly noDustAdjustment?: "none" | "bumped_to_full_debt" | "reduced_to_min_leftover";
++  /** Debt the protocol is expected to repay (<= debtToCover when collateral-capped). */
++  readonly expectedDebtRepaidRaw?: bigint;
++  /** On-chain liquidation protocol fee (bps of the bonus portion) of the collateral reserve. */
++  readonly liquidationProtocolFeeBps?: number;
++  readonly collateralDecimals?: number;
++  /** Aave oracle prices (8-dec USD) captured at sizing time. */
++  readonly debtPriceUsd8?: bigint;
++  readonly collateralPriceUsd8?: bigint;
++  readonly collateralBalanceRaw?: bigint;
+ }
+ 
+ export interface AaveAccountHealthInput {
+@@ -322,6 +333,7 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
+   private lastScanStats: AaveScanStats = { scanned: 0, liquidatable: 0 };
+   private lastBorrowerCursorId = ZERO_CURSOR_ID;
+   private readonly reserveDecimalsCache = new Map<string, number>();
++  private readonly reserveIdCache = new Map<string, number>();
+   private oracleAddress: Address | undefined;
+ 
+   public constructor(
+@@ -374,6 +386,7 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
+       accounts,
+       assets,
+       decimalsCache: this.reserveDecimalsCache,
++      reserveIdCache: this.reserveIdCache,
+     });
+   }
+ 
+diff --git a/src/protocols/liquidationFlashLoanReceiver.ts b/src/protocols/liquidationFlashLoanReceiver.ts
+index 9b529d3..c8666ad 100644
+--- a/src/protocols/liquidationFlashLoanReceiver.ts
++++ b/src/protocols/liquidationFlashLoanReceiver.ts
+@@ -1,33 +1,61 @@
+-import { encodeAbiParameters, parseAbiParameters } from "viem";
+-import type { Address } from "viem";
++import { decodeAbiParameters, encodeAbiParameters, parseAbiParameters } from "viem";
++import type { Address, Hex } from "viem";
+ 
+-const liquidationParams = parseAbiParameters(
+-  "uint8 routeType,address collateralAsset,address debtAsset,address user,uint256 debtToCover,uint256 minCollateralOut,bool receiveAToken",
+-);
++/**
++ * Aave V3 flash-liquidation params for the DEPLOYED `LiquidationFlashReceiver` v1 (RECEIVER_VERSION = 1,
++ * source commit 042e442 `contracts/LiquidationFlashReceiver.sol`, live on Base at
++ * 0x379ce85b431bd4cb3b2b11d682bac4556648ada6):
++ *   abi.decode(params, (address collateralAsset, address debtAsset, address user, uint256 debtToCover, bool receiveAToken))
++ * The receiver computes its own swap minOut (need * 98%) — there is NO minCollateralOut field on the wire.
++ *
++ * History: 8cbab38 (2026-05-30) switched this encoder to the 7-field MultiProtocolFlashReceiver layout
++ * `(uint8 routeType, collateral, debt, user, debtToCover, minCollateralOut, receiveAToken)`, which the live v1
++ * receiver decodes as collateral=0x0/debt=<collateral> -> DebtAssetMismatch (or an empty revert), i.e. every Aave
++ * flash liquidation reverted. The v1 layout is restored here; readiness pins the receiver code hash
++ * (production/liquidationReceiverReadiness.ts) so a layout/receiver mismatch blocks LIVE.
++ */
++export const LIQUIDATION_RECEIVER_V1_PARAMS =
++  "address collateralAsset,address debtAsset,address user,uint256 debtToCover,bool receiveAToken" as const;
++const liquidationParamsV1 = parseAbiParameters(LIQUIDATION_RECEIVER_V1_PARAMS);
++
++/**
++ * MultiProtocolFlashReceiver layout (contracts/MultiProtocolFlashReceiver.sol). NOT deployed; used only by the
++ * isolated Moonwell/Morpho adapters, never by the Aave route.
++ */
++export const MULTI_PROTOCOL_RECEIVER_PARAMS =
++  "uint8 routeType,address collateralAsset,address debtAsset,address user,uint256 debtToCover,uint256 minCollateralOut,bool receiveAToken" as const;
++const multiProtocolParams = parseAbiParameters(MULTI_PROTOCOL_RECEIVER_PARAMS);
+ 
+ export interface EncodedLiquidationRoute {
+   readonly collateralAsset: Address;
+   readonly debtAsset: Address;
+   readonly user: Address;
+   readonly debtToCover: bigint;
+-  readonly minCollateralOut: bigint;
+   readonly receiveAToken?: boolean;
+ }
+ 
+-export function encodeLiquidationRoute(route: EncodedLiquidationRoute): `0x${string}` {
+-  return encodeAbiParameters(liquidationParams, [
+-    0,
++export interface EncodedMultiProtocolRoute extends EncodedLiquidationRoute {
++  readonly minCollateralOut: bigint;
++}
++
++/** Aave V3 route for the live v1 receiver (5 fields, exact order of 042e442). */
++export function encodeLiquidationRoute(route: EncodedLiquidationRoute): Hex {
++  return encodeAbiParameters(liquidationParamsV1, [
+     route.collateralAsset,
+     route.debtAsset,
+     route.user,
+     route.debtToCover,
+-    route.minCollateralOut,
+     route.receiveAToken ?? false,
+   ]);
+ }
+ 
+-export function encodeMoonwellRoute(route: EncodedLiquidationRoute): `0x${string}` {
+-  return encodeAbiParameters(liquidationParams, [
++export function decodeLiquidationRouteV1(params: Hex): EncodedLiquidationRoute {
++  const [collateralAsset, debtAsset, user, debtToCover, receiveAToken] = decodeAbiParameters(liquidationParamsV1, params);
++  return { collateralAsset, debtAsset, user, debtToCover, receiveAToken };
++}
++
++export function encodeMoonwellRoute(route: EncodedMultiProtocolRoute): Hex {
++  return encodeAbiParameters(multiProtocolParams, [
+     1,
+     route.collateralAsset,
+     route.debtAsset,
+@@ -38,8 +66,8 @@ export function encodeMoonwellRoute(route: EncodedLiquidationRoute): `0x${string
+   ]);
+ }
+ 
+-export function encodeMorphoRoute(route: EncodedLiquidationRoute): `0x${string}` {
+-  return encodeAbiParameters(liquidationParams, [
++export function encodeMorphoRoute(route: EncodedMultiProtocolRoute): Hex {
++  return encodeAbiParameters(multiProtocolParams, [
+     2,
+     route.collateralAsset,
+     route.debtAsset,
+diff --git a/src/protocols/liquidationSizing.ts b/src/protocols/liquidationSizing.ts
+index fcb5238..08f032a 100644
+--- a/src/protocols/liquidationSizing.ts
++++ b/src/protocols/liquidationSizing.ts
+@@ -3,24 +3,62 @@ import { defaultCloseFactorBps } from "../config/aavePoolVersion";
+ import type { AaveReservePair } from "../config/chains";
+ import type { AaveReservePosition } from "./aaveReservePositions";
+ 
+-const bpsDenominator = 10_000n;
+-const fullCloseFactorBps = 10_000;
+-/** Aave v3.3+ LiquidationLogic.MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD (8-dec USD base). */
++/*
++ * Aave v3.3+ LiquidationLogic constants and rules.
++ * Source (verified 2026-09-28):
++ *   https://github.com/aave-dao/aave-v3-origin/blob/v3.3.0/src/contracts/protocol/libraries/logic/LiquidationLogic.sol
++ *     (tag v3.3.0 = 5431379f8beb4d7128c84a81ced3917d856efa84, lines 61-82 constants, 278-340 close factor + dust rule)
++ *   identical constants/conditions on main (8305565ae342f1773c42cd2e4593f175fe5968a0, lines 43-64, 259-324); main
++ *   rounds the reserve-debt base value UP (MathUtils.mulDivCeil) where v3.3.0 floors it — we use the ceil form.
++ *
++ *   DEFAULT_LIQUIDATION_CLOSE_FACTOR      = 0.5e4 (50%)
++ *   CLOSE_FACTOR_HF_THRESHOLD             = 0.95e18  ("below (inclusive)" -> 100%)
++ *   MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD   = 2000e8   (USD base, 8 decimals)
++ *   MIN_LEFTOVER_BASE                     = MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD / 2 = 1000e8
++ *
++ *   maxLiquidatableDebt = borrowerReserveDebt, unless
++ *     reserveCollateralBase >= 2000e8 && reserveDebtBase >= 2000e8 && HF > 0.95e18
++ *   in which case, if reserveDebtBase > percentMul(totalDebtBase, 50%), it is (totalDebtBase*50%) in debt units.
++ *   NOTE: the $2k test is on the CHOSEN collateral reserve and CHOSEN debt reserve (not account totals).
++ *
++ *   MustNotLeaveDust: if actualDebtToLiquidate < reserveDebt AND seized collateral (+protocol fee) < collateral
++ *   balance, then BOTH leftover debt base and leftover collateral base must be >= MIN_LEFTOVER_BASE, else revert.
++ */
++export const DEFAULT_LIQUIDATION_CLOSE_FACTOR_BPS = 5_000n;
++export const CLOSE_FACTOR_HF_THRESHOLD = 950_000_000_000_000_000n;
+ export const MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD = 2_000n * 100_000_000n;
++export const MIN_LEFTOVER_BASE = MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD / 2n;
++
++const bps = 10_000n;
++const halfBps = 5_000n;
++const fullCloseFactorBps = 10_000;
+ 
+ export interface LiquidationSizingInput {
+   readonly reserves: readonly AaveReservePosition[];
+   readonly pairs: readonly AaveReservePair[];
+   readonly healthFactor: bigint;
+-  /** getUserAccountData.totalDebtBase (8-dec USD). Close-factor cap = 50% of TOTAL debt, per Aave LiquidationLogic. */
++  /** getUserAccountData.totalDebtBase (8-dec USD). 50% cap is taken on TOTAL debt, per Aave LiquidationLogic. */
+   readonly totalDebtBase?: bigint;
+   /**
+-   * Aave v3.3+ rule: if the chosen reserve's collateral OR debt is < $2,000 base, close factor is 100%.
+-   * Not enabled by default (repo models plain v3 50/100 via defaultCloseFactorBps); see report.
++   * Aave v3.3+ rules (small-position 100% close factor + MustNotLeaveDust). Default ON (Base Pool is revision 11).
++   * `false` restores legacy sizing: close factor 50%/100% at HF<0.95, debtToCover = min(debt, cf cap, collateral cap).
+    */
++  readonly v33Rules?: boolean;
++  /** @deprecated alias of v33Rules kept for callers of the 2a8429f API. */
+   readonly smallPositionFullClose?: boolean;
+ }
+ 
++export type NoDustAdjustment =
++  /** nothing to adjust (full reserve debt / all collateral cleared, or leftovers >= MIN_LEFTOVER_BASE) */
++  | "none"
++  /**
++   * Collateral-capped: submit the full liquidatable reserve debt so the protocol consumes ALL collateral
++   * (a floor-rounded collateral cap would leave a few wei of collateral => MustNotLeaveDust revert).
++   */
++  | "bumped_to_full_debt"
++  /** 50% cap would leave < MIN_LEFTOVER_BASE of collateral: reduce so >= MIN_LEFTOVER_BASE of both remains. */
++  | "reduced_to_min_leftover";
++
+ export interface LiquidationPlan {
+   readonly collateralAsset: Address;
+   readonly debtAsset: Address;
+@@ -28,9 +66,15 @@ export interface LiquidationPlan {
+   readonly collateralDecimals: number;
+   readonly debtPriceUsd8: bigint;
+   readonly collateralPriceUsd8: bigint;
+-  /** Sized amount (native debt decimals) = min(actual debt, close-factor cap, collateral cap). */
++  /** Amount passed to liquidationCall / flash-borrowed (native debt decimals). */
+   readonly debtToCover: bigint;
+   readonly debtToCoverUsd: number;
++  /** Debt the protocol is expected to actually repay (<= debtToCover when collateral-capped). */
++  readonly expectedDebtRepaidRaw: bigint;
++  readonly expectedDebtRepaidUsd: number;
++  /** Collateral expected to reach the liquidator (after liquidation protocol fee), native collateral decimals. */
++  readonly expectedCollateralOutRaw: bigint;
++  readonly expectedProtocolFeeRaw: bigint;
+   /** Actual (variable + stable) debt of the chosen debt reserve, native decimals. */
+   readonly actualDebtRaw: bigint;
+   readonly actualDebtUsd: number;
+@@ -38,8 +82,12 @@ export interface LiquidationPlan {
+   readonly collateralUsd: number;
+   readonly totalDebtUsd?: number;
+   readonly closeFactorBps: number;
++  /** On-chain effective liquidation bonus (eMode-aware), bps over 100% (e.g. 500 = 105%). */
+   readonly liquidationBonusBps: number;
++  readonly liquidationProtocolFeeBps: number;
+   readonly cappedBy: "actual_debt" | "close_factor" | "collateral";
++  readonly v33Rules: boolean;
++  readonly noDustAdjustment: NoDustAdjustment;
+ }
+ 
+ export type LiquidationSizingResult =
+@@ -48,6 +96,17 @@ export type LiquidationSizingResult =
+     readonly kind: "pair_not_held";
+     readonly heldDebtAssets: readonly Address[];
+     readonly heldCollateralAssets: readonly Address[];
++  }
++  /** Fail closed: effective liquidation bonus could not be read on-chain for the chosen collateral. */
++  | { readonly kind: "bonus_unavailable"; readonly collateralAsset: Address; readonly debtAsset: Address }
++  /** v3.3 MustNotLeaveDust cannot be satisfied within the protocol close-factor cap. */
++  | {
++    readonly kind: "must_not_leave_dust";
++    readonly collateralAsset: Address;
++    readonly debtAsset: Address;
++    readonly actualDebtUsd: number;
++    readonly collateralUsd: number;
++    readonly closeFactorBps: number;
+   };
+ 
+ export function reserveUsd8(raw: bigint, decimals: number, priceUsd8: bigint): bigint {
+@@ -57,10 +116,31 @@ export function reserveUsd8(raw: bigint, decimals: number, priceUsd8: bigint): b
+   return (raw * priceUsd8) / 10n ** BigInt(decimals);
+ }
+ 
++function reserveUsd8Ceil(raw: bigint, decimals: number, priceUsd8: bigint): bigint {
++  if (raw <= 0n || priceUsd8 <= 0n) {
++    return 0n;
++  }
++  return ceilDiv(raw * priceUsd8, 10n ** BigInt(decimals));
++}
++
+ export function usd8ToNumber(value: bigint): number {
+   return Number(value) / 1e8;
+ }
+ 
++/** Aave PercentageMath.percentMul (half-up). */
++export function percentMul(value: bigint, percentage: bigint): bigint {
++  return (value * percentage + halfBps) / bps;
++}
++
++/** Aave PercentageMath.percentDiv (half-up). */
++export function percentDiv(value: bigint, percentage: bigint): bigint {
++  return (value * bps + percentage / 2n) / percentage;
++}
++
++function ceilDiv(a: bigint, b: bigint): bigint {
++  return a === 0n ? 0n : (a + b - 1n) / b;
++}
++
+ function totalDebt(reserve: AaveReservePosition): bigint {
+   return reserve.variableDebt + reserve.stableDebt;
+ }
+@@ -69,12 +149,92 @@ function sameAddress(left: string, right: string): boolean {
+   return left.toLowerCase() === right.toLowerCase();
+ }
+ 
++export interface CollateralSimulationInput {
++  readonly debtToCover: bigint;
++  readonly debtPriceUsd8: bigint;
++  readonly debtDecimals: number;
++  readonly collateralPriceUsd8: bigint;
++  readonly collateralDecimals: number;
++  readonly collateralBalance: bigint;
++  /** bps over 100% (500 => 105%). */
++  readonly liquidationBonusBps: number;
++  readonly liquidationProtocolFeeBps: number;
++}
++
++export interface CollateralSimulation {
++  readonly debtRepaid: bigint;
++  /** Collateral leaving the borrower (liquidator + protocol fee). */
++  readonly collateralSeized: bigint;
++  readonly liquidatorCollateral: bigint;
++  readonly protocolFee: bigint;
++}
++
++/** Mirrors LiquidationLogic._calculateAvailableCollateralToLiquidate (v3.3+). */
++export function simulateCollateralToLiquidate(input: CollateralSimulationInput): CollateralSimulation {
++  const debtUnit = 10n ** BigInt(input.debtDecimals);
++  const collateralUnit = 10n ** BigInt(input.collateralDecimals);
++  const bonus = bps + BigInt(input.liquidationBonusBps);
++  const baseCollateral = (input.debtPriceUsd8 * input.debtToCover * collateralUnit)
++    / (input.collateralPriceUsd8 * debtUnit);
++  const maxCollateralToLiquidate = percentMul(baseCollateral, bonus);
++  let collateralAmount: bigint;
++  let debtRepaid: bigint;
++  if (maxCollateralToLiquidate > input.collateralBalance) {
++    collateralAmount = input.collateralBalance;
++    debtRepaid = percentDiv(
++      (input.collateralPriceUsd8 * collateralAmount * debtUnit) / (input.debtPriceUsd8 * collateralUnit),
++      bonus,
++    );
++  } else {
++    collateralAmount = maxCollateralToLiquidate;
++    debtRepaid = input.debtToCover;
++  }
++  let protocolFee = 0n;
++  if (input.liquidationProtocolFeeBps !== 0) {
++    const bonusCollateral = collateralAmount - percentDiv(collateralAmount, bonus);
++    protocolFee = percentMul(bonusCollateral, BigInt(input.liquidationProtocolFeeBps));
++  }
++  return {
++    debtRepaid,
++    collateralSeized: collateralAmount,
++    liquidatorCollateral: collateralAmount - protocolFee,
++    protocolFee,
++  };
++}
++
++/**
++ * v3.3 MustNotLeaveDust check. Leftover debt uses floor rounding (v3.3.0, the stricter form); leftover collateral
++ * uses floor in every version. Returns true when the liquidation would revert.
++ */
++export function wouldLeaveDust(input: {
++  readonly reserveDebt: bigint;
++  readonly debtDecimals: number;
++  readonly debtPriceUsd8: bigint;
++  readonly collateralBalance: bigint;
++  readonly collateralDecimals: number;
++  readonly collateralPriceUsd8: bigint;
++  readonly simulation: CollateralSimulation;
++}): boolean {
++  if (input.simulation.debtRepaid >= input.reserveDebt || input.simulation.collateralSeized >= input.collateralBalance) {
++    return false;
++  }
++  const debtLeft = reserveUsd8(input.reserveDebt - input.simulation.debtRepaid, input.debtDecimals, input.debtPriceUsd8);
++  const collateralLeft = reserveUsd8(
++    input.collateralBalance - input.simulation.collateralSeized,
++    input.collateralDecimals,
++    input.collateralPriceUsd8,
++  );
++  return debtLeft < MIN_LEFTOVER_BASE || collateralLeft < MIN_LEFTOVER_BASE;
++}
++
+ /**
+  * Choose the liquidation pair from ACTUAL holdings and size debtToCover.
+  * - debt asset: largest-USD debt reserve that is a configured pair debt asset (falls through to the next
+  *   largest if no held collateral forms a configured pair with it)
+  * - collateral: largest-USD collateral reserve with usageAsCollateralEnabled that forms a configured pair
+- * - debtToCover = min(actual debt, close-factor cap, collateral cap)
++ * - liquidation bonus / protocol fee: ON-CHAIN values carried on the collateral reserve (eMode-aware). Missing =>
++ *   `bonus_unavailable` (fail closed; the pair config bonus is never used for sizing).
++ * - v3.3 (default): debtToCover = min(reserve debt, protocol max liquidatable), then MustNotLeaveDust adjustment.
+  */
+ export function planAaveLiquidation(input: LiquidationSizingInput): LiquidationSizingResult {
+   const debtReserves = input.reserves
+@@ -99,7 +259,10 @@ export function planAaveLiquidation(input: LiquidationSizingInput): LiquidationS
+       if (pair === undefined) {
+         continue;
+       }
+-      return { kind: "planned", plan: sizePlan(input, debt, collateral, pair) };
++      if (collateral.liquidationBonusBps === undefined || collateral.liquidationProtocolFeeBps === undefined) {
++        return { kind: "bonus_unavailable", collateralAsset: collateral.asset, debtAsset: debt.asset };
++      }
++      return sizePlan(input, debt, collateral, collateral.liquidationBonusBps, collateral.liquidationProtocolFeeBps);
+     }
+   }
+ 
+@@ -114,60 +277,145 @@ function sizePlan(
+   input: LiquidationSizingInput,
+   debt: AaveReservePosition,
+   collateral: AaveReservePosition,
+-  pair: AaveReservePair,
+-): LiquidationPlan {
++  liquidationBonusBps: number,
++  liquidationProtocolFeeBps: number,
++): LiquidationSizingResult {
++  const v33Rules = input.v33Rules ?? input.smallPositionFullClose ?? true;
+   const actualDebtRaw = totalDebt(debt);
+   const debtUnit = 10n ** BigInt(debt.decimals);
+-  const collateralUnit = 10n ** BigInt(collateral.decimals);
+-  const reserveDebtBase = reserveUsd8(actualDebtRaw, debt.decimals, debt.priceUsd8);
++  const reserveDebtBase = reserveUsd8Ceil(actualDebtRaw, debt.decimals, debt.priceUsd8);
+   const reserveCollateralBase = reserveUsd8(collateral.collateralBalance, collateral.decimals, collateral.priceUsd8);
++  const simulate = (debtToCover: bigint): CollateralSimulation => simulateCollateralToLiquidate({
++    debtToCover,
++    debtPriceUsd8: debt.priceUsd8,
++    debtDecimals: debt.decimals,
++    collateralPriceUsd8: collateral.priceUsd8,
++    collateralDecimals: collateral.decimals,
++    collateralBalance: collateral.collateralBalance,
++    liquidationBonusBps,
++    liquidationProtocolFeeBps,
++  });
++  const dust = (simulation: CollateralSimulation): boolean => wouldLeaveDust({
++    reserveDebt: actualDebtRaw,
++    debtDecimals: debt.decimals,
++    debtPriceUsd8: debt.priceUsd8,
++    collateralBalance: collateral.collateralBalance,
++    collateralDecimals: collateral.decimals,
++    collateralPriceUsd8: collateral.priceUsd8,
++    simulation,
++  });
+ 
+-  let closeFactorBps = defaultCloseFactorBps("v3", input.healthFactor);
+-  if (
+-    input.smallPositionFullClose === true
+-    && (reserveDebtBase < MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD || reserveCollateralBase < MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD)
+-  ) {
+-    closeFactorBps = fullCloseFactorBps;
++  let fullClose: boolean;
++  if (v33Rules) {
++    fullClose = !(
++      reserveCollateralBase >= MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD
++      && reserveDebtBase >= MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD
++      && input.healthFactor > CLOSE_FACTOR_HF_THRESHOLD
++    );
++  } else {
++    fullClose = defaultCloseFactorBps("v3", input.healthFactor) === fullCloseFactorBps;
+   }
++  const closeFactorBps = fullClose ? fullCloseFactorBps : Number(DEFAULT_LIQUIDATION_CLOSE_FACTOR_BPS);
+ 
+-  let debtToCover = actualDebtRaw;
+-  let cappedBy: LiquidationPlan["cappedBy"] = "actual_debt";
+-  if (closeFactorBps < fullCloseFactorBps) {
+-    const closeFactorCap = input.totalDebtBase !== undefined && input.totalDebtBase > 0n
+-      ? (((input.totalDebtBase * BigInt(closeFactorBps)) / bpsDenominator) * debtUnit) / debt.priceUsd8
+-      : (actualDebtRaw * BigInt(closeFactorBps)) / bpsDenominator;
+-    if (closeFactorCap < debtToCover) {
+-      debtToCover = closeFactorCap;
+-      cappedBy = "close_factor";
++  let maxLiquidatable = actualDebtRaw;
++  if (!fullClose) {
++    if (input.totalDebtBase !== undefined && input.totalDebtBase > 0n) {
++      const totalDefault = percentMul(input.totalDebtBase, DEFAULT_LIQUIDATION_CLOSE_FACTOR_BPS);
++      if (reserveDebtBase > totalDefault) {
++        maxLiquidatable = (totalDefault * debtUnit) / debt.priceUsd8;
++      }
++    } else {
++      maxLiquidatable = (actualDebtRaw * DEFAULT_LIQUIDATION_CLOSE_FACTOR_BPS) / bps;
+     }
+   }
+ 
+-  // Collateral cap: debtToCover * (1 + bonus) must not exceed the chosen collateral balance (USD).
+-  const bonusMultiplierBps = bpsDenominator + BigInt(pair.liquidationBonusBps);
+-  const collateralCap = (collateral.collateralBalance * collateral.priceUsd8 * debtUnit * bpsDenominator)
+-    / (collateralUnit * debt.priceUsd8 * bonusMultiplierBps);
+-  if (collateralCap < debtToCover) {
+-    debtToCover = collateralCap;
+-    cappedBy = "collateral";
++  let debtToCover = maxLiquidatable;
++  let noDustAdjustment: NoDustAdjustment = "none";
++  let cappedBy: LiquidationPlan["cappedBy"] = maxLiquidatable < actualDebtRaw ? "close_factor" : "actual_debt";
++
++  if (!v33Rules) {
++    // Legacy sizing (pre-v3.3): additionally cap by collateral-with-bonus (floor).
++    const collateralUnit = 10n ** BigInt(collateral.decimals);
++    const collateralCap = (collateral.collateralBalance * collateral.priceUsd8 * debtUnit * bps)
++      / (collateralUnit * debt.priceUsd8 * (bps + BigInt(liquidationBonusBps)));
++    if (collateralCap < debtToCover) {
++      debtToCover = collateralCap;
++      cappedBy = "collateral";
++    }
++  }
++
++  let simulation = simulate(debtToCover);
++  if (v33Rules) {
++    if (simulation.debtRepaid < debtT
