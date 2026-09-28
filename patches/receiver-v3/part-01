@@ -1,3 +1,469 @@
+diff --git a/docs/receiver-v3-review.md b/docs/receiver-v3-review.md
+new file mode 100644
+index 0000000..1dc273b
+--- /dev/null
++++ b/docs/receiver-v3-review.md
+@@ -0,0 +1,117 @@
++# LiquidationFlashReceiverV3 — design review
++
++Status: **code + review only**. Authorized by CoS for writing and reviewing; **not** authorized to deploy, broadcast, push to `master`, merge a PR, use a private key/wallet, or touch a host. All fork measurements below ran against a **local** `anvil --fork-url https://mainnet.base.org` instance (no Alchemy; public Base RPC for forking only).
++
++Live receiver today: `0x379ce85b431bd4cb3b2b11d682bac4556648ada6` = `contracts/LiquidationFlashReceiver.sol` (v1 layout from commit `042e442`, later bumped to `RECEIVER_VERSION = 2` with an HF precheck). This V3 contract is for a **future** redeploy.
++
++## Threat model
++
++| Threat | v1 LIVE | MultiProtocol (Grok-Work) | V3 |
++| --- | --- | --- | --- |
++| Anyone opens `flashLoanSimple` into the receiver with attacker-chosen params and drains leftover/profit balance | Open (no initiator check) | Fail-*open* when `authorizedInitiator == 0` | Fail-*closed*: `executor` never zero (ctor + setter); stranger initiator reverts; `initiator == address(this)` only accepted while `liquidate()` is on the stack |
++| Sandwich / skim on the collateral→debt swap | Floor = 98% of *shortfall* only | Uses caller `minCollateralOut`, but still swaps whole balance | Floor = `max(minCollateralOut, amount+premium)`; swap amount = **delta only** |
++| Preexisting receiver balance used to paper over a bad swap | Yes (absolute balance check) | Yes | No — repayment measured as debt-token **delta**; preexisting funds are neither spent nor swept |
++| Partial liquidation leaves Pool allowance open | Approves `debtToCover`, may leave residue | Same | Resets leftover allowance to 0 after `liquidationCall`; router allowance reset after swap |
++| Profit stranded in the contract (drainable later) | Yes | Yes (no sweep) | Swept to `profitRecipient` every fill; receiver ends with zero *delta* balances |
++| Moonwell / Morpho / unexpected route | N/A (5-field) | Routes 1/2 present | `routeType != 0` reverts; no Moonwell |
++| `receiveAToken = true` leaves aTokens that need redeem | Accepted | Accepted | Reverts (`ReceiveATokenUnsupported`) |
++| Accidental native ETH | No `receive` | Has `receive()` + WETH wrap | No `receive`/`fallback` (Aave + SwapRouter02 never send ETH here); forced ETH still recoverable via `rescue(address(0), …)` |
++| Owner rug / key compromise | Single-step private owner | Single-step | Two-step ownership; `rescue` onlyOwner; executor/profitRecipient/fee mapping are owner-settable but cannot be zeroed |
++
++Assumptions out of scope for the contract itself: the bot EOA key security, RPC honesty, Uniswap V3 pool liquidity at the configured fee tier, and Aave oracle integrity.
++
++## Diff vs v1 (`LiquidationFlashReceiver.sol` @ LIVE)
++
++- Params: 5-field → 7-field (`routeType`, …, `minCollateralOut`, `receiveAToken`).
++- Initiator gate + nonReentrant lock.
++- Fee: immutable `swapFee` → owner mapping `poolFee[collateral][debt]` (unset reverts).
++- Swap input: whole `balanceOf(collateral)` → exact seized delta.
++- Repay check: absolute balance → delta vs `owe`; swap floor covers `owe`.
++- `collateral == debt`: v1 skipped `liquidationCall`; V3 still calls it and requires `received >= owe`.
++- Sweep to `profitRecipient`; events; `layoutId()`; two-step owner; optional `liquidate()` entry.
++
++## Diff vs `MultiProtocolFlashReceiver` (origin/Grok-Work tip)
++
++Kept: 7-field layout (so the future TS cutover can reuse the same ABI encoding), Aave route, SwapRouter02 exactInputSingle, Pool address.
++
++Removed / fixed:
++
++- Moonwell + WETH wrap + whole-balance / WETH-fallback swap.
++- Fail-open initiator (`authorizedInitiator == 0` allowed anyone).
++- Absolute-balance repay check; no sweep; no fee mapping; no reentrancy lock; no two-step owner; no `layoutId`.
++
++## Initiation compatibility
++
++Today's TS (`src/executors/liquidationExecutionAdapter.ts` → `toFlashWrappedEnvelope`) builds a tx **to the Aave Pool** with `flashLoanSimple(receiver, debt, amount, params, referral)`. Aave passes `initiator = msg.sender of flashLoanSimple = bot EOA`. Therefore:
++
++- Deploy with `executor = bot EOA` (the same address that signs the Pool call).
++- Optional: the bot may instead call `receiver.liquidate(...)` (executor-only), in which case Aave sets `initiator = address(this)` and the lock state `_IN_LIQUIDATE` authorizes it.
++
++Do **not** set `executor` to the receiver address itself unless the bot switches to the `liquidate()` entry.
++
++## Deploy parameters (Base)
++
++| Param | Value |
++| --- | --- |
++| `pool_` | `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5` |
++| `router_` | `0x2626664c2603336E57B271c5C0b26F421741e481` (SwapRouter02) |
++| `owner_` | ops multisig / cold key (NOT the bot EOA) |
++| `executor_` | bot EOA (the address that will call `Pool.flashLoanSimple`) |
++| `profitRecipient_` | treasury / ops wallet (nonzero) |
++
++Post-deploy `setPoolFee` (Uniswap V3 factory `0x33128a8fC17869897dcE68Ed026d694621f6FDfD`, read at Base block ~51911851 via public RPC):
++
++| Pair | Recommended fee | Pool | Why |
++| --- | --- | --- | --- |
++| WETH → USDC | **500** | `0xd0b53D9277642d899DF5C87A3966A349A798F224` | Deep liquidity (~1.36e18 L); QuoterV2 1/10/100 WETH → 2,689.16 / 26,882.32 / 267,913.03 USDC. Fee 3000 → 2,681.38 / 26,813.55 / 268,106.55: 3000 has ~30x more in-range L and wins above ~50–100 WETH; consider 3000 (or per-size routing in a later version) for very large WETH fills. Fee 100/10000 are thin. |
++| cbBTC → USDC | **500** | `0xfBB6Eed8e7aa03B138556eeDaF5D271A5E1e43ef` | Best of the set (~2.23e12 L; QuoterV2 0.1 cbBTC → 8,388 USDC, 1 cbBTC → 83,782 USDC). Fee 3000: 8,361 / 83,198 (worse). |
++| cbBTC → WETH | **500** | `0x7AeA2E8A3843516afa07293a10Ac8E49906dabD1` | Best L (~1.98e17); QuoterV2 0.1 / 1 cbBTC → 3.1173 / 31.165 WETH vs fee 3000 3.1025 / 31.009. |
++
++`fee = 0` unsets a pair (next fill reverts `FeeNotSet`). Owner should set every pair the bot may liquidate before cutover.
++
++Oracle used in fork E2E (verified via `Pool.ADDRESSES_PROVIDER().getPriceOracle()`): `0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156`.
++
++## Gas (local anvil fork of Base @ block 51911800)
++
++| Measurement | Gas |
++| --- | --- |
++| Contract create (`forge create` on local anvil; receipt `gasUsed`) | **1,223,926** (`0x12acf6`) |
++| `cast estimate --create` (same bytecode+args) | **1,223,926** |
++| Runtime code size | **4,941** bytes |
++| E2E `Pool.flashLoanSimple` (WETH/USDC, debtToCover 10,676.77 USDC, fee 500) | **~673,371** (in-EVM `gasleft` delta; includes liquidationCall + swap + sweep) |
++| E2E `receiver.liquidate()` entry (debtToCover 5,338.38 USDC) | **~673,043** |
++
++> The `gasleft()` delta printed inside Foundry `setUp` for `new LiquidationFlashReceiverV3(...)` (~15k) is **not** a reliable deploy estimate (Foundry accounting); use the `forge create` / `cast estimate` numbers above.
++
++Fork E2E also asserted: profit swept (e.g. **2,432,651,727 USDC units ≈ $2,432.65** on the half-position fill), receiver USDC/WETH balances and allowances = 0, stranger initiator reverts, unset fee reverts, `minCollateralOut` too high reverts (`Too little received`).
++
++## Unit coverage (Foundry, no fork)
++
++26/26 pass: constructor zero-checks, identity (`receiverVersion=3`, `layoutId=keccak256("BOT21_RECEIVER_V3_7FIELD")`), OnlyPool, initiator fail-closed (stranger / zero / self-outside-liquidate), OnlyExecutor, reentrancy, `routeType!=0`, `receiveAToken`, debt mismatch, debtToCover>amount, fee unset, approvals reset, sweep+zero balances, same-asset path, preexisting balance cannot cover shortfall and is not swept, minOut floor/sandwich, rescue onlyOwner (ERC20+ETH), plain ETH transfer reverts, two-step ownership.
++
++TS encoder round-trip: `test/unit/liquidationReceiverV3.test.ts` (3/3).
++
++## TS cutover (future; **not** done here)
++
++New file only: `src/executors/liquidationReceiverV3.ts` (encode/decode, ABI, identity assert). Live path still uses `src/protocols/liquidationFlashLoanReceiver.ts`.
++
++At cutover:
++
++1. Deploy V3; set `executor`, `profitRecipient`, `poolFee` for every traded pair.
++2. Point `FLASH_LOAN_RECEIVER_ADDRESS` (or equivalent) at the new address.
++3. In `liquidationExecutionAdapter.ts`, replace `encodeLiquidationRoute` with `encodeLiquidationReceiverV3Params`. Keep calling **Pool** directly (executor = bot EOA).
++4. Readiness: `receiverVersion()==3` and `layoutId()==RECEIVER_V3_LAYOUT_ID`.
++5. Treat `minCollateralOut` as **minDebtOut** when sizing. Today `estimateMinimumCollateralOut` returns `debtCovered * (1 + bonus) * (1 - slippage)` in debt-token units, which V3 will read as the minimum swap output; that is compatible in units but should be re-derived from a live Quoter quote of the expected seized collateral (the contract separately floors at `owe`).
++6. Do **not** send Moonwell/Morpho routeTypes; they revert.
++
++## Compile settings
++
++Solidity **0.8.26**, `viaIR: true`, optimizer **200** runs (matches `scripts/compile-liquidation-receiver.mjs` + `foundry.toml`). Artifact `contracts/build/LiquidationFlashReceiverV3.json` is generated by `npm run compile:contracts` (not committed on this branch, to keep the reviewable diff source-only).
++
++## Hard rules respected
++
++- No transaction broadcast to Base mainnet or any public testnet.
++- No real private key / wallet / host access. **Disclosure:** the deploy-gas measurement used `forge create` with Foundry/anvil's publicly known dev key #0 against the in-memory local anvil fork at `127.0.0.1:8547` only (nothing left the box; no public chain). `cast estimate --create` (keyless) gives the same figure and is the recommended method going forward.
++- No push to `master`, no PR merge.
++- Public RPC `https://mainnet.base.org` used only for forking / read-only `eth_call`.
++- Sibling worktree `/workspace/sizingfix` (`fix/sizing-followups`) untouched.
+diff --git a/foundry.toml b/foundry.toml
+new file mode 100644
+index 0000000..6646b4d
+--- /dev/null
++++ b/foundry.toml
+@@ -0,0 +1,20 @@
++# Foundry config for the Solidity receiver contracts (TS bot uses scripts/compile-liquidation-receiver.mjs).
++# Setup once: forge install foundry-rs/forge-std --no-git   (lib/ is gitignored)
++[profile.default]
++src = "contracts"
++test = "test/foundry"
++out = "out-forge"
++cache_path = "cache-forge"
++libs = ["lib"]
++solc_version = "0.8.26"
++via_ir = true
++optimizer = true
++optimizer_runs = 200
++evm_version = "cancun"
++remappings = ["forge-std/=lib/forge-std/src/"]
++
++[rpc_endpoints]
++base = "https://mainnet.base.org"
++
++[lint]
++lint_on_build = false
+diff --git a/scripts/compile-liquidation-receiver.mjs b/scripts/compile-liquidation-receiver.mjs
+index a4ee73e..c52981c 100644
+--- a/scripts/compile-liquidation-receiver.mjs
++++ b/scripts/compile-liquidation-receiver.mjs
+@@ -9,6 +9,7 @@ const outDir = path.join(root, "contracts", "build");
+ const contractsToCompile = [
+   "LiquidationFlashReceiver.sol",
+   "MultiProtocolFlashReceiver.sol",
++  "LiquidationFlashReceiverV3.sol",
+ ];
+ const sources = Object.fromEntries(
+   contractsToCompile.map((name) => [
+diff --git a/src/executors/liquidationReceiverV3.ts b/src/executors/liquidationReceiverV3.ts
+new file mode 100644
+index 0000000..9beb9e7
+--- /dev/null
++++ b/src/executors/liquidationReceiverV3.ts
+@@ -0,0 +1,186 @@
++/**
++ * LiquidationFlashReceiverV3 encoder/decoder + readiness helpers.
++ *
++ * NOT wired into the live execution path. The live bot still uses the v1/v2
++ * 5-field layout (or the transitional 7-field encoder in
++ * `src/protocols/liquidationFlashLoanReceiver.ts`). Switch the adapter over to
++ * this module only at a future redeploy when the V3 receiver is live.
++ *
++ * Layout (abi-encoded, 7 fields):
++ *   (uint8 routeType, address collateral, address debt, address user,
++ *    uint256 debtToCover, uint256 minCollateralOut, bool receiveAToken)
++ *
++ * Semantics:
++ * - routeType MUST be 0 (Aave V3). The contract reverts on any other value.
++ * - minCollateralOut is, despite the historical name, the minimum DEBT-token
++ *   amount the collateral->debt swap must return ("minDebtOut"). The contract
++ *   enforces amountOutMinimum = max(minCollateralOut, amount + premium).
++ * - receiveAToken MUST be false.
++ * - Uniswap V3 fee is NOT in params; it is set on-chain via owner.setPoolFee.
++ *
++ * Initiation (compatible with today's TS path):
++ *   the bot EOA calls Pool.flashLoanSimple(receiver, debt, amount, params, 0).
++ *   Aave passes initiator = that EOA, which must equal the on-chain `executor`.
++ */
++import {
++  encodeAbiParameters,
++  decodeAbiParameters,
++  keccak256,
++  toBytes,
++  type Address,
++  type Hex,
++} from "viem";
++
++export const RECEIVER_V3_VERSION = 3n;
++export const RECEIVER_V3_LAYOUT_ID = keccak256(toBytes("BOT21_RECEIVER_V3_7FIELD"));
++export const RECEIVER_V3_ROUTE_AAVE = 0;
++
++const paramsAbi = [
++  { name: "routeType", type: "uint8" },
++  { name: "collateral", type: "address" },
++  { name: "debt", type: "address" },
++  { name: "user", type: "address" },
++  { name: "debtToCover", type: "uint256" },
++  { name: "minCollateralOut", type: "uint256" },
++  { name: "receiveAToken", type: "bool" },
++] as const;
++
++export interface LiquidationReceiverV3Params {
++  readonly collateral: Address;
++  readonly debt: Address;
++  readonly user: Address;
++  readonly debtToCover: bigint;
++  /** Minimum debt-token amount out of the swap (historical name: minCollateralOut). */
++  readonly minCollateralOut: bigint;
++  readonly receiveAToken?: boolean;
++  /** Must be 0. Defaults to RECEIVER_V3_ROUTE_AAVE. */
++  readonly routeType?: number;
++}
++
++export function encodeLiquidationReceiverV3Params(
++  route: LiquidationReceiverV3Params,
++): Hex {
++  const routeType = route.routeType ?? RECEIVER_V3_ROUTE_AAVE;
++  if (routeType !== RECEIVER_V3_ROUTE_AAVE) {
++    throw new Error(`LiquidationReceiverV3 only supports routeType 0 (got ${routeType})`);
++  }
++  if (route.receiveAToken === true) {
++    throw new Error("LiquidationReceiverV3 requires receiveAToken=false");
++  }
++  return encodeAbiParameters(paramsAbi, [
++    RECEIVER_V3_ROUTE_AAVE,
++    route.collateral,
++    route.debt,
++    route.user,
++    route.debtToCover,
++    route.minCollateralOut,
++    false,
++  ]);
++}
++
++export function decodeLiquidationReceiverV3Params(data: Hex): LiquidationReceiverV3Params & {
++  readonly routeType: number;
++  readonly receiveAToken: boolean;
++} {
++  const [routeType, collateral, debt, user, debtToCover, minCollateralOut, receiveAToken] =
++    decodeAbiParameters(paramsAbi, data);
++  return {
++    routeType: Number(routeType),
++    collateral,
++    debt,
++    user,
++    debtToCover,
++    minCollateralOut,
++    receiveAToken,
++  };
++}
++
++/** Minimal ABI surface used by readiness / cutover checks. */
++export const liquidationFlashReceiverV3Abi = [
++  {
++    type: "function",
++    name: "receiverVersion",
++    stateMutability: "pure",
++    inputs: [],
++    outputs: [{ type: "uint256" }],
++  },
++  {
++    type: "function",
++    name: "layoutId",
++    stateMutability: "pure",
++    inputs: [],
++    outputs: [{ type: "bytes32" }],
++  },
++  {
++    type: "function",
++    name: "executor",
++    stateMutability: "view",
++    inputs: [],
++    outputs: [{ type: "address" }],
++  },
++  {
++    type: "function",
++    name: "profitRecipient",
++    stateMutability: "view",
++    inputs: [],
++    outputs: [{ type: "address" }],
++  },
++  {
++    type: "function",
++    name: "poolFee",
++    stateMutability: "view",
++    inputs: [
++      { name: "collateral", type: "address" },
++      { name: "debt", type: "address" },
++    ],
++    outputs: [{ type: "uint24" }],
++  },
++  {
++    type: "function",
++    name: "liquidate",
++    stateMutability: "nonpayable",
++    inputs: [
++      { name: "collateral", type: "address" },
++      { name: "debt", type: "address" },
++      { name: "user", type: "address" },
++      { name: "debtToCover", type: "uint256" },
++      { name: "minCollateralOut", type: "uint256" },
++    ],
++    outputs: [],
++  },
++  {
++    type: "function",
++    name: "setPoolFee",
++    stateMutability: "nonpayable",
++    inputs: [
++      { name: "collateral", type: "address" },
++      { name: "debt", type: "address" },
++      { name: "fee", type: "uint24" },
++    ],
++    outputs: [],
++  },
++  {
++    type: "event",
++    name: "LiquidationExecuted",
++    inputs: [
++      { name: "user", type: "address", indexed: true },
++      { name: "collateral", type: "address", indexed: true },
++      { name: "debt", type: "address", indexed: true },
++      { name: "debtCovered", type: "uint256", indexed: false },
++      { name: "collateralReceived", type: "uint256", indexed: false },
++      { name: "profit", type: "uint256", indexed: false },
++    ],
++  },
++] as const;
++
++export function assertReceiverV3Identity(args: {
++  readonly version: bigint;
++  readonly layoutId: Hex;
++}): void {
++  if (args.version !== RECEIVER_V3_VERSION) {
++    throw new Error(`unexpected receiverVersion ${args.version} (want ${RECEIVER_V3_VERSION})`);
++  }
++  if (args.layoutId.toLowerCase() !== RECEIVER_V3_LAYOUT_ID.toLowerCase()) {
++    throw new Error(`unexpected layoutId ${args.layoutId}`);
++  }
++}
+diff --git a/test/foundry/LiquidationFlashReceiverV3.fork.t.sol b/test/foundry/LiquidationFlashReceiverV3.fork.t.sol
+new file mode 100644
+index 0000000..456d1b3
+--- /dev/null
++++ b/test/foundry/LiquidationFlashReceiverV3.fork.t.sol
+@@ -0,0 +1,172 @@
++// SPDX-License-Identifier: MIT
++pragma solidity 0.8.26;
++
++import {Test, console2} from "forge-std/Test.sol";
++import {
++    LiquidationFlashReceiverV3,
++    IAavePoolV3,
++    ISwapRouter02V3
++} from "../../contracts/LiquidationFlashReceiverV3.sol";
++
++interface IERC20F {
++    function balanceOf(address) external view returns (uint256);
++    function approve(address, uint256) external returns (bool);
++    function allowance(address, address) external view returns (uint256);
++}
++
++interface IPoolF {
++    function ADDRESSES_PROVIDER() external view returns (address);
++    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
++    function borrow(address asset, uint256 amount, uint256 rateMode, uint16 referralCode, address onBehalfOf)
++        external;
++    function flashLoanSimple(address receiver, address asset, uint256 amount, bytes calldata params, uint16 ref)
++        external;
++    function getUserAccountData(address user)
++        external
++        view
++        returns (uint256, uint256, uint256, uint256, uint256, uint256);
++}
++
++interface IAddressesProviderF {
++    function getPriceOracle() external view returns (address);
++}
++
++interface IOracleF {
++    function getAssetPrice(address asset) external view returns (uint256);
++}
++
++/// @notice Base-mainnet fork E2E. Run with:
++///   FORK_URL=https://mainnet.base.org FORK_BLOCK=<n> forge test --match-contract Fork -vv
++/// Skips (passes trivially) when FORK_URL is unset. Nothing is broadcast; everything runs in-memory.
++contract LiquidationFlashReceiverV3ForkTest is Test {
++    address constant POOL = 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5;
++    address constant ROUTER = 0x2626664c2603336E57B271c5C0b26F421741e481;
++    address constant WETH = 0x4200000000000000000000000000000000000006;
++    address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
++    address constant EXPECTED_ORACLE = 0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156;
++
++    LiquidationFlashReceiverV3 recv;
++    address owner = makeAddr("owner");
++    address executor = makeAddr("executorEOA");
++    address recipient = makeAddr("profitRecipient");
++    address borrower = makeAddr("borrower");
++    address oracle;
++    bool forked;
++    uint256 borrowed;
++
++    function setUp() public {
++        string memory url = vm.envOr("FORK_URL", string(""));
++        if (bytes(url).length == 0) return;
++        uint256 blk = vm.envOr("FORK_BLOCK", uint256(0));
++        if (blk == 0) vm.createSelectFork(url);
++        else vm.createSelectFork(url, blk);
++        forked = true;
++
++        oracle = IAddressesProviderF(IPoolF(POOL).ADDRESSES_PROVIDER()).getPriceOracle();
++        assertEq(oracle, EXPECTED_ORACLE, "oracle address");
++
++        uint256 g0 = gasleft();
++        recv = new LiquidationFlashReceiverV3(
++            IAavePoolV3(POOL), ISwapRouter02V3(ROUTER), owner, executor, recipient
++        );
++        console2.log("deploy gas (in-EVM, excl. intrinsic+calldata)", g0 - gasleft());
++        console2.log("runtime code size", address(recv).code.length);
++        vm.prank(owner);
++        recv.setPoolFee(WETH, USDC, 500);
++
++        // Borrower: supply 10 WETH, borrow USDC near max.
++        deal(WETH, borrower, 10 ether);
++        vm.startPrank(borrower);
++        IERC20F(WETH).approve(POOL, type(uint256).max);
++        IPoolF(POOL).supply(WETH, 10 ether, borrower, 0);
++        (,, uint256 availBase,,,) = IPoolF(POOL).getUserAccountData(borrower);
++        borrowed = (availBase * 99 / 100) / 100; // base (8dp USD) -> USDC 6dp
++        IPoolF(POOL).borrow(USDC, borrowed, 2, 0, borrower);
++        vm.stopPrank();
++
++        (,,,,, uint256 hf) = IPoolF(POOL).getUserAccountData(borrower);
++        console2.log("HF after borrow (1e18)", hf);
++        console2.log("borrowed USDC", borrowed);
++
++        // Drop WETH oracle price 15% so HF < 1.
++        uint256 px = IOracleF(oracle).getAssetPrice(WETH);
++        vm.mockCall(
++            oracle, abi.encodeWithSelector(IOracleF.getAssetPrice.selector, WETH), abi.encode(px * 85 / 100)
++        );
++        (,,,,, hf) = IPoolF(POOL).getUserAccountData(borrower);
++        console2.log("WETH oracle px (8dp) real", px);
++        console2.log("HF after oracle drop (1e18)", hf);
++        assertLt(hf, 1e18, "not liquidatable");
++    }
++
++    function _params(uint256 dtc, uint256 minOut) internal view returns (bytes memory) {
++        return abi.encode(uint8(0), WETH, USDC, borrower, dtc, minOut, false);
++    }
++
++    function _assertClean() internal view {
++        assertEq(IERC20F(USDC).balanceOf(address(recv)), 0, "recv USDC");
 +        assertEq(IERC20F(WETH).balanceOf(address(recv)), 0, "recv WETH");
 +        assertEq(IERC20F(USDC).allowance(address(recv), POOL), 0, "USDC->pool allowance");
 +        assertEq(IERC20F(WETH).allowance(address(recv), ROUTER), 0, "WETH->router allowance");
@@ -63,59 +529,3 @@
 +        IPoolF(POOL).flashLoanSimple(address(recv), USDC, dtc, _params(dtc, 0), 0);
 +    }
 +}
-+
-diff --git a/test/unit/liquidationReceiverV3.test.ts b/test/unit/liquidationReceiverV3.test.ts
-new file mode 100644
-index 0000000..bc489ea
---- /dev/null
-+++ b/test/unit/liquidationReceiverV3.test.ts
-@@ -0,0 +1,46 @@
-+import { describe, expect, it } from "vitest";
-+import {
-+  RECEIVER_V3_LAYOUT_ID,
-+  RECEIVER_V3_VERSION,
-+  assertReceiverV3Identity,
-+  decodeLiquidationReceiverV3Params,
-+  encodeLiquidationReceiverV3Params,
-+} from "../../src/executors/liquidationReceiverV3";
-+
-+const sample = {
-+  collateral: "0x4200000000000000000000000000000000000006" as const,
-+  debt: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as const,
-+  user: "0x1111111111111111111111111111111111111111" as const,
-+  debtToCover: 1_000_000n,
-+  minCollateralOut: 990_000n,
-+};
-+
-+describe("liquidationReceiverV3", () => {
-+  it("round-trips the 7-field layout with routeType 0 and receiveAToken false", () => {
-+    const encoded = encodeLiquidationReceiverV3Params(sample);
-+    const decoded = decodeLiquidationReceiverV3Params(encoded);
-+    expect(decoded.routeType).toBe(0);
-+    expect(decoded.receiveAToken).toBe(false);
-+    expect(decoded.collateral.toLowerCase()).toBe(sample.collateral.toLowerCase());
-+    expect(decoded.debt.toLowerCase()).toBe(sample.debt.toLowerCase());
-+    expect(decoded.user.toLowerCase()).toBe(sample.user.toLowerCase());
-+    expect(decoded.debtToCover).toBe(sample.debtToCover);
-+    expect(decoded.minCollateralOut).toBe(sample.minCollateralOut);
-+  });
-+
-+  it("rejects non-Aave routeType and receiveAToken=true at encode time", () => {
-+    expect(() => encodeLiquidationReceiverV3Params({ ...sample, routeType: 1 })).toThrow(/routeType 0/);
-+    expect(() => encodeLiquidationReceiverV3Params({ ...sample, receiveAToken: true })).toThrow(/receiveAToken/);
-+  });
-+
-+  it("exposes stable identity constants", () => {
-+    expect(RECEIVER_V3_VERSION).toBe(3n);
-+    expect(RECEIVER_V3_LAYOUT_ID).toMatch(/^0x[0-9a-f]{64}$/i);
-+    expect(() =>
-+      assertReceiverV3Identity({ version: 3n, layoutId: RECEIVER_V3_LAYOUT_ID }),
-+    ).not.toThrow();
-+    expect(() =>
-+      assertReceiverV3Identity({ version: 2n, layoutId: RECEIVER_V3_LAYOUT_ID }),
-+    ).toThrow(/receiverVersion/);
-+  });
-+});
--- 
-2.47.3
-
