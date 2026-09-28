@@ -1,0 +1,440 @@
+From 1e406f081fb29c4b39bc37474562158617593c36 Mon Sep 17 00:00:00 2001
+From: Brickadelic <brickadelic@local>
+Date: Mon, 28 Sep 2026 10:37:57 -0600
+Subject: [PATCH] feat(receiver): LiquidationFlashReceiverV3 (Aave-only,
+ 7-field, fail-closed)
+
+New flash-liquidation receiver for a future Base redeploy:
+- 7-field params; routeType==0 only; receiveAToken must be false
+- initiator==executor (never-zero) or self via liquidate(); OnlyPool; reentrancy guard
+- delta-based balances; swap exactly seized collateral; fee via owner mapping
+- minDebtOut floor = max(minCollateralOut, amount+premium); preexisting balance cannot cover
+- sweep profit to profitRecipient; approvals reset; two-step owner; rescue; layoutId
+- Foundry unit + Base fork E2E (local anvil); TS encoder in separate file (not wired live)
+- Review doc with threat model, fee-tier findings, gas, cutover notes
+
+No deploy/broadcast to mainnet or testnet.
+---
+ .gitignore                                    |   6 +
+ contracts/LiquidationFlashReceiverV3.sol      | 383 ++++++++++++++++++
+ docs/receiver-v3-review.md                    | 117 ++++++
+ foundry.toml                                  |  20 +
+ scripts/compile-liquidation-receiver.mjs      |   1 +
+ src/executors/liquidationReceiverV3.ts        | 186 +++++++++
+ .../LiquidationFlashReceiverV3.fork.t.sol     | 172 ++++++++
+ test/foundry/LiquidationFlashReceiverV3.t.sol | 332 +++++++++++++++
+ test/foundry/mocks/ReceiverV3Mocks.sol        | 129 ++++++
+ test/unit/liquidationReceiverV3.test.ts       |  46 +++
+ 10 files changed, 1392 insertions(+)
+ create mode 100644 contracts/LiquidationFlashReceiverV3.sol
+ create mode 100644 docs/receiver-v3-review.md
+ create mode 100644 foundry.toml
+ create mode 100644 src/executors/liquidationReceiverV3.ts
+ create mode 100644 test/foundry/LiquidationFlashReceiverV3.fork.t.sol
+ create mode 100644 test/foundry/LiquidationFlashReceiverV3.t.sol
+ create mode 100644 test/foundry/mocks/ReceiverV3Mocks.sol
+ create mode 100644 test/unit/liquidationReceiverV3.test.ts
+
+diff --git a/.gitignore b/.gitignore
+index 2238135..accb4ff 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -25,3 +25,9 @@ logs/
+ 
+ # Heap snapshots (manual or ENABLE_HEAP_SNAPSHOTS)
+ *.heapsnapshot
++
++# Foundry (receiver contracts)
++/lib/
++/out-forge/
++/cache-forge/
++/broadcast/
+diff --git a/contracts/LiquidationFlashReceiverV3.sol b/contracts/LiquidationFlashReceiverV3.sol
+new file mode 100644
+index 0000000..537750f
+--- /dev/null
++++ b/contracts/LiquidationFlashReceiverV3.sol
+@@ -0,0 +1,383 @@
++// SPDX-License-Identifier: MIT
++pragma solidity 0.8.26;
++
++/// @notice Minimal ERC20 surface used by the V3 receiver.
++interface IERC20V3 {
++    function balanceOf(address account) external view returns (uint256);
++    function allowance(address owner, address spender) external view returns (uint256);
++    function approve(address spender, uint256 amount) external returns (bool);
++    function transfer(address to, uint256 amount) external returns (bool);
++}
++
++/// @notice Aave V3 Pool surface used by the V3 receiver.
++interface IAavePoolV3 {
++    function flashLoanSimple(
++        address receiverAddress,
++        address asset,
++        uint256 amount,
++        bytes calldata params,
++        uint16 referralCode
++    ) external;
++
++    function liquidationCall(
++        address collateralAsset,
++        address debtAsset,
++        address user,
++        uint256 debtToCover,
++        bool receiveAToken
++    ) external;
++}
++
++/// @notice Uniswap V3 `SwapRouter02` (no `deadline` field in params).
++interface ISwapRouter02V3 {
++    struct ExactInputSingleParams {
++        address tokenIn;
++        address tokenOut;
++        uint24 fee;
++        address recipient;
++        uint256 amountIn;
++        uint256 amountOutMinimum;
++        uint160 sqrtPriceLimitX96;
++    }
++
++    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
++}
++
++/// @title LiquidationFlashReceiverV3
++/// @notice Aave V3 `flashLoanSimple` receiver for Bot2.1 on Base. Aave-only (routeType 0).
++///
++/// Params layout (7 fields, abi-encoded, identical to MultiProtocolFlashReceiver):
++///   (uint8 routeType, address collateral, address debt, address user,
++///    uint256 debtToCover, uint256 minCollateralOut, bool receiveAToken)
++///
++/// - `routeType` MUST be 0 (Aave V3 liquidationCall). Anything else reverts.
++/// - `minCollateralOut` is, despite its historical name, the minimum amount of the DEBT token the
++///   collateral->debt swap must return ("minDebtOut"). The effective swap floor is
++///   `max(minCollateralOut, amount + premium)` so the swap alone always covers the flash repayment.
++/// - `receiveAToken` MUST be false.
++/// - `debtToCover` MUST be <= the flash-loaned `amount` (no `type(uint256).max` sentinel).
++///
++/// Swap fee tier is NOT in params: it is looked up in an owner-set mapping
++/// `poolFee[collateral][debt]` and the call reverts with `FeeNotSet` when it is unset.
++///
++/// Initiation: the bot (the `executor` EOA) may either
++///   (a) call `POOL.flashLoanSimple(receiver, debt, amount, params, 0)` directly (how the TS
++///       adapter works today) -> Aave passes `initiator == executor`; or
++///   (b) call `liquidate(...)` on this contract -> Aave passes `initiator == address(this)`, which is
++///       only accepted while `liquidate` is on the stack.
++/// Any other initiator (including address(0)) reverts: the gate fails closed.
++///
++/// All profit (debt-token delta above the repayment, plus any leftover seized collateral) is swept
++/// to `profitRecipient` at the end of every fill. The contract has no `receive()`/`fallback`;
++/// neither Aave V3 (receiveAToken=false, ERC20 underlyings) nor SwapRouter02 (ERC20 out) ever
++/// sends native ETH here, so omitting them makes accidental ETH transfers revert.
++contract LiquidationFlashReceiverV3 {
++    // ------------------------------------------------------------------ constants / immutables
++    uint256 public constant RECEIVER_VERSION = 3;
++    bytes32 public constant LAYOUT_ID = keccak256("BOT21_RECEIVER_V3_7FIELD");
++    uint8 public constant ROUTE_AAVE_V3 = 0;
++
++    IAavePoolV3 public immutable POOL;
++    ISwapRouter02V3 public immutable SWAP_ROUTER;
++
++    // ------------------------------------------------------------------ lock states
++    uint256 private constant _IDLE = 1;
++    uint256 private constant _IN_LIQUIDATE = 2;
++    uint256 private constant _IN_CALLBACK = 3;
++
++    // ------------------------------------------------------------------ storage
++    address public owner;
++    address public pendingOwner;
++    address public executor;
++    address public profitRecipient;
++    /// @notice Uniswap V3 fee tier used to swap `collateral` -> `debt`. 0 = unset (reverts).
++    mapping(address collateral => mapping(address debt => uint24 fee)) public poolFee;
++    uint256 private _lock = _IDLE;
++
++    // ------------------------------------------------------------------ events
++    event LiquidationExecuted(
++        address indexed user,
++        address indexed collateral,
++        address indexed debt,
++        uint256 debtCovered,
++        uint256 collateralReceived,
++        uint256 profit
++    );
++    event ExecutorUpdated(address indexed previous, address indexed next);
++    event ProfitRecipientUpdated(address indexed previous, address indexed next);
++    event PoolFeeUpdated(address indexed collateral, address indexed debt, uint24 fee);
++    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
++    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
++    event Rescued(address indexed token, address indexed to, uint256 amount);
++
++    // ------------------------------------------------------------------ errors
++    error ZeroAddress();
++    error OnlyOwner();
++    error OnlyPendingOwner();
++    error OnlyExecutor();
++    error OnlyPool();
++    error UnauthorizedInitiator();
++    error Reentrancy();
++    error UnsupportedRouteType(uint8 routeType);
++    error ReceiveATokenUnsupported();
++    error DebtAssetMismatch();
++    error DebtToCoverExceedsFlash();
++    error FeeNotSet(address collateral, address debt);
++    error InvalidFee();
++    error NoCollateralReceived();
++    error InsufficientRepay(uint256 have, uint256 owe);
++    error TokenCallFailed(address token);
++    error NativeTransferFailed();
++
++    // ------------------------------------------------------------------ constructor
++    constructor(
++        IAavePoolV3 pool_,
++        ISwapRouter02V3 router_,
++        address owner_,
++        address executor_,
++        address profitRecipient_
++    ) {
++        if (
++            address(pool_) == address(0) || address(router_) == address(0) || owner_ == address(0)
++                || executor_ == address(0) || profitRecipient_ == address(0)
++        ) revert ZeroAddress();
++        POOL = pool_;
++        SWAP_ROUTER = router_;
++        owner = owner_;
++        executor = executor_;
++        profitRecipient = profitRecipient_;
++        emit OwnershipTransferred(address(0), owner_);
++        emit ExecutorUpdated(address(0), executor_);
++        emit ProfitRecipientUpdated(address(0), profitRecipient_);
++    }
++
++    // ------------------------------------------------------------------ modifiers
++    modifier onlyOwner() {
++        if (msg.sender != owner) revert OnlyOwner();
++        _;
++    }
++
++    // ------------------------------------------------------------------ identity
++    function receiverVersion() external pure returns (uint256) {
++        return RECEIVER_VERSION;
++    }
++
++    function layoutId() external pure returns (bytes32) {
++        return LAYOUT_ID;
++    }
++
++    function aavePool() external view returns (address) {
++        return address(POOL);
++    }
++
++    function swapRouter() external view returns (address) {
++        return address(SWAP_ROUTER);
++    }
++
++    // ------------------------------------------------------------------ admin
++    function setExecutor(address next) external onlyOwner {
++        if (next == address(0)) revert ZeroAddress();
++        emit ExecutorUpdated(executor, next);
++        executor = next;
++    }
++
++    function setProfitRecipient(address next) external onlyOwner {
++        if (next == address(0)) revert ZeroAddress();
++        emit ProfitRecipientUpdated(profitRecipient, next);
++        profitRecipient = next;
++    }
++
++    /// @notice Set the Uniswap V3 fee tier for the collateral->debt swap. `fee == 0` unsets the pair.
++    function setPoolFee(address collateral, address debt, uint24 fee) external onlyOwner {
++        if (collateral == address(0) || debt == address(0)) revert ZeroAddress();
++        if (fee >= 1_000_000) revert InvalidFee();
++        poolFee[collateral][debt] = fee;
++        emit PoolFeeUpdated(collateral, debt, fee);
++    }
++
++    function transferOwnership(address newOwner) external onlyOwner {
++        if (newOwner == address(0)) revert ZeroAddress();
++        pendingOwner = newOwner;
++        emit OwnershipTransferStarted(owner, newOwner);
++    }
++
++    function acceptOwnership() external {
++        if (msg.sender != pendingOwner) revert OnlyPendingOwner();
++        emit OwnershipTransferred(owner, msg.sender);
++        owner = msg.sender;
++        pendingOwner = address(0);
++    }
++
++    /// @notice Recover ERC20 (`token != 0`) or native ETH (`token == 0`). Owner only.
++    function rescue(address token, address to, uint256 amount) external onlyOwner {
++        if (to == address(0)) revert ZeroAddress();
++        if (_lock != _IDLE) revert Reentrancy();
++        if (token == address(0)) {
++            (bool ok,) = to.call{value: amount}("");
++            if (!ok) revert NativeTransferFailed();
++        } else {
++            _safeTransfer(token, to, amount);
++        }
++        emit Rescued(token, to, amount);
++    }
++
++    // ------------------------------------------------------------------ entry
++    /// @notice Optional entry: executor asks this contract to open the flash loan itself.
++    function liquidate(
++        address collateral,
++        address debt,
++        address user,
++        uint256 debtToCover,
++        uint256 minCollateralOut
++    ) external {
++        if (msg.sender != executor) revert OnlyExecutor();
++        if (_lock != _IDLE) revert Reentrancy();
++        _lock = _IN_LIQUIDATE;
++        bytes memory params =
++            abi.encode(ROUTE_AAVE_V3, collateral, debt, user, debtToCover, minCollateralOut, false);
++        POOL.flashLoanSimple(address(this), debt, debtToCover, params, 0);
++        _lock = _IDLE;
++    }
++
++    // ------------------------------------------------------------------ Aave callback
++    struct Route {
++        address collateral;
++        address debt;
++        address user;
++        uint256 debtToCover;
++        uint256 minDebtOut;
++    }
++
++    /// @notice Aave pulls `amount + premium` of `asset` right after this returns.
++    function executeOperation(
++        address asset,
++        uint256 amount,
++        uint256 premium,
++        address initiator,
++        bytes calldata params
++    ) external returns (bool) {
++        if (msg.sender != address(POOL)) revert OnlyPool();
++
++        uint256 prevLock = _lock;
++        if (prevLock == _IN_CALLBACK) revert Reentrancy();
++        if (initiator == address(this)) {
++            if (prevLock != _IN_LIQUIDATE) revert UnauthorizedInitiator();
++        } else {
++            // executor can never be zero (constructor + setter), so initiator == 0 always fails.
++            if (initiator != executor || prevLock != _IDLE) revert UnauthorizedInitiator();
++        }
++        _lock = _IN_CALLBACK;
++
++        Route memory r = _decode(params);
++        if (r.debt != asset) revert DebtAssetMismatch();
++        if (r.debtToCover > amount) revert DebtToCoverExceedsFlash();
++
++        uint256 owe = amount + premium;
++        uint256 debtCovered;
++        uint256 received;
++        uint256 profit;
++        {
++            // Pre-existing debt-token balance (excludes the flash amount just received). It is never
++            // used to cover repayment and is never swept (owner can `rescue` it).
++            uint256 debtBase = _balanceOf(asset) - amount;
++            (debtCovered, received) = _liquidate(r);
++
++            if (r.collateral != asset) {
++                _swapExact(r.collateral, asset, received, r.minDebtOut > owe ? r.minDebtOut : owe);
++            } else if (received < owe) {
++                revert InsufficientRepay(received, owe);
++            }
++
++            uint256 debtNow = _balanceOf(asset);
++            uint256 gained = debtNow > debtBase ? debtNow - debtBase : 0;
++            if (gained < owe) revert InsufficientRepay(gained, owe);
++            profit = gained - owe;
++        }
++
++        // Sweep profit in debt token; Aave keeps exactly `owe` to pull.
++        address recipient = profitRecipient;
++        if (profit > 0) _safeTransfer(asset, recipient, profit);
++
++        _safeApprove(asset, address(POOL), owe);
++
++        emit LiquidationExecuted(r.user, r.collateral, asset, debtCovered, received, profit);
++        _lock = prevLock;
++        return true;
++    }
++
++    // ------------------------------------------------------------------ internals
++    function _decode(bytes calldata params) private pure returns (Route memory r) {
++        (
++            uint8 routeType,
++            address collateral,
++            address debt,
++            address user,
++            uint256 debtToCover,
++            uint256 minCollateralOut,
++            bool receiveAToken
++        ) = abi.decode(params, (uint8, address, address, address, uint256, uint256, bool));
++        if (routeType != ROUTE_AAVE_V3) revert UnsupportedRouteType(routeType);
++        if (receiveAToken) revert ReceiveATokenUnsupported();
++        r = Route(collateral, debt, user, debtToCover, minCollateralOut);
++    }
++
++    /// @dev Calls liquidationCall and returns (debt actually pulled by Aave, collateral received).
++    ///      Debt spent is measured from the exact allowance consumed, which works for both the
++    ///      cross-asset and the collateral == debt path.
++    function _liquidate(Route memory r) private returns (uint256 debtCovered, uint256 received) {
++        address pool = address(POOL);
++        uint256 collBefore = _balanceOf(r.collateral);
++        _safeApprove(r.debt, pool, r.debtToCover);
++        POOL.liquidationCall(r.collateral, r.debt, r.user, r.debtToCover, false);
++        uint256 leftAllowance = IERC20V3(r.debt).allowance(address(this), pool);
++        debtCovered = r.debtToCover - leftAllowance;
++        if (leftAllowance != 0) _safeApprove(r.debt, pool, 0);
++
++        uint256 collAfter = _balanceOf(r.collateral);
++        if (r.collateral == r.debt) {
++            // balance moved by (received - debtCovered)
++            received = collAfter + debtCovered - collBefore;
++        } else {
++            received = collAfter - collBefore;
++        }
++        if (received == 0) revert NoCollateralReceived();
++    }
++
++    /// @dev Swaps exactly `amountIn` (the seized collateral delta) via SwapRouter02.
++    function _swapExact(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) private {
++        uint24 fee = poolFee[tokenIn][tokenOut];
++        if (fee == 0) revert FeeNotSet(tokenIn, tokenOut);
++        address router = address(SWAP_ROUTER);
++        _safeApprove(tokenIn, router, amountIn);
++        SWAP_ROUTER.exactInputSingle(
++            ISwapRouter02V3.ExactInputSingleParams({
++                tokenIn: tokenIn,
++                tokenOut: tokenOut,
++                fee: fee,
++                recipient: address(this),
++                amountIn: amountIn,
++                amountOutMinimum: minOut,
++                sqrtPriceLimitX96: 0
++            })
++        );
++        if (IERC20V3(tokenIn).allowance(address(this), router) != 0) _safeApprove(tokenIn, router, 0);
++    }
++
++    function _balanceOf(address token) private view returns (uint256) {
++        return IERC20V3(token).balanceOf(address(this));
++    }
++
++    function _safeApprove(address token, address spender, uint256 amount) private {
++        _callOptionalReturn(token, abi.encodeCall(IERC20V3.approve, (spender, amount)));
++    }
++
++    function _safeTransfer(address token, address to, uint256 amount) private {
++        _callOptionalReturn(token, abi.encodeCall(IERC20V3.transfer, (to, amount)));
++    }
++
++    function _callOptionalReturn(address token, bytes memory data) private {
++        if (token.code.length == 0) revert TokenCallFailed(token);
++        (bool ok, bytes memory ret) = token.call(data);
++        if (!ok || (ret.length != 0 && !abi.decode(ret, (bool)))) revert TokenCallFailed(token);
++    }
++}
