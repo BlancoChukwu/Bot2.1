@@ -25,3 +25,9 @@ logs/
 
 # Heap snapshots (manual or ENABLE_HEAP_SNAPSHOTS)
 *.heapsnapshot
+
+# Foundry (receiver contracts)
+/lib/
+/out-forge/
+/cache-forge/
+/broadcast/

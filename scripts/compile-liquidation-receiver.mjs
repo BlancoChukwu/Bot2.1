@@ -9,6 +9,7 @@ const outDir = path.join(root, "contracts", "build");
 const contractsToCompile = [
   "LiquidationFlashReceiver.sol",
   "MultiProtocolFlashReceiver.sol",
+  "LiquidationFlashReceiverV3.sol",
 ];
 const sources = Object.fromEntries(
   contractsToCompile.map((name) => [

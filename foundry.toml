@@ -1,0 +1,20 @@
+# Foundry config for the Solidity receiver contracts (TS bot uses scripts/compile-liquidation-receiver.mjs).
+# Setup once: forge install foundry-rs/forge-std --no-git   (lib/ is gitignored)
+[profile.default]
+src = "contracts"
+test = "test/foundry"
+out = "out-forge"
+cache_path = "cache-forge"
+libs = ["lib"]
+solc_version = "0.8.26"
+via_ir = true
+optimizer = true
+optimizer_runs = 200
+evm_version = "cancun"
+remappings = ["forge-std/=lib/forge-std/src/"]
+
+[rpc_endpoints]
+base = "https://mainnet.base.org"
+
+[lint]
+lint_on_build = false
