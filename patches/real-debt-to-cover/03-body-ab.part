@@ -1,0 +1,627 @@
+diff --git a/src/protocols/aaveReservePositions.ts b/src/protocols/aaveReservePositions.ts
+new file mode 100644
+index 0000000..0745168
+--- /dev/null
++++ b/src/protocols/aaveReservePositions.ts
+@@ -0,0 +1,348 @@
++import type { Address } from "viem";
++import { uiPoolDataProviderAbi } from "./uiPoolDataProvider";
++
++/**
++ * Real per-reserve Aave V3 positions for liquidation sizing.
++ *
++ * One multicall per batch of accounts:
++ *   - UiPoolDataProvider.getUserReservesData(provider, user) per account (scaled balances + collateral flag)
++ *   - Pool.getReserveNormalizedIncome / getReserveNormalizedVariableDebt per tracked asset (current indices)
++ *   - AaveOracle.getAssetPrice per tracked asset (8-dec USD base)
++ *   - ERC20.decimals per tracked asset (cached after first successful read)
++ * Real balance = scaled * index / RAY with protocol rounding (v3.4+ TokenMath): collateral (aToken) rounds
++ * DOWN, variable debt rounds UP — this reproduces getUserAccountData.totalDebtBase exactly (verified on the
++ * 0xf20e replay: 10 scaled sats cbBTC -> 11 sats debt -> 923715 base).
++ * Stable debt is not exposed by the v3.2+ UserReserveData struct (stable rate removed) and is reported as 0.
++ */
++
++const RAY = 10n ** 27n;
++
++export function rayMulFloor(a: bigint, b: bigint): bigint {
++  return (a * b) / RAY;
++}
++
++export function rayMulCeil(a: bigint, b: bigint): bigint {
++  const product = a * b;
++  if (product === 0n) {
++    return 0n;
++  }
++  return (product + RAY - 1n) / RAY;
++}
++
++export const aavePoolIndexAbi = [
++  {
++    type: "function",
++    name: "getReserveNormalizedIncome",
++    stateMutability: "view",
++    inputs: [{ name: "asset", type: "address" }],
++    outputs: [{ name: "", type: "uint256" }],
++  },
++  {
++    type: "function",
++    name: "getReserveNormalizedVariableDebt",
++    stateMutability: "view",
++    inputs: [{ name: "asset", type: "address" }],
++    outputs: [{ name: "", type: "uint256" }],
++  },
++] as const;
++
++export const poolAddressesProviderOracleAbi = [
++  {
++    type: "function",
++    name: "getPriceOracle",
++    stateMutability: "view",
++    inputs: [],
++    outputs: [{ name: "", type: "address" }],
++  },
++] as const;
++
++export const aaveOracleAssetPriceAbi = [
++  {
++    type: "function",
++    name: "getAssetPrice",
++    stateMutability: "view",
++    inputs: [{ name: "asset", type: "address" }],
++    outputs: [{ name: "", type: "uint256" }],
++  },
++] as const;
++
++export const erc20DecimalsAbi = [
++  {
++    type: "function",
++    name: "decimals",
++    stateMutability: "view",
++    inputs: [],
++    outputs: [{ name: "", type: "uint8" }],
++  },
++] as const;
++
++export interface AaveReservePosition {
++  readonly asset: Address;
++  readonly decimals: number;
++  /** Aave oracle price, 8-decimal USD base. */
++  readonly priceUsd8: bigint;
++  readonly collateralBalance: bigint;
++  readonly variableDebt: bigint;
++  readonly stableDebt: bigint;
++  readonly usageAsCollateralEnabled: boolean;
++}
++
++export interface UntrackedReserveHolding {
++  readonly asset: Address;
++  readonly hasDebt: boolean;
++  readonly hasCollateral: boolean;
++}
++
++export interface AaveAccountReservePositions {
++  readonly account: Address;
++  readonly reserves: readonly AaveReservePosition[];
++  /** Held reserves outside the tracked (configured-pair) asset set — cannot be liquidated by this bot. */
++  readonly untrackedReserves?: readonly UntrackedReserveHolding[];
++}
++
++export type AccountReservePositionsResult =
++  | { readonly ok: true; readonly positions: AaveAccountReservePositions }
++  | { readonly ok: false; readonly error: string };
++
++export type MulticallResultLike =
++  | { readonly status: "success"; readonly result: unknown }
++  | { readonly status: "failure"; readonly error: unknown };
++
++export interface ReservePositionsMulticallClient {
++  multicall(parameters: {
++    readonly contracts: readonly unknown[];
++    readonly allowFailure: true;
++    readonly blockNumber?: bigint;
++  }): Promise<readonly MulticallResultLike[]>;
++}
++
++export interface ReservePositionsAddresses {
++  readonly pool: Address;
++  readonly poolAddressesProvider: Address;
++  readonly uiPoolDataProvider: Address;
++  /** Optional explicit AaveOracle; otherwise resolved once via PoolAddressesProvider.getPriceOracle(). */
++  readonly oracle?: Address;
++}
++
++export interface ResolveReservePositionsInput {
++  readonly client: ReservePositionsMulticallClient;
++  readonly addresses: ReservePositionsAddresses;
++  readonly accounts: readonly Address[];
++  /** Reserves relevant to liquidation (configured pair assets). */
++  readonly assets: readonly Address[];
++  readonly decimalsCache?: Map<string, number>;
++  readonly blockNumber?: bigint;
++  readonly maxAccountsPerCall?: number;
++}
++
++interface AssetMarketData {
++  readonly liquidityIndex: bigint;
++  readonly variableBorrowIndex: bigint;
++  readonly priceUsd8: bigint;
++  readonly decimals: number;
++}
++
++interface UserReserveRow {
++  readonly underlyingAsset: Address;
++  readonly scaledATokenBalance: bigint;
++  readonly usageAsCollateralEnabledOnUser: boolean;
++  readonly scaledVariableDebt: bigint;
++}
++
++export function asReservePositionsMulticallClient(client: unknown): ReservePositionsMulticallClient | undefined {
++  const candidate = client as { multicall?: unknown } | undefined;
++  if (candidate === undefined || candidate === null || typeof candidate.multicall !== "function") {
++    return undefined;
++  }
++  return client as ReservePositionsMulticallClient;
++}
++
++export async function resolveOracleAddress(
++  client: ReservePositionsMulticallClient,
++  addresses: ReservePositionsAddresses,
++  blockNumber?: bigint,
++): Promise<Address> {
++  if (addresses.oracle !== undefined) {
++    return addresses.oracle;
++  }
++  const [result] = await client.multicall({
++    contracts: [{
++      address: addresses.poolAddressesProvider,
++      abi: poolAddressesProviderOracleAbi,
++      functionName: "getPriceOracle",
++    }],
++    allowFailure: true,
++    ...(blockNumber === undefined ? {} : { blockNumber }),
++  });
++  if (result?.status !== "success" || typeof result.result !== "string") {
++    throw new Error("getPriceOracle failed");
++  }
++  return result.result as Address;
++}
++
++/**
++ * Resolve real per-reserve positions for many accounts. Never throws for per-account problems:
++ * each account maps to `{ ok: false, error }` so callers can log `debt_to_cover_resolve_failed` and skip.
++ * Throws only when the transport itself fails (caller may retry once).
++ */
++export async function resolveAccountReservePositions(
++  input: ResolveReservePositionsInput & { readonly oracle: Address },
++): Promise<Map<string, AccountReservePositionsResult>> {
++  const out = new Map<string, AccountReservePositionsResult>();
++  const accounts = dedupe(input.accounts);
++  if (accounts.length === 0) {
++    return out;
++  }
++  const assets = dedupe(input.assets);
++  const decimalsCache = input.decimalsCache ?? new Map<string, number>();
++  const chunkSize = Math.max(1, input.maxAccountsPerCall ?? 100);
++
++  for (let offset = 0; offset < accounts.length; offset += chunkSize) {
++    const chunk = accounts.slice(offset, offset + chunkSize);
++    const uncachedDecimals = assets.filter((asset) => !decimalsCache.has(asset.toLowerCase()));
++    const contracts: unknown[] = [
++      ...chunk.map((account) => ({
++        address: input.addresses.uiPoolDataProvider,
++        abi: uiPoolDataProviderAbi,
++        functionName: "getUserReservesData",
++        args: [input.addresses.poolAddressesProvider, account],
++      })),
++      ...assets.flatMap((asset) => [
++        { address: input.addresses.pool, abi: aavePoolIndexAbi, functionName: "getReserveNormalizedIncome", args: [asset] },
++        { address: input.addresses.pool, abi: aavePoolIndexAbi, functionName: "getReserveNormalizedVariableDebt", args: [asset] },
++        { address: input.oracle, abi: aaveOracleAssetPriceAbi, functionName: "getAssetPrice", args: [asset] },
++      ]),
++      ...uncachedDecimals.map((asset) => ({ address: asset, abi: erc20DecimalsAbi, functionName: "decimals" })),
++    ];
++    const results = await input.client.multicall({
++      contracts,
++      allowFailure: true,
++      ...(input.blockNumber === undefined ? {} : { blockNumber: input.blockNumber }),
++    });
++    if (results.length !== contracts.length) {
++      throw new Error(`multicall returned ${results.length} results for ${contracts.length} calls`);
++    }
++
++    const decimalsOffset = chunk.length + assets.length * 3;
++    uncachedDecimals.forEach((asset, index) => {
++      const response = results[decimalsOffset + index];
++      if (response?.status === "success") {
++        const value = Number(response.result);
++        if (Number.isInteger(value) && value >= 0 && value <= 36) {
++          decimalsCache.set(asset.toLowerCase(), value);
++        }
++      }
++    });
++
++    const market = new Map<string, AssetMarketData>();
++    const marketErrors: string[] = [];
++    assets.forEach((asset, index) => {
++      const base = chunk.length + index * 3;
++      const income = results[base];
++      const variable = results[base + 1];
++      const price = results[base + 2];
++      const decimals = decimalsCache.get(asset.toLowerCase());
++      if (
++        income?.status !== "success" || variable?.status !== "success" || price?.status !== "success"
++        || typeof income.result !== "bigint" || typeof variable.result !== "bigint" || typeof price.result !== "bigint"
++        || price.result <= 0n || decimals === undefined
++      ) {
++        marketErrors.push(asset);
++        return;
++      }
++      market.set(asset.toLowerCase(), {
++        liquidityIndex: income.result,
++        variableBorrowIndex: variable.result,
++        priceUsd8: price.result,
++        decimals,
++      });
++    });
++
++    chunk.forEach((account, index) => {
++      const key = account.toLowerCase();
++      const response = results[index];
++      if (response?.status !== "success") {
++        out.set(key, { ok: false, error: `getUserReservesData_failed:${errorMessage(response)}` });
++        return;
++      }
++      const rows = extractRows(response.result);
++      if (rows === undefined) {
++        out.set(key, { ok: false, error: "getUserReservesData_malformed" });
++        return;
++      }
++      const reserves: AaveReservePosition[] = [];
++      const untrackedReserves: UntrackedReserveHolding[] = [];
++      let missingMarket: string | undefined;
++      for (const row of rows) {
++        if (row.scaledATokenBalance === 0n && row.scaledVariableDebt === 0n) {
++          continue;
++        }
++        const assetKey = row.underlyingAsset.toLowerCase();
++        const data = market.get(assetKey);
++        if (data === undefined) {
++          if (marketErrors.some((asset) => asset.toLowerCase() === assetKey)) {
++            missingMarket = row.underlyingAsset;
++          }
++          // Reserve outside tracked (configured-pair) assets: not liquidatable by this bot.
++          untrackedReserves.push({
++            asset: row.underlyingAsset,
++            hasDebt: row.scaledVariableDebt > 0n,
++            hasCollateral: row.scaledATokenBalance > 0n && row.usageAsCollateralEnabledOnUser,
++          });
++          continue;
++        }
++        reserves.push({
++          asset: row.underlyingAsset,
++          decimals: data.decimals,
++          priceUsd8: data.priceUsd8,
++          collateralBalance: rayMulFloor(row.scaledATokenBalance, data.liquidityIndex),
++          variableDebt: rayMulCeil(row.scaledVariableDebt, data.variableBorrowIndex),
++          stableDebt: 0n,
++          usageAsCollateralEnabled: row.usageAsCollateralEnabledOnUser,
++        });
++      }
++      if (missingMarket !== undefined) {
++        out.set(key, { ok: false, error: `reserve_market_data_failed:${missingMarket}` });
++        return;
++      }
++      out.set(key, { ok: true, positions: { account, reserves, untrackedReserves } });
++    });
++  }
++  return out;
++}
++
++function extractRows(result: unknown): readonly UserReserveRow[] | undefined {
++  if (!Array.isArray(result)) {
++    return undefined;
++  }
++  const rows = result[0];
++  if (!Array.isArray(rows)) {
++    return undefined;
++  }
++  return rows as readonly UserReserveRow[];
++}
++
++function errorMessage(response: MulticallResultLike | undefined): string {
++  if (response === undefined) {
++    return "missing";
++  }
++  if (response.status === "failure") {
++    const error = response.error;
++    return error instanceof Error ? error.message.split("\n")[0] ?? "error" : String(error);
++  }
++  return "unknown";
++}
++
++function dedupe(addresses: readonly Address[]): Address[] {
++  const seen = new Set<string>();
++  const out: Address[] = [];
++  for (const address of addresses) {
++    const key = address.toLowerCase();
++    if (seen.has(key)) {
++      continue;
++    }
++    seen.add(key);
++    out.push(address);
++  }
++  return out;
++}
+diff --git a/src/protocols/aaveV3.ts b/src/protocols/aaveV3.ts
+index 39bbde2..943a9e9 100644
+--- a/src/protocols/aaveV3.ts
++++ b/src/protocols/aaveV3.ts
+@@ -1,6 +1,12 @@
+ import type { Address, Hex } from "viem";
+ import type { ChainRegistry } from "../config/chainRegistry";
+ import type { AaveReservePair, ChainConfig } from "../config/chains";
++import {
++  asReservePositionsMulticallClient,
++  resolveAccountReservePositions,
++  resolveOracleAddress,
++  type AccountReservePositionsResult,
++} from "./aaveReservePositions";
+ 
+ export const ZERO_CURSOR_ID = "0x0000000000000000000000000000000000000000";
+ 
+@@ -32,6 +38,16 @@ export interface LiquidationCandidate {
+   readonly gasEstimate?: bigint;
+   readonly gasPrice?: bigint;
+   readonly healthFactor: bigint;
++  /** Native decimals of debtAsset (from reserve data) when sized from real positions. */
++  readonly debtDecimals?: number;
++  /** Protocol close factor applied when sizing debtToCover (debtToCover is already capped by it). */
++  readonly appliedCloseFactorBps?: number;
++  /** Actual variable+stable debt of debtAsset, native decimals. */
++  readonly actualDebtRaw?: bigint;
++  readonly actualDebtUsd?: number;
++  /** getUserAccountData.totalDebtBase / 1e8. */
++  readonly totalDebtUsd?: number;
++  readonly sizingCappedBy?: "actual_debt" | "close_factor" | "collateral";
+ }
+ 
+ export interface AaveAccountHealthInput {
+@@ -52,6 +68,10 @@ export interface AaveV3Protocol {
+   getBestLiquidationPair?(
+     account: AaveUserAccount,
+   ): Promise<Omit<LiquidationCandidate, "account" | "healthFactor">>;
++  /** Real per-reserve positions (batched). Missing/failed accounts map to `{ ok: false }`. */
++  getAccountReservePositions?(
++    accounts: readonly Address[],
++  ): Promise<ReadonlyMap<string, AccountReservePositionsResult>>;
+   listBorrowerAddresses?(): Promise<readonly Address[]>;
+   getLastScanStats?(): AaveScanStats;
+   subscribeToReserveDataUpdated?(onEvent: (reserve?: Address) => void): Promise<() => void>;
+@@ -301,6 +321,8 @@ export async function getLiquidatablePositions(
+ export class ViemAaveV3Protocol implements AaveV3Protocol {
+   private lastScanStats: AaveScanStats = { scanned: 0, liquidatable: 0 };
+   private lastBorrowerCursorId = ZERO_CURSOR_ID;
++  private readonly reserveDecimalsCache = new Map<string, number>();
++  private oracleAddress: Address | undefined;
+ 
+   public constructor(
+     private readonly publicClient: AaveReadClient & AaveEventClient,
+@@ -328,6 +350,33 @@ export class ViemAaveV3Protocol implements AaveV3Protocol {
+     };
+   }
+ 
++  public async getAccountReservePositions(
++    accounts: readonly Address[],
++  ): Promise<ReadonlyMap<string, AccountReservePositionsResult>> {
++    const client = asReservePositionsMulticallClient(this.publicClient);
++    if (client === undefined) {
++      throw new Error("public client does not support multicall; cannot resolve reserve positions");
++    }
++    const resolved = this.registry?.getResolvedAave(this.chain.name) ?? this.chain.aave;
++    const addresses = {
++      pool: resolved.pool,
++      poolAddressesProvider: resolved.poolAddressesProvider,
++      uiPoolDataProvider: resolved.uiPoolDataProvider,
++    };
++    if (this.oracleAddress === undefined) {
++      this.oracleAddress = await resolveOracleAddress(client, addresses);
++    }
++    const assets = this.chain.aave.reservePairs.flatMap((pair) => [pair.collateralAsset, pair.debtAsset]);
++    return resolveAccountReservePositions({
++      client,
++      addresses,
++      oracle: this.oracleAddress,
++      accounts,
++      assets,
++      decimalsCache: this.reserveDecimalsCache,
++    });
++  }
++
+   public async listBorrowerAddresses(): Promise<readonly Address[]> {
+     if (this.graphClient === undefined) {
+       throw new Error("Aave subgraph client is required for borrower enumeration");
+diff --git a/src/protocols/liquidationSizing.ts b/src/protocols/liquidationSizing.ts
+new file mode 100644
+index 0000000..fcb5238
+--- /dev/null
++++ b/src/protocols/liquidationSizing.ts
+@@ -0,0 +1,179 @@
++import type { Address } from "viem";
++import { defaultCloseFactorBps } from "../config/aavePoolVersion";
++import type { AaveReservePair } from "../config/chains";
++import type { AaveReservePosition } from "./aaveReservePositions";
++
++const bpsDenominator = 10_000n;
++const fullCloseFactorBps = 10_000;
++/** Aave v3.3+ LiquidationLogic.MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD (8-dec USD base). */
++export const MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD = 2_000n * 100_000_000n;
++
++export interface LiquidationSizingInput {
++  readonly reserves: readonly AaveReservePosition[];
++  readonly pairs: readonly AaveReservePair[];
++  readonly healthFactor: bigint;
++  /** getUserAccountData.totalDebtBase (8-dec USD). Close-factor cap = 50% of TOTAL debt, per Aave LiquidationLogic. */
++  readonly totalDebtBase?: bigint;
++  /**
++   * Aave v3.3+ rule: if the chosen reserve's collateral OR debt is < $2,000 base, close factor is 100%.
++   * Not enabled by default (repo models plain v3 50/100 via defaultCloseFactorBps); see report.
++   */
++  readonly smallPositionFullClose?: boolean;
++}
++
++export interface LiquidationPlan {
++  readonly collateralAsset: Address;
++  readonly debtAsset: Address;
++  readonly debtDecimals: number;
++  readonly collateralDecimals: number;
++  readonly debtPriceUsd8: bigint;
++  readonly collateralPriceUsd8: bigint;
++  /** Sized amount (native debt decimals) = min(actual debt, close-factor cap, collateral cap). */
++  readonly debtToCover: bigint;
++  readonly debtToCoverUsd: number;
++  /** Actual (variable + stable) debt of the chosen debt reserve, native decimals. */
++  readonly actualDebtRaw: bigint;
++  readonly actualDebtUsd: number;
++  readonly collateralBalanceRaw: bigint;
++  readonly collateralUsd: number;
++  readonly totalDebtUsd?: number;
++  readonly closeFactorBps: number;
++  readonly liquidationBonusBps: number;
++  readonly cappedBy: "actual_debt" | "close_factor" | "collateral";
++}
++
++export type LiquidationSizingResult =
++  | { readonly kind: "planned"; readonly plan: LiquidationPlan }
++  | {
++    readonly kind: "pair_not_held";
++    readonly heldDebtAssets: readonly Address[];
++    readonly heldCollateralAssets: readonly Address[];
++  };
++
++export function reserveUsd8(raw: bigint, decimals: number, priceUsd8: bigint): bigint {
++  if (raw <= 0n || priceUsd8 <= 0n) {
++    return 0n;
++  }
++  return (raw * priceUsd8) / 10n ** BigInt(decimals);
++}
++
++export function usd8ToNumber(value: bigint): number {
++  return Number(value) / 1e8;
++}
++
++function totalDebt(reserve: AaveReservePosition): bigint {
++  return reserve.variableDebt + reserve.stableDebt;
++}
++
++function sameAddress(left: string, right: string): boolean {
++  return left.toLowerCase() === right.toLowerCase();
++}
++
++/**
++ * Choose the liquidation pair from ACTUAL holdings and size debtToCover.
++ * - debt asset: largest-USD debt reserve that is a configured pair debt asset (falls through to the next
++ *   largest if no held collateral forms a configured pair with it)
++ * - collateral: largest-USD collateral reserve with usageAsCollateralEnabled that forms a configured pair
++ * - debtToCover = min(actual debt, close-factor cap, collateral cap)
++ */
++export function planAaveLiquidation(input: LiquidationSizingInput): LiquidationSizingResult {
++  const debtReserves = input.reserves
++    .filter((reserve) => totalDebt(reserve) > 0n)
++    .filter((reserve) => input.pairs.some((pair) => sameAddress(pair.debtAsset, reserve.asset)))
++    .sort((left, right) => compareDesc(
++      reserveUsd8(totalDebt(left), left.decimals, left.priceUsd8),
++      reserveUsd8(totalDebt(right), right.decimals, right.priceUsd8),
++    ));
++  const collateralReserves = input.reserves
++    .filter((reserve) => reserve.usageAsCollateralEnabled && reserve.collateralBalance > 0n)
++    .sort((left, right) => compareDesc(
++      reserveUsd8(left.collateralBalance, left.decimals, left.priceUsd8),
++      reserveUsd8(right.collateralBalance, right.decimals, right.priceUsd8),
++    ));
++
++  for (const debt of debtReserves) {
++    for (const collateral of collateralReserves) {
++      const pair = input.pairs.find(
++        (candidate) => sameAddress(candidate.debtAsset, debt.asset) && sameAddress(candidate.collateralAsset, collateral.asset),
++      );
++      if (pair === undefined) {
++        continue;
++      }
++      return { kind: "planned", plan: sizePlan(input, debt, collateral, pair) };
++    }
++  }
++
++  return {
++    kind: "pair_not_held",
++    heldDebtAssets: input.reserves.filter((reserve) => totalDebt(reserve) > 0n).map((reserve) => reserve.asset),
++    heldCollateralAssets: collateralReserves.map((reserve) => reserve.asset),
++  };
++}
++
++function sizePlan(
++  input: LiquidationSizingInput,
++  debt: AaveReservePosition,
++  collateral: AaveReservePosition,
++  pair: AaveReservePair,
++): LiquidationPlan {
++  const actualDebtRaw = totalDebt(debt);
++  const debtUnit = 10n ** BigInt(debt.decimals);
++  const collateralUnit = 10n ** BigInt(collateral.decimals);
++  const reserveDebtBase = reserveUsd8(actualDebtRaw, debt.decimals, debt.priceUsd8);
++  const reserveCollateralBase = reserveUsd8(collateral.collateralBalance, collateral.decimals, collateral.priceUsd8);
++
++  let closeFactorBps = defaultCloseFactorBps("v3", input.healthFactor);
++  if (
++    input.smallPositionFullClose === true
++    && (reserveDebtBase < MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD || reserveCollateralBase < MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD)
++  ) {
++    closeFactorBps = fullCloseFactorBps;
++  }
++
++  let debtToCover = actualDebtRaw;
++  let cappedBy: LiquidationPlan["cappedBy"] = "actual_debt";
++  if (closeFactorBps < fullCloseFactorBps) {
++    const closeFactorCap = input.totalDebtBase !== undefined && input.totalDebtBase > 0n
++      ? (((input.totalDebtBase * BigInt(closeFactorBps)) / bpsDenominator) * debtUnit) / debt.priceUsd8
++      : (actualDebtRaw * BigInt(closeFactorBps)) / bpsDenominator;
++    if (closeFactorCap < debtToCover) {
++      debtToCover = closeFactorCap;
++      cappedBy = "close_factor";
++    }
++  }
++
++  // Collateral cap: debtToCover * (1 + bonus) must not exceed the chosen collateral balance (USD).
++  const bonusMultiplierBps = bpsDenominator + BigInt(pair.liquidationBonusBps);
++  const collateralCap = (collateral.collateralBalance * collateral.priceUsd8 * debtUnit * bpsDenominator)
++    / (collateralUnit * debt.priceUsd8 * bonusMultiplierBps);
++  if (collateralCap < debtToCover) {
++    debtToCover = collateralCap;
++    cappedBy = "collateral";
++  }
++
++  return {
++    collateralAsset: collateral.asset,
++    debtAsset: debt.asset,
++    debtDecimals: debt.decimals,
++    collateralDecimals: collateral.decimals,
++    debtPriceUsd8: debt.priceUsd8,
++    collateralPriceUsd8: collateral.priceUsd8,
++    debtToCover,
++    debtToCoverUsd: usd8ToNumber(reserveUsd8(debtToCover, debt.decimals, debt.priceUsd8)),
++    actualDebtRaw,
++    actualDebtUsd: usd8ToNumber(reserveDebtBase),
++    collateralBalanceRaw: collateral.collateralBalance,
++    collateralUsd: usd8ToNumber(reserveCollateralBase),
++    ...(input.totalDebtBase === undefined ? {} : { totalDebtUsd: usd8ToNumber(input.totalDebtBase) }),
++    closeFactorBps,
++    liquidationBonusBps: pair.liquidationBonusBps,
++    cappedBy,
++  };
++}
++
++function compareDesc(left: bigint, right: bigint): number {
++  if (left === right) {
++    return 0;
++  }
++  return left > right ? -1 : 1;
++}
