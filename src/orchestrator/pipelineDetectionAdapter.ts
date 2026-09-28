@@ -1,18 +1,12 @@
-import type { Address } from "viem";
+import type { LoggerLike } from "../bot";
 import type { HealthFactorMonitor } from "../monitors/healthFactorMonitor";
-import type { HybridDetectionPipeline } from "../monitors/hybridDetectionPipeline";
+import type { BorrowerSnapshotProvider, HybridDetectionPipeline } from "../monitors/hybridDetectionPipeline";
 import { ArbitrageOpportunityQueue } from "../monitors/arbitrageOpportunityQueue";
-import { ReserveAwareBorrowerCache, type BorrowerSnapshot } from "../monitors/reserveAwareBorrowerCache";
-import type { LiquidationCandidate } from "../protocols/aaveV3";
-import { createAsset, createAssetAmount } from "../utils/typedAssetMath";
+import { ReserveAwareBorrowerCache } from "../monitors/reserveAwareBorrowerCache";
 import type { CircuitBreakerName, CircuitBreakerState } from "../config/chainRegistry";
 import type { SupportedChain } from "../config/chains";
 import type { Opportunity } from "../types/opportunity";
 import { fromArbitrageOpportunity } from "../types/opportunity";
-
-const usd = createAsset({ symbol: "USD", decimals: 8 });
-const weth = createAsset({ symbol: "WETH", decimals: 18 });
-const usdc = createAsset({ symbol: "USDC", decimals: 6 });
 
 export interface PipelineDetectionAdapterConfig {
   readonly chain: SupportedChain;
@@ -20,6 +14,9 @@ export interface PipelineDetectionAdapterConfig {
   readonly hybridDetection?: HybridDetectionPipeline;
   readonly arbitrageQueue: ArbitrageOpportunityQueue;
   readonly enableArbitrage?: boolean;
+  /** Resolves real per-reserve positions + debtToCover for monitor-scan accounts (no static-pair fallback). */
+  readonly snapshotProvider?: Pick<BorrowerSnapshotProvider, "refreshBorrowers">;
+  readonly logger?: LoggerLike;
 }
 
 export class PipelineDetectionAdapter {
@@ -69,42 +66,25 @@ export class PipelineDetectionAdapter {
       return;
     }
     const candidates = await this.config.monitor.scanOnce();
-    for (const candidate of candidates) {
-      this.cache.upsert(toSnapshot(this.config.chain, candidate));
+    if (candidates.length === 0) {
+      return;
+    }
+    const accounts = [...new Set(candidates.map((candidate) => candidate.account))];
+    if (this.config.snapshotProvider === undefined) {
+      // Monitor candidates carry the static pair defaultDebtToCoverWei — never price that as real debt.
+      for (const account of accounts) {
+        this.config.logger?.warn("debt_to_cover_resolve_failed", {
+          chain: this.config.chain,
+          account,
+          error: "no_reserve_resolver",
+          action: "skip_candidate",
+        });
+      }
+      return;
+    }
+    const snapshots = await this.config.snapshotProvider.refreshBorrowers(this.config.chain, accounts);
+    for (const snapshot of snapshots) {
+      this.cache.upsert(snapshot);
     }
   }
-}
-
-function toSnapshot(chain: SupportedChain, candidate: LiquidationCandidate): BorrowerSnapshot {
-  const debtRaw = candidate.debtToCover;
-  const collateralRaw = debtRaw + (debtRaw * BigInt(candidate.liquidationBonusBps)) / 10_000n;
-  return {
-    chain,
-    account: candidate.account,
-    protocol: "aave",
-    healthFactor: candidate.healthFactor,
-    updatedAtMs: Date.now(),
-    reserves: [
-      {
-        assetAddress: candidate.collateralAsset,
-        asset: weth,
-        collateralBalance: createAssetAmount(weth, collateralRaw),
-        variableDebt: createAssetAmount(weth, 0n),
-        stableDebt: createAssetAmount(weth, 0n),
-        priceInQuote: createAssetAmount(usd, 300_000_000_000n),
-        usageAsCollateralEnabled: true,
-        liquidationBonusBps: candidate.liquidationBonusBps,
-      },
-      {
-        assetAddress: candidate.debtAsset as Address,
-        asset: usdc,
-        collateralBalance: createAssetAmount(usdc, 0n),
-        variableDebt: createAssetAmount(usdc, debtRaw),
-        stableDebt: createAssetAmount(usdc, 0n),
-        priceInQuote: createAssetAmount(usd, 100_000_000n),
-        usageAsCollateralEnabled: false,
-        liquidationBonusBps: 0,
-      },
-    ],
-  };
 }

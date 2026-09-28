@@ -1,0 +1,66 @@
+{
+  "description": "Aave V3 Base replay for account 0xf20e...2ecb at block 51765799. Source: read-only eth_call against https://mainnet.base.org (archive) at blockTag 51765799, fetched 2026-09-28. getUserReservesData returned 15 rows; only non-zero rows are stored. Balances derive from scaled * normalized index (collateral floor, debt ceil).",
+  "source": "onchain_archive_eth_call",
+  "rpc": "https://mainnet.base.org",
+  "chain": "base",
+  "blockNumber": 51765799,
+  "account": "0xf20e421cf0b314d61177466d3c9c0cb5e1342ecb",
+  "pool": "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+  "poolAddressesProvider": "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D",
+  "uiPoolDataProvider": "0x0C6BC4a12039788be08F87e87Cff87FEDbd1D386",
+  "oracle": "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156",
+  "poolRevision": 11,
+  "userEmodeCategoryId": 0,
+  "getUserAccountData": {
+    "totalCollateralBase": "1183997",
+    "totalDebtBase": "923715",
+    "availableBorrowsBase": "0",
+    "currentLiquidationThreshold": "7800",
+    "ltv": "7500",
+    "healthFactor": "999865066606041906"
+  },
+  "botLoggedBeforeFix": {
+    "event": "liquidation_evaluated",
+    "debtUsd": 0.99986806,
+    "debtAsset": "USDC",
+    "collateralAsset": "WETH",
+    "bonusRate": 0.05,
+    "hardFloor": 50,
+    "reason": "below_PROFITABILITY_FLOOR(50)"
+  },
+  "reserves": [
+    {
+      "symbol": "WETH",
+      "underlyingAsset": "0x4200000000000000000000000000000000000006",
+      "decimals": 18,
+      "scaledATokenBalance": "5174054861",
+      "scaledVariableDebt": "0",
+      "usageAsCollateralEnabledOnUser": true,
+      "liquidityIndex": "1050946261310554660175083540",
+      "variableBorrowIndex": "1079640385625616185010399540",
+      "priceUsd8": "267409566521"
+    },
+    {
+      "symbol": "USDC",
+      "underlyingAsset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "decimals": 6,
+      "scaledATokenBalance": "10312",
+      "scaledVariableDebt": "0",
+      "usageAsCollateralEnabledOnUser": true,
+      "liquidityIndex": "1146946952503344787502705820",
+      "variableBorrowIndex": "1204342104947373044895297369",
+      "priceUsd8": "99986806"
+    },
+    {
+      "symbol": "cbBTC",
+      "underlyingAsset": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+      "decimals": 8,
+      "scaledATokenBalance": "0",
+      "scaledVariableDebt": "10",
+      "usageAsCollateralEnabledOnUser": false,
+      "liquidityIndex": "1002034759145801865070615429",
+      "variableBorrowIndex": "1018958536569144248467767193",
+      "priceUsd8": "8397409000000"
+    }
+  ]
+}
