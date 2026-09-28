@@ -1,0 +1,6 @@
+
+From 2a8429f3309c5c8f9980f1a83937e73a093c4529 Mon Sep 17 00:00:00 2001
+From: BlancoChukwu <blanco.chukwu@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 10:18:38 -0600
+Subject: [PATCH 2/2] Fix real debtToCover from per-reserve positions (no
+ static 1 USDC).
