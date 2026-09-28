@@ -1,0 +1,800 @@
+oCover) {
++      // Protocol caps by collateral itself; submitting the full liquidatable amount guarantees ALL collateral is
++      // taken (no dust). A floor-rounded collateral cap would leave wei-level collateral -> MustNotLeaveDust.
++      cappedBy = "collateral";
++      noDustAdjustment = "bumped_to_full_debt";
++    }
++    if (dust(simulation)) {
++      // Only reachable with the 50% cap (both reserves >= $2k, HF > 0.95). With R >= $2k, R - 50%*T >= R/2 >= $1k,
++      // so it is the COLLATERAL leftover that would be dust: shrink debtToCover so >= MIN_LEFTOVER_BASE of both
++      // collateral and debt remain (smaller but valid liquidation).
++      const collateralUnit = 10n ** BigInt(collateral.decimals);
++      const collateralLeftRaw = ceilDiv(MIN_LEFTOVER_BASE * collateralUnit, collateral.priceUsd8) + 1n;
++      const debtLeftRaw = ceilDiv(MIN_LEFTOVER_BASE * debtUnit, debt.priceUsd8) + 1n;
++      const maxSeize = collateral.collateralBalance - collateralLeftRaw;
++      const byCollateral = maxSeize > 0n
++        ? (maxSeize * collateral.priceUsd8 * debtUnit * bps)
++          / (collateralUnit * debt.priceUsd8 * (bps + BigInt(liquidationBonusBps))) - 1n
++        : 0n;
++      const byDebt = actualDebtRaw - debtLeftRaw;
++      let reduced = maxLiquidatable;
++      if (byCollateral < reduced) {
++        reduced = byCollateral;
++      }
++      if (byDebt < reduced) {
++        reduced = byDebt;
++      }
++      const reducedSimulation = reduced > 0n ? simulate(reduced) : undefined;
++      if (reducedSimulation === undefined || dust(reducedSimulation)) {
++        return {
++          kind: "must_not_leave_dust",
++          collateralAsset: collateral.asset,
++          debtAsset: debt.asset,
++          actualDebtUsd: usd8ToNumber(reserveDebtBase),
++          collateralUsd: usd8ToNumber(reserveCollateralBase),
++          closeFactorBps,
++        };
++      }
++      debtToCover = reduced;
++      simulation = reducedSimulation;
++      noDustAdjustment = "reduced_to_min_leftover";
++    }
+   }
+ 
+   return {
+-    collateralAsset: collateral.asset,
+-    debtAsset: debt.asset,
+-    debtDecimals: debt.decimals,
+-    collateralDecimals: collateral.decimals,
+-    debtPriceUsd8: debt.priceUsd8,
+-    collateralPriceUsd8: collateral.priceUsd8,
+-    debtToCover,
+-    debtToCoverUsd: usd8ToNumber(reserveUsd8(debtToCover, debt.decimals, debt.priceUsd8)),
+-    actualDebtRaw,
+-    actualDebtUsd: usd8ToNumber(reserveDebtBase),
+-    collateralBalanceRaw: collateral.collateralBalance,
+-    collateralUsd: usd8ToNumber(reserveCollateralBase),
+-    ...(input.totalDebtBase === undefined ? {} : { totalDebtUsd: usd8ToNumber(input.totalDebtBase) }),
+-    closeFactorBps,
+-    liquidationBonusBps: pair.liquidationBonusBps,
+-    cappedBy,
++    kind: "planned",
++    plan: {
++      collateralAsset: collateral.asset,
++      debtAsset: debt.asset,
++      debtDecimals: debt.decimals,
++      collateralDecimals: collateral.decimals,
++      debtPriceUsd8: debt.priceUsd8,
++      collateralPriceUsd8: collateral.priceUsd8,
++      debtToCover,
++      debtToCoverUsd: usd8ToNumber(reserveUsd8(debtToCover, debt.decimals, debt.priceUsd8)),
++      expectedDebtRepaidRaw: simulation.debtRepaid,
++      expectedDebtRepaidUsd: usd8ToNumber(reserveUsd8(simulation.debtRepaid, debt.decimals, debt.priceUsd8)),
++      expectedCollateralOutRaw: simulation.liquidatorCollateral,
++      expectedProtocolFeeRaw: simulation.protocolFee,
++      actualDebtRaw,
++      actualDebtUsd: usd8ToNumber(reserveDebtBase),
++      collateralBalanceRaw: collateral.collateralBalance,
++      collateralUsd: usd8ToNumber(reserveCollateralBase),
++      ...(input.totalDebtBase === undefined ? {} : { totalDebtUsd: usd8ToNumber(input.totalDebtBase) }),
++      closeFactorBps,
++      liquidationBonusBps,
++      liquidationProtocolFeeBps,
++      cappedBy,
++      v33Rules,
++      noDustAdjustment,
++    },
+   };
+ }
+ 
+diff --git a/test/fixtures/base-aave-reserve-params-2026-09-28.json b/test/fixtures/base-aave-reserve-params-2026-09-28.json
+new file mode 100644
+index 0000000..27b84de
+--- /dev/null
++++ b/test/fixtures/base-aave-reserve-params-2026-09-28.json
+@@ -0,0 +1,27 @@
++{
++  "description": "Aave V3 Base reserve parameters for the configured pair assets. Sources: Aave MCP (user-Aave get_reserve_details / get_emode_categories, chainId 8453, market 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5) and Pool.getConfiguration / getReserveData / getEModeCategory* via read-only eth_call on https://mainnet.base.org.",
++  "retrievedAt": "2026-09-28T10:27:48-06:00 .. 10:30 (MDT); block ~51911812 (2026-09-28T16:29:31Z)",
++  "poolRevision": 11,
++  "assets": {
++    "WETH": { "address": "0x4200000000000000000000000000000000000006", "reserveId": 0, "decimals": 18, "ltvBps": 8000, "liquidationThresholdBps": 8300, "liquidationBonusRaw": 10500, "liquidationProtocolFeeBps": 1000, "borrowingEnabled": true, "canBeCollateral": true, "frozen": false, "paused": false, "mcp": { "maxLtvPct": "80", "liquidationThresholdPct": "83", "liquidationBonusPct": "5", "canBeCollateral": true, "priceUsd": "2690.50340666", "aaveOracleSource": "0x9dA00D23465282005DB222a441a663eE7B9dfCc8" } },
++    "USDC": { "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "reserveId": 4, "decimals": 6, "ltvBps": 7500, "liquidationThresholdBps": 7800, "liquidationBonusRaw": 10500, "liquidationProtocolFeeBps": 1000, "borrowingEnabled": true, "canBeCollateral": true, "frozen": false, "paused": false, "mcp": { "maxLtvPct": "75", "liquidationThresholdPct": "78", "liquidationBonusPct": "5", "canBeCollateral": true, "priceUsd": "0.99993525", "aaveOracleSource": "0xf52D010c7d4ecBfda92c2509900593CE34535D86" } },
++    "cbBTC": { "address": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", "reserveId": 6, "decimals": 8, "ltvBps": 7300, "liquidationThresholdBps": 7800, "liquidationBonusRaw": 10750, "liquidationProtocolFeeBps": 1000, "borrowingEnabled": true, "canBeCollateral": true, "frozen": false, "paused": false, "mcp": { "maxLtvPct": "73", "liquidationThresholdPct": "78", "liquidationBonusPct": "7.5", "canBeCollateral": true, "priceUsd": "83970.61712432", "aaveOracleSource": "0x3A932b286715abc4A86a4ACAF68A6cdD89E0d446" } }
++  },
++  "eModeCategories": {
++    "1": { "label": "ETH correlated", "liquidationBonusRaw": 10200, "collateralBitmap": "0b101011", "note": "WETH (id 0) collateral" },
++    "4": { "label": "LBTC_cbBTC", "liquidationBonusRaw": 10300, "collateralBitmap": "0b10000000000", "note": "cbBTC borrowable only" },
++    "10": { "label": "cbBTC Stablecoins", "liquidationBonusRaw": 10400, "collateralBitmap": "0b1000000", "note": "cbBTC (id 6) collateral, USDC (id 4) borrowable" }
++  },
++  "chainlinkFeeds": {
++    "USDC": { "feed": "0x7e860098F58bBFC8648a4311b374B1D669a2bc6B", "description": "USDC / USD", "decimals": 8, "answer": "99988320", "updatedAt": "2026-09-28T12:46:11Z" },
++    "WETH": { "feed": "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70", "description": "ETH / USD", "decimals": 8, "answer": "269266207920", "updatedAt": "2026-09-28T16:24:33Z" },
++    "cbBTC": { "feed": "0x07DA0E54543a844a80ABE69c8A12F22B3aA59f9D", "description": "cbBTC / USD", "decimals": 8, "answer": "8396520006916", "updatedAt": "2026-09-28T16:27:01Z" }
++  },
++  "uniswapV3Pools": {
++    "factory": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
++    "WETH/USDC": { "100": "0xb4CB800910B228ED3d0834cF79D697127BBB00e5", "500": "0xd0b53D9277642d899DF5C87A3966A349A798F224", "3000": "0x6c561B446416E1A00E8E93E221854d6eA4171372", "10000": "0x0b1C2DCbBfA744ebD3fC17fF1A96A1E1Eb4B2d69" },
++    "cbBTC/USDC": { "100": "0xE9e25E35aa99A2A60155010802b81A25C45bA185", "500": "0xfBB6Eed8e7aa03B138556eeDaF5D271A5E1e43ef", "3000": "0xeC558e484cC9f2210714E345298fdc53B253c27D", "10000": "0x3e7586D52A9D07F8611B8ecf6CCc8a689c34a659" },
++    "cbBTC/WETH": { "100": "0x4c1e404a013bF1917fAf2dBF5E5cEf3E9Bafb5aa", "500": "0x7AeA2E8A3843516afa07293a10Ac8E49906dabD1", "3000": "0x8c7080564B5A792A33Ef2FD473fbA6364d5495e5", "10000": "0x233571eAE953D9d59eEFc0769F71Dc19287DDCCB" }
++  },
++  "liveReceiver": { "address": "0x379ce85b431bd4cb3b2b11d682bac4556648ada6", "codeHash": "0xf3e6c57e86b3aaba08c3d818d006063e355569353f80bd7bd84ee72d393e23ab", "codeBytes": 2889, "receiverVersion": 1, "swapFee": 3000, "swapRouter": "0x2626664c2603336E57B271c5C0b26F421741e481", "aavePool": "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5", "probe_v1_5field": "0x930bb771 (HealthFactorNotBelowThreshold)", "probe_ts_7field": "0xebbd4204 (DebtAssetMismatch)" }
++}
+diff --git a/test/fixtures/replay-0xf20e-51765799.json b/test/fixtures/replay-0xf20e-51765799.json
+index dd80dd6..7ef91e6 100644
+--- a/test/fixtures/replay-0xf20e-51765799.json
++++ b/test/fixtures/replay-0xf20e-51765799.json
+@@ -38,7 +38,10 @@
+       "usageAsCollateralEnabledOnUser": true,
+       "liquidityIndex": "1050946261310554660175083540",
+       "variableBorrowIndex": "1079640385625616185010399540",
+-      "priceUsd8": "267409566521"
++      "priceUsd8": "267409566521",
++      "reserveConfiguration": "0x100000000000000000000103e800001e8480000186a005dc85122904206c1f40",
++      "liquidationBonusRaw": 10500,
++      "liquidationProtocolFeeBps": 1000
+     },
+     {
+       "symbol": "USDC",
+@@ -49,7 +52,10 @@
+       "usageAsCollateralEnabledOnUser": true,
+       "liquidityIndex": "1146946952503344787502705820",
+       "variableBorrowIndex": "1204342104947373044895297369",
+-      "priceUsd8": "99986806"
++      "priceUsd8": "99986806",
++      "reserveConfiguration": "0x100000000000000000000003e800db5858000c5691c003e8850629041e781d4c",
++      "liquidationBonusRaw": 10500,
++      "liquidationProtocolFeeBps": 1000
+     },
+     {
+       "symbol": "cbBTC",
+@@ -60,7 +66,11 @@
+       "usageAsCollateralEnabledOnUser": false,
+       "liquidityIndex": "1002034759145801865070615429",
+       "variableBorrowIndex": "1018958536569144248467767193",
+-      "priceUsd8": "8397409000000"
++      "priceUsd8": "8397409000000",
++      "reserveConfiguration": "0x100000000000000000000003e8000000c8000000017c1388850829fe1e781c84",
++      "liquidationBonusRaw": 10750,
++      "liquidationProtocolFeeBps": 1000
+     }
+-  ]
++  ],
++  "reserveConfigurationSource": "Pool.getConfiguration(asset) archive eth_call at blockTag 51765799 via https://mainnet.base.org, fetched 2026-09-28 ~10:45 MDT (bits 32-47 bonus, 152-167 protocol fee)"
+ }
+diff --git a/test/helpers/fakeAaveReserveClient.ts b/test/helpers/fakeAaveReserveClient.ts
+index bccf17c..9c1961d 100644
+--- a/test/helpers/fakeAaveReserveClient.ts
++++ b/test/helpers/fakeAaveReserveClient.ts
+@@ -1,5 +1,9 @@
+ import type { Address } from "viem";
+-import type { MulticallResultLike, ReservePositionsMulticallClient } from "../../src/protocols/aaveReservePositions";
++import {
++  encodeReserveConfiguration,
++  type MulticallResultLike,
++  type ReservePositionsMulticallClient,
++} from "../../src/protocols/aaveReservePositions";
+ 
+ export const RAY = 10n ** 27n;
+ 
+@@ -8,8 +12,30 @@ export interface FakeReserveMarket {
+   readonly variableBorrowIndex: bigint;
+   readonly priceUsd8: bigint;
+   readonly decimals: number;
++  /** Raw on-chain liquidation bonus (10500 = 105%). Default: Base values (cbBTC 10750, else 10500). */
++  readonly liquidationBonusRaw?: number;
++  /** Default 1000 (10% of bonus, Base value). */
++  readonly liquidationProtocolFeeBps?: number;
++  readonly reserveId?: number;
++  /** Simulate Pool.getConfiguration revert for this asset. */
++  readonly configurationFails?: boolean;
+ }
+ 
++export interface FakeEModeCategory {
++  readonly liquidationBonusRaw: number;
++  readonly collateralBitmap: bigint;
++  readonly fails?: boolean;
++}
++
++const BASE_DEFAULT_BONUS: Record<string, number> = {
++  "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf": 10_750,
++};
++const BASE_RESERVE_IDS: Record<string, number> = {
++  "0x4200000000000000000000000000000000000006": 0,
++  "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 4,
++  "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf": 6,
++};
++
+ export interface FakeUserRow {
+   readonly underlyingAsset: Address;
+   readonly scaledATokenBalance: bigint;
+@@ -29,6 +55,8 @@ export class FakeAaveReserveClient implements ReservePositionsMulticallClient {
+   public readonly userReserveCalls: Address[] = [];
+   public failUsers = new Set<string>();
+   public throwNext = 0;
++  public readonly userEMode = new Map<string, number>();
++  public readonly eModeCategories = new Map<number, FakeEModeCategory>();
+ 
+   public constructor(
+     private readonly markets: Map<string, FakeReserveMarket>,
+@@ -61,7 +89,7 @@ export class FakeAaveReserveClient implements ReservePositionsMulticallClient {
+         if (this.failUsers.has(user)) {
+           return fail("execution reverted");
+         }
+-        return ok([this.users.get(user) ?? [], 0]);
++        return ok([this.users.get(user) ?? [], this.userEMode.get(user) ?? 0]);
+       }
+       case "getReserveNormalizedIncome":
+       case "getReserveNormalizedVariableDebt":
+@@ -78,6 +106,36 @@ export class FakeAaveReserveClient implements ReservePositionsMulticallClient {
+         }
+         return ok(market.priceUsd8);
+       }
++      case "getConfiguration": {
++        const asset = String(call.args?.[0]).toLowerCase();
++        const market = this.markets.get(asset);
++        if (market === undefined || market.configurationFails === true) {
++          return fail("configuration unavailable");
++        }
++        return ok(encodeReserveConfiguration({
++          liquidationBonusRaw: market.liquidationBonusRaw ?? BASE_DEFAULT_BONUS[asset] ?? 10_500,
++          decimals: market.decimals,
++          liquidationProtocolFeeBps: market.liquidationProtocolFeeBps ?? 1_000,
++          liquidationThresholdBps: 7_800,
++          ltvBps: 7_500,
++        }));
++      }
++      case "getReserveData": {
++        const asset = String(call.args?.[0]).toLowerCase();
++        const market = this.markets.get(asset);
++        const id = market?.reserveId ?? BASE_RESERVE_IDS[asset];
++        return id === undefined ? fail("unknown reserve") : ok({ id });
++      }
++      case "getEModeCategoryCollateralConfig":
++      case "getEModeCategoryCollateralBitmap": {
++        const category = this.eModeCategories.get(Number(call.args?.[0]));
++        if (category === undefined || category.fails === true) {
++          return fail("emode unavailable");
++        }
++        return call.functionName === "getEModeCategoryCollateralBitmap"
++          ? ok(category.collateralBitmap)
++          : ok({ ltv: 0, liquidationThreshold: 0, liquidationBonus: category.liquidationBonusRaw });
++      }
+       case "decimals": {
+         const market = this.markets.get(call.address.toLowerCase());
+         return market === undefined ? fail("no decimals") : ok(market.decimals);
+diff --git a/test/unit/aaveReservePositionsBonus.test.ts b/test/unit/aaveReservePositionsBonus.test.ts
+new file mode 100644
+index 0000000..77035be
+--- /dev/null
++++ b/test/unit/aaveReservePositionsBonus.test.ts
+@@ -0,0 +1,123 @@
++import { describe, expect, it, vi } from "vitest";
++import type { Address } from "viem";
++import { createChainRegistry } from "../../src/config/chainRegistry";
++import { getChainConfig } from "../../src/config/chains";
++import { AaveSnapshotProvider } from "../../src/monitors/aaveSnapshotProvider";
++import { ViemAaveV3Protocol } from "../../src/protocols/aaveV3";
++import {
++  decodeReserveConfiguration,
++  encodeReserveConfiguration,
++  resolveAccountReservePositions,
++} from "../../src/protocols/aaveReservePositions";
++import { FakeAaveReserveClient, RAY, type FakeReserveMarket } from "../helpers/fakeAaveReserveClient";
++
++const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
++const WETH = "0x4200000000000000000000000000000000000006" as Address;
++const CBBTC = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
++const USER = "0x00000000000000000000000000000000000000b1" as Address;
++const addresses = {
++  pool: "0x00000000000000000000000000000000000000c1" as Address,
++  poolAddressesProvider: "0x00000000000000000000000000000000000000c2" as Address,
++  uiPoolDataProvider: "0x00000000000000000000000000000000000000c3" as Address,
++};
++const oracle = "0x00000000000000000000000000000000000000fe" as Address;
++
++function markets(overrides: Partial<Record<string, Partial<FakeReserveMarket>>> = {}): Map<string, FakeReserveMarket> {
++  const base: Record<string, FakeReserveMarket> = {
++    [USDC.toLowerCase()]: { liquidityIndex: RAY, variableBorrowIndex: RAY, priceUsd8: 100_000_000n, decimals: 6 },
++    [WETH.toLowerCase()]: { liquidityIndex: RAY, variableBorrowIndex: RAY, priceUsd8: 300_000_000_000n, decimals: 18 },
++    [CBBTC.toLowerCase()]: { liquidityIndex: RAY, variableBorrowIndex: RAY, priceUsd8: 8_000_000_000_000n, decimals: 8 },
++  };
++  return new Map(Object.entries(base).map(([key, value]) => [key, { ...value, ...(overrides[key] ?? {}) }]));
++}
++
++const cbBtcCollateralUsdcDebt = [
++  { underlyingAsset: USDC, scaledATokenBalance: 0n, usageAsCollateralEnabledOnUser: false, scaledVariableDebt: 10_000_000_000n },
++  { underlyingAsset: CBBTC, scaledATokenBalance: 20_000_000n, usageAsCollateralEnabledOnUser: true, scaledVariableDebt: 0n },
++];
++
++async function resolve(fake: FakeAaveReserveClient) {
++  const result = await resolveAccountReservePositions({
++    client: fake, addresses, oracle, accounts: [USER], assets: [USDC, WETH, CBBTC],
++  });
++  return result.get(USER.toLowerCase())!;
++}
++
++describe("on-chain liquidation bonus (eMode-aware)", () => {
++  it("decodes Base reserve configuration words (archive @ 51765799)", () => {
++    const cbBtc = decodeReserveConfiguration(0x100000000000000000000003e8000000c8000000017c1388850829fe1e781c84n);
++    expect(cbBtc.liquidationBonusRaw).toBe(10_750);
++    expect(cbBtc.liquidationThresholdBps).toBe(7_800);
++    expect(cbBtc.ltvBps).toBe(7_300);
++    expect(cbBtc.decimals).toBe(8);
++    expect(cbBtc.liquidationProtocolFeeBps).toBe(1_000);
++    expect(cbBtc.borrowingEnabled).toBe(true);
++    const weth = decodeReserveConfiguration(0x100000000000000000000103e800001e8480000186a005dc85122904206c1f40n);
++    expect(weth.liquidationBonusRaw).toBe(10_500);
++    expect(weth.liquidationThresholdBps).toBe(8_300);
++    expect(decodeReserveConfiguration(encodeReserveConfiguration({ liquidationBonusRaw: 10_400, decimals: 6 })).liquidationBonusRaw).toBe(10_400);
++  });
++
++  it("non-eMode account: reserve bonus from getConfiguration (cbBTC 750)", async () => {
++    const fake = new FakeAaveReserveClient(markets(), new Map([[USER.toLowerCase(), cbBtcCollateralUsdcDebt]]));
++    const row = await resolve(fake);
++    if (!row.ok) throw new Error(row.error);
++    const cbBtc = row.positions.reserves.find((reserve) => reserve.asset === CBBTC)!;
++    expect(cbBtc.liquidationBonusBps).toBe(750);
++    expect(cbBtc.liquidationProtocolFeeBps).toBe(1_000);
++    expect(cbBtc.liquidationBonusSource).toBe("reserve");
++    expect(row.positions.eModeCategoryId).toBe(0);
++  });
++
++  it("eMode 10 (cbBTC Stablecoins) account: eMode bonus 400 applies to cbBTC collateral (id 6 in bitmap)", async () => {
++    const fake = new FakeAaveReserveClient(markets(), new Map([[USER.toLowerCase(), cbBtcCollateralUsdcDebt]]));
++    fake.userEMode.set(USER.toLowerCase(), 10);
++    fake.eModeCategories.set(10, { liquidationBonusRaw: 10_400, collateralBitmap: 1n << 6n });
++    const row = await resolve(fake);
++    if (!row.ok) throw new Error(row.error);
++    const cbBtc = row.positions.reserves.find((reserve) => reserve.asset === CBBTC)!;
++    expect(cbBtc.liquidationBonusBps).toBe(400);
++    expect(cbBtc.liquidationBonusSource).toBe("emode:10");
++    expect(row.positions.eModeCategoryId).toBe(10);
++  });
++
++  it("eMode account whose collateral is NOT in the category bitmap keeps the reserve bonus", async () => {
++    const fake = new FakeAaveReserveClient(markets(), new Map([[USER.toLowerCase(), cbBtcCollateralUsdcDebt]]));
++    fake.userEMode.set(USER.toLowerCase(), 1);
++    fake.eModeCategories.set(1, { liquidationBonusRaw: 10_200, collateralBitmap: 0b101011n }); // WETH (id 0) etc, not cbBTC
++    const row = await resolve(fake);
++    if (!row.ok) throw new Error(row.error);
++    expect(row.positions.reserves.find((reserve) => reserve.asset === CBBTC)!.liquidationBonusBps).toBe(750);
++  });
++
++  it("eMode config read failure fails the account closed", async () => {
++    const fake = new FakeAaveReserveClient(markets(), new Map([[USER.toLowerCase(), cbBtcCollateralUsdcDebt]]));
++    fake.userEMode.set(USER.toLowerCase(), 10);
++    fake.eModeCategories.set(10, { liquidationBonusRaw: 10_400, collateralBitmap: 1n << 6n, fails: true });
++    const row = await resolve(fake);
++    expect(row.ok).toBe(false);
++    if (!row.ok) expect(row.error).toBe("emode_config_failed:10");
++  });
++
++  it("getConfiguration failure => bonus undefined => snapshot provider logs liquidation_bonus_unavailable_skip (no config fallback)", async () => {
++    const fake = new FakeAaveReserveClient(
++      markets({ [CBBTC.toLowerCase()]: { configurationFails: true } }),
++      new Map([[USER.toLowerCase(), cbBtcCollateralUsdcDebt]]),
++    );
++    const registry = createChainRegistry({
++      chains: [{ chain: "base", rpcUrl: "https://base.example", fallbackRpcUrls: [], aaveSubgraphUrl: "https://subgraph.example" }],
++    });
++    const accountData = [16_000n * 100_000_000n, 10_000n * 100_000_000n, 0n, 7_800n, 7_300n, 990_000_000_000_000_000n] as const;
++    const protocol = new ViemAaveV3Protocol(
++      { readContract: async () => accountData, multicall: fake.multicall.bind(fake) } as never,
++      getChainConfig("base"), undefined, undefined, 50, registry,
++    );
++    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
++    const provider = new AaveSnapshotProvider("base", protocol, registry, log);
++    expect(await provider.refreshBorrowers("base", [USER])).toHaveLength(0);
++    const skip = log.warn.mock.calls.find((call) => call[0] === "liquidation_bonus_unavailable_skip")?.[1] as Record<string, unknown>;
++    expect(skip).toBeDefined();
++    expect(skip.collateralAsset).toBe(CBBTC);
++    expect(skip.action).toBe("skip_candidate");
++  });
++});
+diff --git a/test/unit/baseReservePairs.test.ts b/test/unit/baseReservePairs.test.ts
+new file mode 100644
+index 0000000..bc7ca78
+--- /dev/null
++++ b/test/unit/baseReservePairs.test.ts
+@@ -0,0 +1,43 @@
++import { readFileSync } from "node:fs";
++import { join } from "node:path";
++import { describe, expect, it } from "vitest";
++import { getChainConfig } from "../../src/config/chains";
++
++const params = JSON.parse(readFileSync(join(__dirname, "../fixtures/base-aave-reserve-params-2026-09-28.json"), "utf8")) as {
++  assets: Record<string, { address: string; liquidationBonusRaw: number; borrowingEnabled: boolean; canBeCollateral: boolean; liquidationThresholdBps: number }>;
++};
++const symbolOf = (address: string): string => Object.entries(params.assets)
++  .find(([, row]) => row.address.toLowerCase() === address.toLowerCase())![0];
++
++describe("Base reserve pairs (WETH/USDC/cbBTC permutations)", () => {
++  const pairs = getChainConfig("base").aave.reservePairs;
++
++  it("covers all 6 collateral/debt permutations of WETH, USDC, cbBTC; WETH/USDC stays first (legacy placeholder)", () => {
++    const keys = pairs.map((pair) => `${symbolOf(pair.collateralAsset)}/${symbolOf(pair.debtAsset)}`);
++    expect(keys[0]).toBe("WETH/USDC");
++    expect(new Set(keys)).toEqual(new Set(["WETH/USDC", "cbBTC/USDC", "USDC/WETH", "cbBTC/WETH", "WETH/cbBTC", "USDC/cbBTC"]));
++  });
++
++  it("every pair is allowed by Aave Base (collateral LT>0 + canBeCollateral, debt borrowable)", () => {
++    for (const pair of pairs) {
++      const collateral = params.assets[symbolOf(pair.collateralAsset)]!;
++      const debt = params.assets[symbolOf(pair.debtAsset)]!;
++      expect(collateral.canBeCollateral).toBe(true);
++      expect(collateral.liquidationThresholdBps).toBeGreaterThan(0);
++      expect(debt.borrowingEnabled).toBe(true);
++    }
++  });
++
++  it("config bonus (reference only) equals the collateral reserve's on-chain non-eMode bonus", () => {
++    for (const pair of pairs) {
++      expect(pair.liquidationBonusBps).toBe(params.assets[symbolOf(pair.collateralAsset)]!.liquidationBonusRaw - 10_000);
++    }
++  });
++
++  it("legacy defaultDebtToCoverWei is ~$1 of the debt asset (never used for sizing)", () => {
++    const expected: Record<string, bigint> = { USDC: 1_000_000n, WETH: 400_000_000_000_000n, cbBTC: 1_200n };
++    for (const pair of pairs) {
++      expect(pair.defaultDebtToCoverWei).toBe(expected[symbolOf(pair.debtAsset)]);
++    }
++  });
++});
+diff --git a/test/unit/liquidationExecutionAdapter.test.ts b/test/unit/liquidationExecutionAdapter.test.ts
+index eed10fb..a2d0416 100644
+--- a/test/unit/liquidationExecutionAdapter.test.ts
++++ b/test/unit/liquidationExecutionAdapter.test.ts
+@@ -1,7 +1,13 @@
+ import { describe, expect, it } from "vitest";
+-import { decodeAbiParameters, decodeFunctionData, parseAbiParameters } from "viem";
++import { decodeFunctionData } from "viem";
++import type { Address } from "viem";
+ import { buildLiquidationExecutionRequest, estimateMinimumCollateralOut } from "../../src/executors/liquidationExecutionAdapter";
+ import { aavePoolAbi } from "../../src/protocols/aaveV3";
++import {
++  decodeLiquidationRouteV1,
++  encodeLiquidationRoute,
++  LIQUIDATION_RECEIVER_V1_PARAMS,
++} from "../../src/protocols/liquidationFlashLoanReceiver";
+ 
+ const candidate = {
+   account: "0x0000000000000000000000000000000000000011",
+@@ -40,18 +46,16 @@ describe("buildLiquidationExecutionRequest", () => {
+ 
+     expect(decoded.functionName).toBe("flashLoanSimple");
+     const encodedRoute = decoded.args[3] as `0x${string}`;
+-    const decodedRoute = decodeAbiParameters(
+-      parseAbiParameters(
+-        "uint8 routeType,address collateralAsset,address debtAsset,address user,uint256 debtToCover,uint256 minCollateralOut,bool receiveAToken",
+-      ),
+-      encodedRoute,
+-    );
+-    expect(decodedRoute[0]).toBe(0);
+-    expect(decodedRoute[1]).toBe(candidate.collateralAsset);
+-    expect(decodedRoute[2]).toBe(candidate.debtAsset);
+-    expect(decodedRoute[3]).toBe(candidate.account);
+-    expect(decodedRoute[4]).toBe(candidate.debtToCover);
+-    expect(decodedRoute[5]).toBeGreaterThan(0n);
++    // Live v1 receiver (042e442): 5 fields, NO routeType / minCollateralOut.
++    const decodedRoute = decodeLiquidationRouteV1(encodedRoute);
++    expect(decodedRoute.collateralAsset).toBe(candidate.collateralAsset);
++    expect(decodedRoute.debtAsset).toBe(candidate.debtAsset);
++    expect(decodedRoute.user).toBe(candidate.account);
++    expect(decodedRoute.debtToCover).toBe(candidate.debtToCover);
++    expect(decodedRoute.receiveAToken).toBe(false);
++    // Round-trip: decoder matches the 5-field ABI exactly (word count = 5 * 32 bytes).
++    expect((encodedRoute.length - 2) / 64).toBe(5);
++    expect(encodeLiquidationRoute(decodedRoute)).toBe(encodedRoute);
+   });
+ 
+   it("builds Balancer Vault flashLoan transaction when balancer route selected", () => {
+@@ -90,25 +94,72 @@ describe("buildLiquidationExecutionRequest", () => {
+     expect(preview?.data).toBe(built.data);
+   });
+ 
+-  it("calculates minCollateralOut with non-e-mode close factor defaults", () => {
++  it("BEFORE bug: estimateMinimumCollateralOut treated debt raw as collateral raw (unit mismatch)", () => {
++    // Pre-fix formula (kept here as documentation of the bug):
++    //   debtCovered = debtToCover * closeFactorBps / 10_000
++    //   gross = debtCovered + debtCovered * bonusBps / 10_000
++    //   return gross - slippage
++    // That number is in DEBT-token raw units, not collateral units — and ignores the price ratio / protocol fee.
++    const debtToCover = 1_000_000_000n; // $1000 USDC (6 dec)
++    const closeFactorBps = 5_000;
++    const bonusBps = 500;
++    const slippageBps = 500;
++    const debtCovered = (debtToCover * BigInt(closeFactorBps)) / 10_000n;
++    const gross = debtCovered + (debtCovered * BigInt(bonusBps)) / 10_000n;
++    const beforeBug = gross - (gross * BigInt(slippageBps)) / 10_000n;
++    expect(beforeBug).toBe(498_750_000n); // "498_750_000 wei of WETH" = 5e-10 WETH ≈ $0 — vacuous floor
++  });
++
++  it("AFTER fix: estimateMinimumCollateralOut uses Aave price/decimals formula (USDC debt -> WETH collateral)", () => {
++    const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
++    const WETH = "0x4200000000000000000000000000000000000006" as Address;
+     const minOut = estimateMinimumCollateralOut({
+-      ...candidate,
+-      healthFactor: 960_000_000_000_000_000n,
++      account: candidate.account as Address,
++      collateralAsset: WETH,
++      debtAsset: USDC,
++      debtToCover: 1_000_000_000n, // $1000 USDC
++      repayValueUsd: 1_000,
+       liquidationBonusBps: 500,
++      effectiveLiquidationBonusBps: 500,
++      healthFactor: 960_000_000_000_000_000n,
++      appliedCloseFactorBps: 5_000, // already sized; executor must NOT re-apply close factor
++      expectedDebtRepaidRaw: 1_000_000_000n,
++      debtDecimals: 6,
++      collateralDecimals: 18,
++      debtPriceUsd8: 100_000_000n,
++      collateralPriceUsd8: 300_000_000_000n, // $3000
++      liquidationProtocolFeeBps: 1_000,
++      collateralBalanceRaw: 10n ** 18n,
+     }, 500);
+-    // debtToCover * 50% close factor => 500_000, +5% bonus => 525_000, -5% slippage => 498_750
+-    expect(minOut).toBe(498_750n);
++    // base = 1000/3000 WETH = 1/3e18; *1.05 = 0.35e18; fee on bonus portion ≈ 0.001666e18; liquidator ≈ 0.348333e18
++    // -5% slippage => ≈ 0.330916e18
++    expect(minOut).toBeDefined();
++    expect(minOut!).toBeGreaterThan(330_000_000_000_000_000n);
++    expect(minOut!).toBeLessThan(331_000_000_000_000_000n);
+   });
+ 
+-  it("calculates minCollateralOut with e-mode bonus and 100% close factor", () => {
+-    const minOut = estimateMinimumCollateralOut({
++  it("AFTER fix: returns undefined (fail closed) when prices/decimals are missing", () => {
++    expect(estimateMinimumCollateralOut({
+       ...candidate,
+       healthFactor: 940_000_000_000_000_000n,
+       closeFactorBps: 10_000,
+       effectiveLiquidationBonusBps: 1_000,
+-    }, 1_000);
+-    // debtToCover full => 1_000_000, +10% bonus => 1_100_000, -10% slippage => 990_000
+-    expect(minOut).toBe(990_000n);
++    }, 1_000)).toBeUndefined();
++  });
++
++  it("v1 encodeLiquidationRoute is exactly 5 ABI words matching LIQUIDATION_RECEIVER_V1_PARAMS", () => {
++    expect(LIQUIDATION_RECEIVER_V1_PARAMS).toBe(
++      "address collateralAsset,address debtAsset,address user,uint256 debtToCover,bool receiveAToken",
++    );
++    const encoded = encodeLiquidationRoute({
++      collateralAsset: candidate.collateralAsset as Address,
++      debtAsset: candidate.debtAsset as Address,
++      user: candidate.account as Address,
++      debtToCover: candidate.debtToCover,
++      receiveAToken: false,
++    });
++    expect((encoded.length - 2) / 64).toBe(5);
++    expect(decodeLiquidationRouteV1(encoded).debtToCover).toBe(candidate.debtToCover);
+   });
+ 
+   it("rejects request construction when flash wrapper is required but receiver is missing", () => {
+diff --git a/test/unit/liquidationReceiverReadiness.test.ts b/test/unit/liquidationReceiverReadiness.test.ts
+index 168b059..6282bd3 100644
+--- a/test/unit/liquidationReceiverReadiness.test.ts
++++ b/test/unit/liquidationReceiverReadiness.test.ts
+@@ -1,125 +1,185 @@
+ import { describe, expect, it, vi } from "vitest";
+-import type { Address } from "viem";
++import type { Address, Hex } from "viem";
++import { keccak256 } from "viem";
+ import { getChainConfig } from "../../src/config/chains";
+-import { assertLiquidationReceiverReadiness, liquidationFlashReceiverAbi } from "../../src/production/liquidationReceiverReadiness";
++import {
++  AAVE_HF_NOT_BELOW_THRESHOLD_SELECTOR,
++  assertLiquidationReceiverReadiness,
++  classifyLayoutProbeRevert,
++  RECEIVER_DEBT_ASSET_MISMATCH_SELECTOR,
++  resolveExpectedReceiverCodeHashes,
++} from "../../src/production/liquidationReceiverReadiness";
++
++const LIVE_RECEIVER = "0x379ce85b431bd4cb3b2b11d682bac4556648ada6" as Address;
++const LIVE_CODEHASH = "0xf3e6c57e86b3aaba08c3d818d006063e355569353f80bd7bd84ee72d393e23ab" as Hex;
++/** Arbitrary non-empty bytecode whose keccak is LIVE_CODEHASH's sibling — we force the hash via a spy. */
++const FAKE_BYTECODE = "0x600160005260206000f3" as Hex;
+ 
+ describe("assertLiquidationReceiverReadiness", () => {
+-  const receiver = "0x0000000000000000000000000000000000000abc" as Address;
++  const receiver = LIVE_RECEIVER;
+   const expectedRouter = "0x2626664c2603336E57B271c5C0b26F421741e481" as Address;
+   const basePool = getChainConfig("base").aave.pool;
+ 
+-  it("throws when bytecode is empty", async () => {
+-    const client = {
+-      getBytecode: vi.fn().mockResolvedValue("0x"),
+-      readContract: vi.fn(),
++  function client(overrides: {
++    readonly bytecode?: Hex | undefined;
++    readonly version?: bigint;
++    readonly pool?: Address;
++    readonly router?: Address;
++    readonly callError?: unknown;
++    readonly callSucceeds?: boolean;
++    readonly getBytecodeThrows?: boolean;
++    readonly readThrows?: boolean;
++  } = {}) {
++    return {
++      getBytecode: overrides.getBytecodeThrows === true
++        ? vi.fn().mockRejectedValue(new Error("RPC down"))
++        : vi.fn().mockResolvedValue(overrides.bytecode === undefined ? FAKE_BYTECODE : overrides.bytecode),
++      readContract: overrides.readThrows === true
++        ? vi.fn().mockRejectedValue(new Error("RPC read failed"))
++        : vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
++          if (functionName === "receiverVersion") {
++            return overrides.version ?? 1n;
++          }
++          if (functionName === "aavePool") {
++            return overrides.pool ?? basePool;
++          }
++          if (functionName === "swapRouter") {
++            return overrides.router ?? expectedRouter;
++          }
++          throw new Error(`unexpected ${functionName}`);
++        }),
++      call: overrides.callSucceeds === true
++        ? vi.fn().mockResolvedValue({ data: "0x01" })
++        : vi.fn().mockRejectedValue(overrides.callError ?? Object.assign(new Error("Execution reverted"), {
++          cause: { data: AAVE_HF_NOT_BELOW_THRESHOLD_SELECTOR },
++        })),
+     };
+-    await expect(
+-      assertLiquidationReceiverReadiness(client, {
+-        chain: "base",
+-        receiver,
+-        expectedSwapRouter: expectedRouter,
+-      }),
+-    ).rejects.toThrow(/no on-chain code/);
+-    expect(client.readContract).not.toHaveBeenCalled();
++  }
++
++  it("throws when bytecode is empty", async () => {
++    await expect(assertLiquidationReceiverReadiness(client({ bytecode: "0x" }), {
++      chain: "base", receiver, expectedSwapRouter: expectedRouter, layoutProbe: false,
++    })).rejects.toThrow(/no on-chain code/);
++  });
++
++  it("blocks LIVE on eth_getCode RPC error (fail closed)", async () => {
++    await expect(assertLiquidationReceiverReadiness(client({ getBytecodeThrows: true }), {
++      chain: "base", receiver, expectedSwapRouter: expectedRouter,
++    })).rejects.toThrow(/LIQUIDATION_RECEIVER_READINESS_BLOCKED.*eth_getCode failed/);
++  });
++
++  it("blocks LIVE on unknown / mismatched code hash", async () => {
++    await expect(assertLiquidationReceiverReadiness(client({}), {
++      chain: "base",
++      receiver,
++      expectedSwapRouter: expectedRouter,
++      expectedCodeHashes: [LIVE_CODEHASH],
++      layoutProbe: false,
++    })).rejects.toThrow(/code hash mismatch/);
++  });
++
++  it("blocks LIVE when no pinned hash is configured for the address", async () => {
++    const unknown = "0x0000000000000000000000000000000000000abc" as Address;
++    await expect(assertLiquidationReceiverReadiness(client({}), {
++      chain: "base",
++      receiver: unknown,
++      expectedSwapRouter: expectedRouter,
++      expectedCodeHashes: [],
++      layoutProbe: false,
++    })).rejects.toThrow(/no pinned code hash/);
+   });
+ 
+   it("throws when version is not 1", async () => {
+-    const client = {
+-      getBytecode: vi.fn().mockResolvedValue("0x6000"),
+-      readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
+-        if (functionName === "receiverVersion") {
+-          return 2n;
+-        }
+-        throw new Error("unexpected");
+-      }),
+-    };
+-    await expect(
+-      assertLiquidationReceiverReadiness(client, {
+-        chain: "base",
+-        receiver,
+-        expectedSwapRouter: expectedRouter,
+-      }),
+-    ).rejects.toThrow(/version mismatch/);
++    await expect(assertLiquidationReceiverReadiness(client({ version: 2n }), {
++      chain: "base",
++      receiver,
++      expectedSwapRouter: expectedRouter,
++      expectedCodeHashes: [keccak256(FAKE_BYTECODE)],
++      layoutProbe: false,
++    })).rejects.toThrow(/version mismatch/);
+   });
+ 
+   it("throws when pool binding mismatches chain config", async () => {
+-    const wrongPool = "0x1111111111111111111111111111111111111111" as Address;
+-    const client = {
+-      getBytecode: vi.fn().mockResolvedValue("0x6000"),
+-      readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
+-        if (functionName === "receiverVersion") {
+-          return 1n;
+-        }
+-        if (functionName === "aavePool") {
+-          return wrongPool;
+-        }
+-        throw new Error("unexpected");
+-      }),
+-    };
+-    await expect(
+-      assertLiquidationReceiverReadiness(client, {
+-        chain: "base",
+-        receiver,
+-        expectedSwapRouter: expectedRouter,
+-      }),
+-    ).rejects.toThrow(/wrong Aave pool/);
+-    expect(client.readContract).toHaveBeenCalled();
++    await expect(assertLiquidationReceiverReadiness(client({
++      pool: "0x1111111111111111111111111111111111111111" as Address,
++    }), {
++      chain: "base",
++      receiver,
++      expectedSwapRouter: expectedRouter,
++      expectedCodeHashes: [keccak256(FAKE_BYTECODE)],
++      layoutProbe: false,
++    })).rejects.toThrow(/wrong Aave pool/);
+   });
+ 
+   it("throws when swap router mismatches", async () => {
+-    const client = {
+-      getBytecode: vi.fn().mockResolvedValue("0x6000"),
+-      readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
+-        if (functionName === "receiverVersion") {
+-          return 1n;
+-        }
+-        if (functionName === "aavePool") {
+-          return basePool;
+-        }
+-        if (functionName === "swapRouter") {
+-          return "0x2222222222222222222222222222222222222222" as Address;
+-        }
+-        throw new Error("unexpected");
+-      }),
+-    };
+-    await expect(
+-      assertLiquidationReceiverReadiness(client, {
+-        chain: "base",
+-        receiver,
+-        expectedSwapRouter: expectedRouter,
+-      }),
+-    ).rejects.toThrow(/swap router mismatch/);
++    await expect(assertLiquidationReceiverReadiness(client({
++      router: "0x2222222222222222222222222222222222222222" as Address,
++    }), {
++      chain: "base",
++      receiver,
++      expectedSwapRouter: expectedRouter,
++      expectedCodeHashes: [keccak256(FAKE_BYTECODE)],
++      layoutProbe: false,
++    })).rejects.toThrow(/swap router mismatch/);
+   });
+ 
+-  it("resolves when all checks pass", async () => {
+-    const client = {
+-      getBytecode: vi.fn().mockResolvedValue("0x6000"),
+-      readContract: vi.fn().mockImplementation(async ({ functionName }: { functionName: string }) => {
+-        if (functionName === "receiverVersion") {
+-          return 1n;
+-        }
+-        if (functionName === "aavePool") {
+-          return basePool;
+-        }
+-        if (functionName === "swapRouter") {
+-          return expectedRouter;
+-        }
+-        throw new Error("unexpected");
+-      }),
+-    };
+-    await expect(
+-      assertLiquidationReceiverReadiness(client, {
+-        chain: "base",
+-        receiver,
+-        expectedSwapRouter: expectedRouter,
++  it("blocks LIVE when layout probe returns DebtAssetMismatch (today's 
