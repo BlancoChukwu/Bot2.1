@@ -1,0 +1,628 @@
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Snapshot builders were pricing pair.defaultDebtToCoverWei (1e6 USDC) as
+debtUsd≈1, causing 26 dust rejects across 4 accounts since restart
+(host: 0xf20e @ Base 51765799 logged debtUsd=0.99986806 while on-chain
+totalDebtBase=923715 / $0.0092).
+
+- Resolve getUserReservesData + indices + oracle prices (batched) per
+  account; choose pair from actual holdings; size debtToCover =
+  min(actual debt, close-factor 50%/100% at HF 0.95, collateral*(1+bonus)).
+- Never fall back to defaultDebtToCoverWei: log debt_to_cover_resolve_failed
+  or pair_not_held_skip and skip the candidate.
+- Log debtToCover (raw+USD), actualDebtUsd, closeFactorBps, assets on every
+  liquidation_evaluated (pass or fail).
+- Replay fixture for 0xf20e @ 51765799 (archive eth_call) + unit coverage.
+---
+ src/index.ts                                  |   6 +-
+ src/monitors/aaveSnapshotProvider.ts          | 199 +++++++---
+ src/monitors/reserveAwareBorrowerCache.ts     |  33 ++
+ src/monitors/watchlistCoordinator.ts          |   1 +
+ src/orchestrator/liquidationCandidateGate.ts  |  60 ++-
+ src/orchestrator/pipelineDetectionAdapter.ts  |  70 ++--
+ src/protocols/aaveReservePositions.ts         | 348 ++++++++++++++++++
+ src/protocols/aaveV3.ts                       |  49 +++
+ src/protocols/liquidationSizing.ts            | 179 +++++++++
+ test/fixtures/replay-0xf20e-51765799.json     |  66 ++++
+ test/helpers/fakeAaveReserveClient.ts         |  89 +++++
+ test/unit/aaveReservePositions.test.ts        |  60 +++
+ .../unit/aaveSnapshotProviderRealDebt.test.ts | 224 +++++++++++
+ test/unit/liquidationSizing.test.ts           | 164 +++++++++
+ test/unit/replay0xf20e51765799.test.ts        | 209 +++++++++++
+ 15 files changed, 1653 insertions(+), 104 deletions(-)
+ create mode 100644 src/protocols/aaveReservePositions.ts
+ create mode 100644 src/protocols/liquidationSizing.ts
+ create mode 100644 test/fixtures/replay-0xf20e-51765799.json
+ create mode 100644 test/helpers/fakeAaveReserveClient.ts
+ create mode 100644 test/unit/aaveReservePositions.test.ts
+ create mode 100644 test/unit/aaveSnapshotProviderRealDebt.test.ts
+ create mode 100644 test/unit/liquidationSizing.test.ts
+ create mode 100644 test/unit/replay0xf20e51765799.test.ts
+
+diff --git a/src/index.ts b/src/index.ts
+index a94d6b4..c7e360e 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -916,7 +916,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
+     },
+     onClose: () => metrics.setWatchlistCircuitBreakerOpen(config.chain, false),
+   });
+-  const aaveSnapshotProvider = new AaveSnapshotProvider(config.chain, protocol, registry);
++  const aaveSnapshotProvider = new AaveSnapshotProvider(config.chain, protocol, registry, logger);
+   const minDebtBase = BigInt(Math.trunc(config.minLiquidationDebtUsd * 1e8));
+   const multicallBatchSize = parseMinNumber(
+     process.env.MULTICALL_BATCH_SIZE,
+@@ -1193,6 +1193,8 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
+     hybridDetection,
+     arbitrageQueue: arbQueue,
+     enableArbitrage: config.eventPurity.enableArbitrage,
++    snapshotProvider: borrowerProvider,
++    logger,
+   });
+   const arbScannerEngine = new ProfitabilityEngine({
+     registry,
+@@ -1779,7 +1781,7 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
+     .filter((event): event is { atMs: number; chain: SupportedChain; reserve: Address } => event !== undefined);
+   const snapshots = await new ReplayHarness({
+     registry: replayRegistry,
+-    provider: new AaveSnapshotProvider(config.chain, protocol, replayRegistry),
++    provider: new AaveSnapshotProvider(config.chain, protocol, replayRegistry, logger),
+     logger,
+     metrics,
+     events: replayEvents,
+diff --git a/src/monitors/aaveSnapshotProvider.ts b/src/monitors/aaveSnapshotProvider.ts
+index 5d7eddf..c50f73f 100644
+--- a/src/monitors/aaveSnapshotProvider.ts
++++ b/src/monitors/aaveSnapshotProvider.ts
+@@ -1,24 +1,45 @@
+ import type { Address } from "viem";
++import type { LoggerLike } from "../bot";
+ import type { ChainRegistry } from "../config/chainRegistry";
+-import type { SupportedChain } from "../config/chains";
+-import type { AaveUserAccount, AaveV3Protocol, LiquidationCandidate } from "../protocols/aaveV3";
++import type { AaveReservePair, SupportedChain } from "../config/chains";
++import { getChainConfig } from "../config/chains";
++import type { AccountReservePositionsResult, AaveReservePosition } from "../protocols/aaveReservePositions";
++import type { AaveUserAccount, AaveV3Protocol } from "../protocols/aaveV3";
++import { planAaveLiquidation, type LiquidationPlan } from "../protocols/liquidationSizing";
+ import { createAsset, createAssetAmount } from "../utils/typedAssetMath";
+ import type { BorrowerSnapshot } from "./reserveAwareBorrowerCache";
+ 
+ const usd = createAsset({ symbol: "USD", decimals: 8 });
+-const weth = createAsset({ symbol: "WETH", decimals: 18 });
+-const usdc = createAsset({ symbol: "USDC", decimals: 6 });
+ const liquidationHealthFactor = 1_000_000_000_000_000_000n;
+ const preLiquidatableHealthFactor = 1_050_000_000_000_000_000n;
+ /** Pipeline / reserve-event diagnostics (success gate: HF < 1.5). */
+ export const pipelineDiagnosticHealthFactor = 1_500_000_000_000_000_000n;
+ 
++const fallbackLogger: LoggerLike = {
++  info: (message, meta) => console.info(JSON.stringify({ level: "info", message, ...(meta as object) }, bigintReplacer)),
++  warn: (message, meta) => console.warn(JSON.stringify({ level: "warn", message, ...(meta as object) }, bigintReplacer)),
++  error: (message, meta) => console.error(JSON.stringify({ level: "error", message, ...(meta as object) }, bigintReplacer)),
++};
++
++export interface AaveSnapshotProviderOptions {
++  /** Reserve pairs to consider; defaults to the chain config pairs. */
++  readonly reservePairs?: readonly AaveReservePair[];
++  /** Aave v3.3+ small-position 100% close factor rule (off by default; see liquidationSizing). */
++  readonly smallPositionFullClose?: boolean;
++}
++
+ export class AaveSnapshotProvider {
++  private readonly logger: LoggerLike;
++
+   public constructor(
+     private readonly chain: SupportedChain,
+     private readonly protocol: AaveV3Protocol,
+     private readonly registry: Pick<ChainRegistry, "getResolvedAave">,
+-  ) {}
++    logger?: LoggerLike,
++    private readonly options: AaveSnapshotProviderOptions = {},
++  ) {
++    this.logger = logger ?? fallbackLogger;
++  }
+ 
+   public async getBorrowersForReserve(_chain: SupportedChain, reserve: Address): Promise<Address[]> {
+     const candidates = await this.protocol.getLiquidatablePositions();
+@@ -58,9 +79,25 @@ export class AaveSnapshotProvider {
+     hfThreshold: bigint,
+   ): Promise<readonly BorrowerSnapshot[]> {
+     this.registry.getResolvedAave(this.chain);
+-    const snapshots: BorrowerSnapshot[] = [];
++    if (this.protocol.getUserAccount === undefined) {
++      return [];
++    }
++    const eligible: AaveUserAccount[] = [];
+     for (const account of accounts) {
+-      const snapshot = await this.refreshBorrower(account, hfThreshold);
++      const userAccount = await this.protocol.getUserAccount(account);
++      if (userAccount.healthFactor >= hfThreshold || userAccount.totalDebtBase <= 0n) {
++        continue;
++      }
++      eligible.push(userAccount);
++    }
++    if (eligible.length === 0) {
++      return [];
++    }
++
++    const positions = await this.resolvePositionsWithRetry(eligible.map((row) => row.account));
++    const snapshots: BorrowerSnapshot[] = [];
++    for (const userAccount of eligible) {
++      const snapshot = this.buildSnapshot(userAccount, positions.get(userAccount.account.toLowerCase()));
+       if (snapshot !== undefined) {
+         snapshots.push(snapshot);
+       }
+@@ -71,69 +108,125 @@ export class AaveSnapshotProvider {
+   public async pollBorrowers(_chain: SupportedChain): Promise<readonly BorrowerSnapshot[]> {
+     this.registry.getResolvedAave(this.chain);
+     const candidates = await this.protocol.getLiquidatablePositions();
+-    return candidates.map((candidate) => toSnapshot(this.chain, candidate));
++    // Candidates from the subgraph scan carry the static pair default; re-resolve real positions.
++    return this.refreshBorrowersWithThreshold(candidates.map((candidate) => candidate.account), liquidationHealthFactor);
+   }
+ 
+-  private async refreshBorrower(
+-    account: Address,
+-    hfThreshold: bigint = liquidationHealthFactor,
+-  ): Promise<BorrowerSnapshot | undefined> {
+-    if (this.protocol.getUserAccount === undefined || this.protocol.getBestLiquidationPair === undefined) {
+-      return undefined;
++  /** One batched resolution for all accounts; failed accounts get exactly one retry (also batched). */
++  private async resolvePositionsWithRetry(
++    accounts: readonly Address[],
++  ): Promise<Map<string, AccountReservePositionsResult>> {
++    const out = new Map<string, AccountReservePositionsResult>();
++    if (this.protocol.getAccountReservePositions === undefined) {
++      for (const account of accounts) {
++        out.set(account.toLowerCase(), { ok: false, error: "protocol_missing_getAccountReservePositions" });
++      }
++      return out;
++    }
++    let pending = [...accounts];
++    for (let attempt = 0; attempt < 2 && pending.length > 0; attempt += 1) {
++      let batch: ReadonlyMap<string, AccountReservePositionsResult>;
++      try {
++        batch = await this.protocol.getAccountReservePositions(pending);
++      } catch (error) {
++        const message = error instanceof Error ? error.message.split("\n")[0] ?? "error" : String(error);
++        for (const account of pending) {
++          out.set(account.toLowerCase(), { ok: false, error: `resolve_threw:${message}` });
++        }
++        continue;
++      }
++      for (const account of pending) {
++        out.set(account.toLowerCase(), batch.get(account.toLowerCase()) ?? { ok: false, error: "missing_from_batch" });
++      }
++      pending = pending.filter((account) => out.get(account.toLowerCase())?.ok !== true);
+     }
++    return out;
++  }
+ 
+-    const userAccount = await this.protocol.getUserAccount(account);
+-    if (userAccount.healthFactor >= hfThreshold || userAccount.totalDebtBase <= 0n) {
++  private resolveReservePairs(): readonly AaveReservePair[] {
++    return this.options.reservePairs
++      ?? this.registry.getResolvedAave(this.chain)?.reservePairs
++      ?? getChainConfig(this.chain).aave.reservePairs;
++  }
++
++  private buildSnapshot(
++    userAccount: AaveUserAccount,
++    resolved: AccountReservePositionsResult | undefined,
++  ): BorrowerSnapshot | undefined {
++    if (resolved === undefined || !resolved.ok) {
++      // Never fall back to the static pair defaultDebtToCoverWei.
++      this.logger.warn("debt_to_cover_resolve_failed", {
++        chain: this.chain,
++        account: userAccount.account,
++        healthFactor: userAccount.healthFactor.toString(),
++        totalDebtUsd: Number(userAccount.totalDebtBase) / 1e8,
++        error: resolved === undefined ? "not_resolved" : resolved.error,
++        action: "skip_candidate",
++      });
+       return undefined;
+     }
+-    const pair = await this.protocol.getBestLiquidationPair(userAccount);
+-    const candidate: LiquidationCandidate = {
+-      account,
+-      collateralAsset: pair.collateralAsset,
+-      debtAsset: pair.debtAsset,
+-      debtToCover: pair.debtToCover,
+-      repayValueUsd: pair.repayValueUsd,
+-      liquidationBonusBps: pair.liquidationBonusBps,
++    const sizing = planAaveLiquidation({
++      reserves: resolved.positions.reserves,
++      pairs: this.resolveReservePairs(),
+       healthFactor: userAccount.healthFactor,
+-    };
+-    return toSnapshot(this.chain, candidate);
++      totalDebtBase: userAccount.totalDebtBase,
++      ...(this.options.smallPositionFullClose === undefined ? {} : { smallPositionFullClose: this.options.smallPositionFullClose }),
++    });
++    if (sizing.kind === "pair_not_held") {
++      this.logger.info("pair_not_held_skip", {
++        chain: this.chain,
++        account: userAccount.account,
++        healthFactor: userAccount.healthFactor.toString(),
++        totalDebtUsd: Number(userAccount.totalDebtBase) / 1e8,
++        heldDebtAssets: [
++          ...sizing.heldDebtAssets,
++          ...(resolved.positions.untrackedReserves ?? []).filter((row) => row.hasDebt).map((row) => row.asset),
++        ],
++        heldCollateralAssets: [
++          ...sizing.heldCollateralAssets,
++          ...(resolved.positions.untrackedReserves ?? []).filter((row) => row.hasCollateral).map((row) => row.asset),
++        ],
++      });
++      return undefined;
++    }
++    return toSnapshot(this.chain, userAccount, resolved.positions.reserves, sizing.plan);
+   }
+ }
+ 
+-function toSnapshot(chain: SupportedChain, candidate: LiquidationCandidate): BorrowerSnapshot {
+-  const debtRaw = candidate.debtToCover;
+-  const collateralRaw = debtRaw + (debtRaw * BigInt(candidate.liquidationBonusBps)) / 10_000n;
++export function toSnapshot(
++  chain: SupportedChain,
++  userAccount: Pick<AaveUserAccount, "account" | "healthFactor">,
++  reserves: readonly AaveReservePosition[],
++  plan: LiquidationPlan,
++): BorrowerSnapshot {
+   return {
+     chain,
+-    account: candidate.account,
++    account: userAccount.account,
+     protocol: "aave",
+-    healthFactor: candidate.healthFactor,
++    healthFactor: userAccount.healthFactor,
+     updatedAtMs: Date.now(),
+-    reserves: [
+-      {
+-        assetAddress: candidate.collateralAsset,
+-        asset: weth,
+-        collateralBalance: createAssetAmount(weth, collateralRaw),
+-        variableDebt: createAssetAmount(weth, 0n),
+-        stableDebt: createAssetAmount(weth, 0n),
+-        priceInQuote: createAssetAmount(usd, 300_000_000_000n),
+-        usageAsCollateralEnabled: true,
+-        liquidationBonusBps: candidate.liquidationBonusBps,
+-      },
+-      {
+-        assetAddress: candidate.debtAsset as Address,
+-        asset: usdc,
+-        collateralBalance: createAssetAmount(usdc, 0n),
+-        variableDebt: createAssetAmount(usdc, debtRaw),
+-        stableDebt: createAssetAmount(usdc, 0n),
+-        priceInQuote: createAssetAmount(usd, 100_000_000n),
+-        usageAsCollateralEnabled: false,
+-        liquidationBonusBps: 0,
+-      },
+-    ],
++    liquidationPlan: plan,
++    reserves: reserves.map((reserve) => {
++      const asset = createAsset({ symbol: reserve.asset.toLowerCase(), decimals: reserve.decimals });
++      const isCollateral = reserve.asset.toLowerCase() === plan.collateralAsset.toLowerCase();
++      return {
++        assetAddress: reserve.asset,
++        asset,
++        collateralBalance: createAssetAmount(asset, reserve.collateralBalance),
++        variableDebt: createAssetAmount(asset, reserve.variableDebt),
++        stableDebt: createAssetAmount(asset, reserve.stableDebt),
++        priceInQuote: createAssetAmount(usd, reserve.priceUsd8),
++        usageAsCollateralEnabled: reserve.usageAsCollateralEnabled,
++        liquidationBonusBps: isCollateral ? plan.liquidationBonusBps : 0,
++      };
++    }),
+   };
+ }
+ 
++function bigintReplacer(_key: string, value: unknown): unknown {
++  return typeof value === "bigint" ? value.toString() : value;
++}
++
+ export function liquidationSafetyEstimateUsd(input: {
+   account: AaveUserAccount;
+   liquidationBonusBps: number;
+diff --git a/src/monitors/reserveAwareBorrowerCache.ts b/src/monitors/reserveAwareBorrowerCache.ts
+index ed946fa..a1290ad 100644
+--- a/src/monitors/reserveAwareBorrowerCache.ts
++++ b/src/monitors/reserveAwareBorrowerCache.ts
+@@ -1,6 +1,7 @@
+ import type { Address } from "viem";
+ import type { SupportedChain } from "../config/chains";
+ import type { LiquidationCandidate } from "../protocols/aaveV3";
++import type { LiquidationPlan } from "../protocols/liquidationSizing";
+ import {
+   convertToQuote,
+   createAssetAmount,
+@@ -17,6 +18,11 @@ export interface BorrowerSnapshot {
+   readonly healthFactor: bigint;
+   readonly reserves: readonly BorrowerReserveSnapshot[];
+   readonly updatedAtMs: number;
++  /**
++   * Aave: pair + debtToCover sized from real per-reserve positions (close factor / collateral capped).
++   * When present it is the ONLY candidate emitted for this snapshot.
++   */
++  readonly liquidationPlan?: LiquidationPlan;
+ }
+ 
+ export interface BorrowerReserveSnapshot {
+@@ -145,6 +151,10 @@ function toCandidates(snapshot: BorrowerSnapshot): LiquidationCandidate[] {
+     return [];
+   }
+ 
++  if (snapshot.liquidationPlan !== undefined) {
++    return [candidateFromPlan(snapshot, snapshot.liquidationPlan)];
++  }
++
+   const collaterals = snapshot.reserves.filter(
+     (reserve) => reserve.usageAsCollateralEnabled && reserve.collateralBalance.raw > 0n,
+   );
+@@ -169,6 +179,29 @@ function toCandidates(snapshot: BorrowerSnapshot): LiquidationCandidate[] {
+   });
+ }
+ 
++export function candidateFromPlan(
++  snapshot: Pick<BorrowerSnapshot, "account" | "healthFactor">,
++  plan: LiquidationPlan,
++): LiquidationCandidate {
++  return {
++    account: snapshot.account,
++    collateralAsset: plan.collateralAsset,
++    debtAsset: plan.debtAsset,
++    debtToCover: plan.debtToCover,
++    repayValueUsd: plan.debtToCoverUsd,
++    liquidationBonusBps: plan.liquidationBonusBps,
++    // debtToCover is already close-factor capped; 10_000 keeps executors from applying it twice.
++    closeFactorBps: 10_000,
++    appliedCloseFactorBps: plan.closeFactorBps,
++    debtDecimals: plan.debtDecimals,
++    actualDebtRaw: plan.actualDebtRaw,
++    actualDebtUsd: plan.actualDebtUsd,
++    ...(plan.totalDebtUsd === undefined ? {} : { totalDebtUsd: plan.totalDebtUsd }),
++    sizingCappedBy: plan.cappedBy,
++    healthFactor: snapshot.healthFactor,
++  };
++}
++
+ function totalDebt(reserve: BorrowerReserveSnapshot): AssetAmount {
+   return createAssetAmount(
+     reserve.asset,
+diff --git a/src/monitors/watchlistCoordinator.ts b/src/monitors/watchlistCoordinator.ts
+index 4c33cec..6992dcb 100644
+--- a/src/monitors/watchlistCoordinator.ts
++++ b/src/monitors/watchlistCoordinator.ts
+@@ -79,6 +79,7 @@ export class WatchlistCoordinator implements BorrowerSnapshotProvider {
+       config.chain,
+       config.protocol,
+       config.registry,
++      config.logger,
+     );
+   }
+ 
+diff --git a/src/orchestrator/liquidationCandidateGate.ts b/src/orchestrator/liquidationCandidateGate.ts
+index 0a5e3c9..9440032 100644
+--- a/src/orchestrator/liquidationCandidateGate.ts
++++ b/src/orchestrator/liquidationCandidateGate.ts
+@@ -2,6 +2,7 @@ import type { Address } from "viem";
+ import type { BotMetrics, LoggerLike } from "../bot";
+ import type { SupportedChain } from "../config/chains";
+ import type { LiquidationCandidate } from "../protocols/aaveV3";
++import type { LiquidationPlan } from "../protocols/liquidationSizing";
+ import {
+   evaluateDustFilter,
+   logLiquidationDustDecision,
+@@ -24,6 +25,43 @@ const baseUsdcDecimals = 6;
+ const baseWethDecimals = 18;
+ const defaultErc20Decimals = 18;
+ 
++interface ResolvedDebtUsd {
++  readonly debtUsd: number;
++  readonly trusted: boolean;
++  readonly actualDebtUsd?: number;
++}
++
++/** Sizing fields logged on EVERY liquidation_evaluated (pass or fail, including dust rejects). */
++function sizingLogFields(candidate: LiquidationCandidate, resolved: ResolvedDebtUsd): Record<string, unknown> {
++  return {
++    debtAsset: candidate.debtAsset,
++    collateralAsset: candidate.collateralAsset,
++    debtToCover: candidate.debtToCover.toString(),
++    debtToCoverUsd: resolved.debtUsd,
++    actualDebtUsd: resolved.actualDebtUsd ?? candidate.actualDebtUsd ?? null,
++    actualDebtRaw: candidate.actualDebtRaw?.toString() ?? null,
++    closeFactorBps: candidate.appliedCloseFactorBps ?? null,
++    debtDecimals: candidate.debtDecimals ?? null,
++    totalDebtUsd: candidate.totalDebtUsd ?? null,
++    sizingCappedBy: candidate.sizingCappedBy ?? null,
++  };
++}
++
++function planLogFields(plan: LiquidationPlan): Record<string, unknown> {
++  return {
++    debtAsset: plan.debtAsset,
++    collateralAsset: plan.collateralAsset,
++    debtToCover: plan.debtToCover.toString(),
++    debtToCoverUsd: plan.debtToCoverUsd,
++    actualDebtUsd: plan.actualDebtUsd,
++    actualDebtRaw: plan.actualDebtRaw.toString(),
++    closeFactorBps: plan.closeFactorBps,
++    debtDecimals: plan.debtDecimals,
++    totalDebtUsd: plan.totalDebtUsd ?? null,
++    sizingCappedBy: plan.cappedBy,
++  };
++}
++
+ export interface LiquidationCandidateGateConfig {
+   readonly minDebtUsd: number;
+   readonly resolveGasCostUsd: () => Promise<number>;
+@@ -119,6 +157,7 @@ export class LiquidationCandidateGate {
+         debtUsd: resolved.debtUsd,
+         ...profitability,
+         pass: finalPass,
++        ...sizingLogFields(candidate, resolved),
+       });
+       const diagnosticRow = {
+         kind: "liquidation" as const,
+@@ -169,7 +208,11 @@ export class LiquidationCandidateGate {
+ 
+   public recordHealthFactorDiagnostics(
+     chain: SupportedChain,
+-    reads: readonly { readonly account: Address; readonly healthFactor: bigint }[],
++    reads: readonly {
++      readonly account: Address;
++      readonly healthFactor: bigint;
++      readonly liquidationPlan?: LiquidationPlan;
++    }[],
+     stage: string,
+   ): void {
+     const hfScale = 1_000_000_000_000_000_000n;
+@@ -201,6 +244,7 @@ export class LiquidationCandidateGate {
+         hfFloat,
+         nearLiquidation,
+         pass: false,
++        ...(row.liquidationPlan === undefined ? {} : planLogFields(row.liquidationPlan)),
+       });
+     }
+   }
+@@ -215,6 +259,7 @@ export class LiquidationCandidateGate {
+       snapshots.map((snapshot) => ({
+         account: snapshot.account,
+         healthFactor: snapshot.healthFactor,
++        ...(snapshot.liquidationPlan === undefined ? {} : { liquidationPlan: snapshot.liquidationPlan }),
+       })),
+       "ws_reserve_event",
+     );
+@@ -252,9 +297,13 @@ export class LiquidationCandidateGate {
+   private async resolveFreshDebtUsd(
+     candidate: LiquidationCandidate,
+     chain: SupportedChain,
+-  ): Promise<{ readonly debtUsd: number; readonly trusted: boolean }> {
++  ): Promise<ResolvedDebtUsd> {
+     if (this.config.priceOracle === undefined) {
+-      return { debtUsd: candidate.repayValueUsd, trusted: true };
++      return {
++        debtUsd: candidate.repayValueUsd,
++        trusted: true,
++        ...(candidate.actualDebtUsd === undefined ? {} : { actualDebtUsd: candidate.actualDebtUsd }),
++      };
+     }
+     const prices = await this.config.priceOracle.forceRefreshUsdPrices([
+       candidate.debtAsset,
+@@ -271,10 +320,13 @@ export class LiquidationCandidateGate {
+       });
+       return { debtUsd: 0, trusted: false };
+     }
+-    const decimals = this.resolveDebtDecimals(candidate.debtAsset);
++    const decimals = candidate.debtDecimals ?? this.resolveDebtDecimals(candidate.debtAsset);
+     return {
+       debtUsd: computeDebtUsdFromWei(candidate.debtToCover, decimals, debtPrice),
+       trusted: true,
++      ...(candidate.actualDebtRaw === undefined
++        ? {}
++        : { actualDebtUsd: computeDebtUsdFromWei(candidate.actualDebtRaw, decimals, debtPrice) }),
+     };
+   }
+ 
+diff --git a/src/orchestrator/pipelineDetectionAdapter.ts b/src/orchestrator/pipelineDetectionAdapter.ts
+index d4ab139..ad0de01 100644
+--- a/src/orchestrator/pipelineDetectionAdapter.ts
++++ b/src/orchestrator/pipelineDetectionAdapter.ts
+@@ -1,25 +1,22 @@
+-import type { Address } from "viem";
++import type { LoggerLike } from "../bot";
+ import type { HealthFactorMonitor } from "../monitors/healthFactorMonitor";
+-import type { HybridDetectionPipeline } from "../monitors/hybridDetectionPipeline";
++import type { BorrowerSnapshotProvider, HybridDetectionPipeline } from "../monitors/hybridDetectionPipeline";
+ import { ArbitrageOpportunityQueue } from "../monitors/arbitrageOpportunityQueue";
+-import { ReserveAwareBorrowerCache, type BorrowerSnapshot } from "../monitors/reserveAwareBorrowerCache";
+-import type { LiquidationCandidate } from "../protocols/aaveV3";
+-import { createAsset, createAssetAmount } from "../utils/typedAssetMath";
++import { ReserveAwareBorrowerCache } from "../monitors/reserveAwareBorrowerCache";
+ import type { CircuitBreakerName, CircuitBreakerState } from "../config/chainRegistry";
+ import type { SupportedChain } from "../config/chains";
+ import type { Opportunity } from "../types/opportunity";
+ import { fromArbitrageOpportunity } from "../types/opportunity";
+ 
+-const usd = createAsset({ symbol: "USD", decimals: 8 });
+-const weth = createAsset({ symbol: "WETH", decimals: 18 });
+-const usdc = createAsset({ symbol: "USDC", decimals: 6 });
+-
+ export interface PipelineDetectionAdapterConfig {
+   readonly chain: SupportedChain;
+   readonly monitor?: HealthFactorMonitor;
+   readonly hybridDetection?: HybridDetectionPipeline;
+   readonly arbitrageQueue: ArbitrageOpportunityQueue;
+   readonly enableArbitrage?: boolean;
++  /** Resolves real per-reserve positions + debtToCover for monitor-scan accounts (no static-pair fallback). */
++  readonly snapshotProvider?: Pick<BorrowerSnapshotProvider, "refreshBorrowers">;
++  readonly logger?: LoggerLike;
+ }
+ 
+ export class PipelineDetectionAdapter {
+@@ -69,42 +66,25 @@ export class PipelineDetectionAdapter {
+       return;
+     }
+     const candidates = await this.config.monitor.scanOnce();
+-    for (const candidate of candidates) {
+-      this.cache.upsert(toSnapshot(this.config.chain, candidate));
++    if (candidates.length === 0) {
++      return;
++    }
++    const accounts = [...new Set(candidates.map((candidate) => candidate.account))];
++    if (this.config.snapshotProvider === undefined) {
++      // Monitor candidates carry the static pair defaultDebtToCoverWei — never price that as real debt.
++      for (const account of accounts) {
++        this.config.logger?.warn("debt_to_cover_resolve_failed", {
++          chain: this.config.chain,
++          account,
++          error: "no_reserve_resolver",
++          action: "skip_candidate",
++        });
++      }
++      return;
++    }
++    const snapshots = await this.config.snapshotProvider.refreshBorrowers(this.config.chain, accounts);
++    for (const snapshot of snapshots) {
++      this.cache.upsert(snapshot);
+     }
+   }
+ }
+-
+-function toSnapshot(chain: SupportedChain, candidate: LiquidationCandidate): BorrowerSnapshot {
+-  const debtRaw = candidate.debtToCover;
+-  const collateralRaw = debtRaw + (debtRaw * BigInt(candidate.liquidationBonusBps)) / 10_000n;
+-  return {
+-    chain,
+-    account: candidate.account,
+-    protocol: "aave",
+-    healthFactor: candidate.healthFactor,
+-    updatedAtMs: Date.now(),
+-    reserves: [
+-      {
+-        assetAddress: candidate.collateralAsset,
+-        asset: weth,
+-        collateralBalance: createAssetAmount(weth, collateralRaw),
+-        variableDebt: createAssetAmount(weth, 0n),
+-        stableDebt: createAssetAmount(weth, 0n),
+-        priceInQuote: createAssetAmount(usd, 300_000_000_000n),
+-        usageAsCollateralEnabled: true,
+-        liquidationBonusBps: candidate.liquidationBonusBps,
+-      },
+-      {
+-        assetAddress: candidate.debtAsset as Address,
+-        asset: usdc,
+-        collateralBalance: createAssetAmount(usdc, 0n),
+-        variableDebt: createAssetAmount(usdc, debtRaw),
+-        stableDebt: createAssetAmount(usdc, 0n),
+-        priceInQuote: createAssetAmount(usd, 100_000_000n),
+-        usageAsCollateralEnabled: false,
+-        liquidationBonusBps: 0,
+-      },
+-    ],
+-  };
+-}
