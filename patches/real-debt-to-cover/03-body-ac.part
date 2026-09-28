@@ -1,0 +1,851 @@
+diff --git a/test/fixtures/replay-0xf20e-51765799.json b/test/fixtures/replay-0xf20e-51765799.json
+new file mode 100644
+index 0000000..dd80dd6
+--- /dev/null
++++ b/test/fixtures/replay-0xf20e-51765799.json
+@@ -0,0 +1,66 @@
++{
++  "description": "Aave V3 Base replay for account 0xf20e...2ecb at block 51765799. Source: read-only eth_call against https://mainnet.base.org (archive) at blockTag 51765799, fetched 2026-09-28. getUserReservesData returned 15 rows; only non-zero rows are stored. Balances derive from scaled * normalized index (collateral floor, debt ceil).",
++  "source": "onchain_archive_eth_call",
++  "rpc": "https://mainnet.base.org",
++  "chain": "base",
++  "blockNumber": 51765799,
++  "account": "0xf20e421cf0b314d61177466d3c9c0cb5e1342ecb",
++  "pool": "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
++  "poolAddressesProvider": "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D",
++  "uiPoolDataProvider": "0x0C6BC4a12039788be08F87e87Cff87FEDbd1D386",
++  "oracle": "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156",
++  "poolRevision": 11,
++  "userEmodeCategoryId": 0,
++  "getUserAccountData": {
++    "totalCollateralBase": "1183997",
++    "totalDebtBase": "923715",
++    "availableBorrowsBase": "0",
++    "currentLiquidationThreshold": "7800",
++    "ltv": "7500",
++    "healthFactor": "999865066606041906"
++  },
++  "botLoggedBeforeFix": {
++    "event": "liquidation_evaluated",
++    "debtUsd": 0.99986806,
++    "debtAsset": "USDC",
++    "collateralAsset": "WETH",
++    "bonusRate": 0.05,
++    "hardFloor": 50,
++    "reason": "below_PROFITABILITY_FLOOR(50)"
++  },
++  "reserves": [
++    {
++      "symbol": "WETH",
++      "underlyingAsset": "0x4200000000000000000000000000000000000006",
++      "decimals": 18,
++      "scaledATokenBalance": "5174054861",
++      "scaledVariableDebt": "0",
++      "usageAsCollateralEnabledOnUser": true,
++      "liquidityIndex": "1050946261310554660175083540",
++      "variableBorrowIndex": "1079640385625616185010399540",
++      "priceUsd8": "267409566521"
++    },
++    {
++      "symbol": "USDC",
++      "underlyingAsset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
++      "decimals": 6,
++      "scaledATokenBalance": "10312",
++      "scaledVariableDebt": "0",
++      "usageAsCollateralEnabledOnUser": true,
++      "liquidityIndex": "1146946952503344787502705820",
++      "variableBorrowIndex": "1204342104947373044895297369",
++      "priceUsd8": "99986806"
++    },
++    {
++      "symbol": "cbBTC",
++      "underlyingAsset": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
++      "decimals": 8,
++      "scaledATokenBalance": "0",
++      "scaledVariableDebt": "10",
++      "usageAsCollateralEnabledOnUser": false,
++      "liquidityIndex": "1002034759145801865070615429",
++      "variableBorrowIndex": "1018958536569144248467767193",
++      "priceUsd8": "8397409000000"
++    }
++  ]
++}
+diff --git a/test/helpers/fakeAaveReserveClient.ts b/test/helpers/fakeAaveReserveClient.ts
+new file mode 100644
+index 0000000..bccf17c
+--- /dev/null
++++ b/test/helpers/fakeAaveReserveClient.ts
+@@ -0,0 +1,89 @@
++import type { Address } from "viem";
++import type { MulticallResultLike, ReservePositionsMulticallClient } from "../../src/protocols/aaveReservePositions";
++
++export const RAY = 10n ** 27n;
++
++export interface FakeReserveMarket {
++  readonly liquidityIndex: bigint;
++  readonly variableBorrowIndex: bigint;
++  readonly priceUsd8: bigint;
++  readonly decimals: number;
++}
++
++export interface FakeUserRow {
++  readonly underlyingAsset: Address;
++  readonly scaledATokenBalance: bigint;
++  readonly usageAsCollateralEnabledOnUser: boolean;
++  readonly scaledVariableDebt: bigint;
++}
++
++interface FakeContractCall {
++  readonly address: Address;
++  readonly functionName: string;
++  readonly args?: readonly unknown[];
++}
++
++/** In-memory multicall that answers the exact calls resolveAccountReservePositions issues. */
++export class FakeAaveReserveClient implements ReservePositionsMulticallClient {
++  public multicallCalls = 0;
++  public readonly userReserveCalls: Address[] = [];
++  public failUsers = new Set<string>();
++  public throwNext = 0;
++
++  public constructor(
++    private readonly markets: Map<string, FakeReserveMarket>,
++    private readonly users: Map<string, readonly FakeUserRow[]>,
++    private readonly oracle: Address = "0x00000000000000000000000000000000000000fe",
++  ) {}
++
++  public async multicall(parameters: {
++    readonly contracts: readonly unknown[];
++    readonly allowFailure: true;
++    readonly blockNumber?: bigint;
++  }): Promise<readonly MulticallResultLike[]> {
++    this.multicallCalls += 1;
++    if (this.throwNext > 0) {
++      this.throwNext -= 1;
++      throw new Error("rpc transport down");
++    }
++    return parameters.contracts.map((raw) => this.answer(raw as FakeContractCall));
++  }
++
++  private answer(call: FakeContractCall): MulticallResultLike {
++    const ok = (result: unknown): MulticallResultLike => ({ status: "success", result });
++    const fail = (message: string): MulticallResultLike => ({ status: "failure", error: new Error(message) });
++    switch (call.functionName) {
++      case "getPriceOracle":
++        return ok(this.oracle);
++      case "getUserReservesData": {
++        const user = String(call.args?.[1]).toLowerCase() as Address;
++        this.userReserveCalls.push(user);
++        if (this.failUsers.has(user)) {
++          return fail("execution reverted");
++        }
++        return ok([this.users.get(user) ?? [], 0]);
++      }
++      case "getReserveNormalizedIncome":
++      case "getReserveNormalizedVariableDebt":
++      case "getAssetPrice": {
++        const market = this.markets.get(String(call.args?.[0]).toLowerCase());
++        if (market === undefined) {
++          return fail("unknown reserve");
++        }
++        if (call.functionName === "getReserveNormalizedIncome") {
++          return ok(market.liquidityIndex);
++        }
++        if (call.functionName === "getReserveNormalizedVariableDebt") {
++          return ok(market.variableBorrowIndex);
++        }
++        return ok(market.priceUsd8);
++      }
++      case "decimals": {
++        const market = this.markets.get(call.address.toLowerCase());
++        return market === undefined ? fail("no decimals") : ok(market.decimals);
++      }
++      default:
++        return fail(`unexpected ${call.functionName}`);
++    }
++  }
++}
+diff --git a/test/unit/aaveReservePositions.test.ts b/test/unit/aaveReservePositions.test.ts
+new file mode 100644
+index 0000000..94c32d5
+--- /dev/null
++++ b/test/unit/aaveReservePositions.test.ts
+@@ -0,0 +1,60 @@
++import { describe, expect, it } from "vitest";
++import type { Address } from "viem";
++import { resolveAccountReservePositions, rayMulCeil, rayMulFloor } from "../../src/protocols/aaveReservePositions";
++import { FakeAaveReserveClient, RAY } from "../helpers/fakeAaveReserveClient";
++
++const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
++const WETH = "0x4200000000000000000000000000000000000006" as Address;
++const CBBTC = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
++const USER = "0x00000000000000000000000000000000000000b1" as Address;
++const addresses = {
++  pool: "0x00000000000000000000000000000000000000c1" as Address,
++  poolAddressesProvider: "0x00000000000000000000000000000000000000c2" as Address,
++  uiPoolDataProvider: "0x00000000000000000000000000000000000000c3" as Address,
++};
++const oracle = "0x00000000000000000000000000000000000000fe" as Address;
++
++describe("resolveAccountReservePositions", () => {
++  it("applies indices with protocol rounding and per-reserve decimals from reserve data", async () => {
++    const markets = new Map([
++      [USDC.toLowerCase(), { liquidityIndex: RAY, variableBorrowIndex: (RAY * 11n) / 10n, priceUsd8: 100_000_000n, decimals: 6 }],
++      [WETH.toLowerCase(), { liquidityIndex: (RAY * 105n) / 100n, variableBorrowIndex: RAY, priceUsd8: 300_000_000_000n, decimals: 18 }],
++      [CBBTC.toLowerCase(), { liquidityIndex: RAY, variableBorrowIndex: RAY, priceUsd8: 8_000_000_000_000n, decimals: 8 }],
++    ]);
++    const fake = new FakeAaveReserveClient(markets, new Map([[USER.toLowerCase(), [
++      { underlyingAsset: USDC, scaledATokenBalance: 0n, usageAsCollateralEnabledOnUser: false, scaledVariableDebt: 1_000_001n },
++      { underlyingAsset: WETH, scaledATokenBalance: 10n ** 18n, usageAsCollateralEnabledOnUser: true, scaledVariableDebt: 0n },
++      { underlyingAsset: CBBTC, scaledATokenBalance: 0n, usageAsCollateralEnabledOnUser: false, scaledVariableDebt: 0n },
++    ]]]));
++    const decimalsCache = new Map<string, number>();
++    const result = await resolveAccountReservePositions({
++      client: fake, addresses, oracle, accounts: [USER], assets: [USDC, WETH, CBBTC], decimalsCache,
++    });
++    const row = result.get(USER.toLowerCase());
++    if (row === undefined || !row.ok) {
++      throw new Error("expected ok");
++    }
++    const usdc = row.positions.reserves.find((reserve) => reserve.asset === USDC)!;
++    const weth = row.positions.reserves.find((reserve) => reserve.asset === WETH)!;
++    expect(usdc.decimals).toBe(6);
++    expect(usdc.variableDebt).toBe(1_100_002n); // ceil(1_000_001 * 1.1)
++    expect(weth.decimals).toBe(18);
++    expect(weth.collateralBalance).toBe(1_050_000_000_000_000_000n);
++    expect(row.positions.reserves.some((reserve) => reserve.asset === CBBTC)).toBe(false); // zero rows dropped
++    expect(decimalsCache.get(CBBTC.toLowerCase())).toBe(8);
++  });
++
++  it("marks accounts failed when market data for a held reserve is unavailable", async () => {
++    const fake = new FakeAaveReserveClient(new Map(), new Map([[USER.toLowerCase(), [
++      { underlyingAsset: USDC, scaledATokenBalance: 0n, usageAsCollateralEnabledOnUser: false, scaledVariableDebt: 1n },
++    ]]]));
++    const result = await resolveAccountReservePositions({ client: fake, addresses, oracle, accounts: [USER], assets: [USDC] });
++    expect(result.get(USER.toLowerCase())?.ok).toBe(false);
++  });
++
++  it("rounds like Aave TokenMath", () => {
++    expect(rayMulFloor(10n, (RAY * 1019n) / 1000n)).toBe(10n);
++    expect(rayMulCeil(10n, (RAY * 1019n) / 1000n)).toBe(11n);
++    expect(rayMulCeil(0n, RAY)).toBe(0n);
++  });
++});
+diff --git a/test/unit/aaveSnapshotProviderRealDebt.test.ts b/test/unit/aaveSnapshotProviderRealDebt.test.ts
+new file mode 100644
+index 0000000..91f226a
+--- /dev/null
++++ b/test/unit/aaveSnapshotProviderRealDebt.test.ts
+@@ -0,0 +1,224 @@
++import { describe, expect, it, vi } from "vitest";
++import type { Address } from "viem";
++import { createChainRegistry } from "../../src/config/chainRegistry";
++import { getChainConfig } from "../../src/config/chains";
++import { AaveSnapshotProvider } from "../../src/monitors/aaveSnapshotProvider";
++import { createReserveAwareCandidates, ReserveAwareBorrowerCache } from "../../src/monitors/reserveAwareBorrowerCache";
++import { LiquidationCandidateGate } from "../../src/orchestrator/liquidationCandidateGate";
++import { PipelineDetectionAdapter } from "../../src/orchestrator/pipelineDetectionAdapter";
++import { ArbitrageOpportunityQueue } from "../../src/monitors/arbitrageOpportunityQueue";
++import { ViemAaveV3Protocol } from "../../src/protocols/aaveV3";
++import { BorrowerCooldownRegistry } from "../../src/utils/borrowerCooldown";
++import type { PriceOracleCache } from "../../src/utils/priceOracleCache";
++import { FakeAaveReserveClient, RAY, type FakeUserRow } from "../helpers/fakeAaveReserveClient";
++
++const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
++const WETH = "0x4200000000000000000000000000000000000006" as Address;
++const GHO = "0x6Bb7a212910682DCFdbd5BCBb3e28FB4E8da10Ee" as Address;
++const WHALE = "0x00000000000000000000000000000000000000a1" as Address;
++const OTHER = "0x00000000000000000000000000000000000000a2" as Address;
++const THIRD = "0x00000000000000000000000000000000000000a3" as Address;
++
++const registry = createChainRegistry({
++  chains: [{ chain: "base", rpcUrl: "https://base.example", fallbackRpcUrls: [], aaveSubgraphUrl: "https://subgraph.example" }],
++});
++
++const HF_099 = 990_000_000_000_000_000n;
++const markets = new Map([
++  [USDC.toLowerCase(), { liquidityIndex: RAY, variableBorrowIndex: RAY, priceUsd8: 100_000_000n, decimals: 6 }],
++  [WETH.toLowerCase(), { liquidityIndex: RAY, variableBorrowIndex: RAY, priceUsd8: 300_000_000_000n, decimals: 18 }],
++]);
++
++function usdcWethRows(usdcDebtRaw: bigint, wethRaw: bigint): FakeUserRow[] {
++  return [
++    { underlyingAsset: USDC, scaledATokenBalance: 0n, usageAsCollateralEnabledOnUser: false, scaledVariableDebt: usdcDebtRaw },
++    { underlyingAsset: WETH, scaledATokenBalance: wethRaw, usageAsCollateralEnabledOnUser: true, scaledVariableDebt: 0n },
++  ];
++}
++
++function logger() {
++  return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
++}
++
++function setup(users: Map<string, readonly FakeUserRow[]>, accountData: Map<string, readonly [bigint, bigint, bigint, bigint, bigint, bigint]>) {
++  const fake = new FakeAaveReserveClient(markets, users);
++  const publicClient = {
++    readContract: async (parameters: { readonly args: readonly [Address] }) => {
++      const row = accountData.get(parameters.args[0].toLowerCase());
++      if (row === undefined) {
++        throw new Error("unknown account");
++      }
++      return row;
++    },
++    multicall: fake.multicall.bind(fake),
++  };
++  const protocol = new ViemAaveV3Protocol(publicClient as never, getChainConfig("base"), undefined, undefined, 50, registry);
++  const log = logger();
++  const provider = new AaveSnapshotProvider("base", protocol, registry, log);
++  return { fake, protocol, provider, log };
++}
++
++const whaleAccount = [15_000n * 100_000_000n, 10_000n * 100_000_000n, 0n, 8_000n, 7_500n, HF_099] as const;
++
++describe("AaveSnapshotProvider real debtToCover", () => {
++  it("$10k USDC-debt account yields debtUsd ~ $5k (not ~$1) end-to-end through the gate", async () => {
++    const { provider } = setup(
++      new Map([[WHALE.toLowerCase(), usdcWethRows(10_000_000_000n, 5n * 10n ** 18n)]]),
++      new Map([[WHALE.toLowerCase(), whaleAccount]]),
++    );
++    const snapshots = await provider.refreshBorrowers("base", [WHALE]);
++    expect(snapshots).toHaveLength(1);
++    expect(snapshots[0]?.liquidationPlan?.debtToCover).toBe(5_000_000_000n);
++
++    const cache = new ReserveAwareBorrowerCache();
++    cache.upsert(snapshots[0]!);
++    const candidates = createReserveAwareCandidates(cache, "base");
++    expect(candidates).toHaveLength(1);
++    expect(candidates[0]?.debtToCover).toBe(5_000_000_000n);
++    expect(candidates[0]?.closeFactorBps).toBe(10_000); // already applied; executor must not halve again
++
++    const gateLog = logger();
++    const gate = new LiquidationCandidateGate({
++      minDebtUsd: 50,
++      resolveGasCostUsd: async () => 0.05,
++      resolveFlashFeeBps: async () => 5,
++      borrowerCooldown: new BorrowerCooldownRegistry({ cooldownMs: 60_000, nowMs: () => 0 }),
++      logger: gateLog,
++      priceOracle: { forceRefreshUsdPrices: async () => ({ [USDC]: 100_000_000n, [WETH]: 300_000_000_000n }) } as unknown as PriceOracleCache,
++    });
++    const kept = await gate.filterCandidates("base", candidates, "test");
++    expect(kept).toHaveLength(1);
++    const evaluated = gateLog.info.mock.calls.find((call) => call[0] === "liquidation_evaluated")?.[1] as Record<string, unknown>;
++    expect(evaluated.debtUsd).toBeCloseTo(5_000, 6);
++    expect(evaluated).toMatchObject({
++      debtToCover: "5000000000",
++      closeFactorBps: 5_000,
++      debtAsset: USDC,
++      collateralAsset: WETH,
++      debtDecimals: 6,
++      pass: true,
++    });
++    expect(evaluated.debtToCoverUsd).toBeCloseTo(5_000, 6);
++    expect(evaluated.actualDebtUsd).toBeCloseTo(10_000, 6);
++  });
++
++  it("resolves reserves for all borrowers in ONE batched multicall", async () => {
++    const users = new Map([
++      [WHALE.toLowerCase(), usdcWethRows(10_000_000_000n, 5n * 10n ** 18n)],
++      [OTHER.toLowerCase(), usdcWethRows(2_000_000_000n, 10n ** 18n)],
++      [THIRD.toLowerCase(), usdcWethRows(3_000_000_000n, 2n * 10n ** 18n)],
++    ]);
++    const data = new Map([
++      [WHALE.toLowerCase(), whaleAccount],
++      [OTHER.toLowerCase(), [3_000n * 100_000_000n, 2_000n * 100_000_000n, 0n, 8_000n, 7_500n, HF_099] as const],
++      [THIRD.toLowerCase(), [6_000n * 100_000_000n, 3_000n * 100_000_000n, 0n, 8_000n, 7_500n, HF_099] as const],
++    ]);
++    const { fake, provider } = setup(users, data);
++    const snapshots = await provider.refreshBorrowers("base", [WHALE, OTHER, THIRD]);
++    expect(snapshots).toHaveLength(3);
++    // 1 one-time oracle lookup + 1 batched reserves call for all 3 accounts
++    expect(fake.multicallCalls).toBe(2);
++    expect(fake.userReserveCalls).toHaveLength(3);
++  });
++
++  it("resolve failure: logs debt_to_cover_resolve_failed, retries once, skips (no default fallback)", async () => {
++    const { fake, provider, log } = setup(
++      new Map([[WHALE.toLowerCase(), usdcWethRows(10_000_000_000n, 5n * 10n ** 18n)]]),
++      new Map([[WHALE.toLowerCase(), whaleAccount]]),
++    );
++    fake.failUsers.add(WHALE.toLowerCase());
++    const snapshots = await provider.refreshBorrowers("base", [WHALE]);
++    expect(snapshots).toHaveLength(0);
++    expect(fake.userReserveCalls).toHaveLength(2); // initial + one retry
++    const failed = log.warn.mock.calls.filter((call) => call[0] === "debt_to_cover_resolve_failed");
++    expect(failed).toHaveLength(1);
++    expect(failed[0]?.[1]).toMatchObject({ account: WHALE, action: "skip_candidate" });
++  });
++
++  it("transient transport failure recovers on the single retry", async () => {
++    const { fake, provider, log } = setup(
++      new Map([[WHALE.toLowerCase(), usdcWethRows(10_000_000_000n, 5n * 10n ** 18n)]]),
++      new Map([[WHALE.toLowerCase(), whaleAccount]]),
++    );
++    await provider.refreshBorrowers("base", [WHALE]); // warm oracle address
++    fake.throwNext = 1;
++    const snapshots = await provider.refreshBorrowers("base", [WHALE]);
++    expect(snapshots).toHaveLength(1);
++    expect(log.warn.mock.calls.some((call) => call[0] === "debt_to_cover_resolve_failed")).toBe(false);
++  });
++
++  it("protocol without reserve resolution never emits a default-sized snapshot", async () => {
++    const log = logger();
++    const provider = new AaveSnapshotProvider("base", {
++      getLiquidatablePositions: async () => [],
++      getUserAccount: async (account: Address) => ({
++        account, totalCollateralBase: 1n, totalDebtBase: 100_000_000n, availableBorrowsBase: 0n,
++        currentLiquidationThreshold: 8_000n, loanToValue: 7_500n, healthFactor: HF_099,
++      }),
++    }, registry, log);
++    expect(await provider.refreshBorrowers("base", [WHALE])).toHaveLength(0);
++    expect(log.warn.mock.calls[0]?.[0]).toBe("debt_to_cover_resolve_failed");
++  });
++
++  it("pair not held: logs pair_not_held_skip and skips", async () => {
++    const markets2 = new Map(markets);
++    markets2.set(GHO.toLowerCase(), { liquidityIndex: RAY, variableBorrowIndex: RAY, priceUsd8: 100_000_000n, decimals: 18 });
++    const { provider, log } = setup(
++      new Map([[WHALE.toLowerCase(), [
++        { underlyingAsset: GHO, scaledATokenBalance: 0n, usageAsCollateralEnabledOnUser: false, scaledVariableDebt: 10n ** 22n },
++        { underlyingAsset: WETH, scaledATokenBalance: 5n * 10n ** 18n, usageAsCollateralEnabledOnUser: true, scaledVariableDebt: 0n },
++      ]]]),
++      new Map([[WHALE.toLowerCase(), whaleAccount]]),
++    );
++    expect(await provider.refreshBorrowers("base", [WHALE])).toHaveLength(0);
++    expect(log.info.mock.calls.some((call) => call[0] === "pair_not_held_skip")).toBe(true);
++  });
++
++  it("pollBorrowers re-resolves subgraph candidates instead of using defaultDebtToCoverWei", async () => {
++    const { protocol, provider } = setup(
++      new Map([[WHALE.toLowerCase(), usdcWethRows(10_000_000_000n, 5n * 10n ** 18n)]]),
++      new Map([[WHALE.toLowerCase(), whaleAccount]]),
++    );
++    vi.spyOn(protocol, "getLiquidatablePositions").mockResolvedValue([{
++      account: WHALE, collateralAsset: WETH, debtAsset: USDC, debtToCover: 1_000_000n,
++      repayValueUsd: 1, liquidationBonusBps: 500, healthFactor: HF_099,
++    }]);
++    const snapshots = await provider.pollBorrowers("base");
++    expect(snapshots[0]?.liquidationPlan?.debtToCover).toBe(5_000_000_000n);
++  });
++});
++
++describe("PipelineDetectionAdapter monitor path", () => {
++  const monitorCandidate = {
++    account: WHALE, collateralAsset: WETH, debtAsset: USDC, debtToCover: 1_000_000n,
++    repayValueUsd: 1, liquidationBonusBps: 500, healthFactor: HF_099,
++  };
++
++  it("skips with debt_to_cover_resolve_failed when no reserve resolver is wired", async () => {
++    const log = logger();
++    const adapter = new PipelineDetectionAdapter({
++      chain: "base",
++      monitor: { scanOnce: async () => [monitorCandidate] } as never,
++      arbitrageQueue: new ArbitrageOpportunityQueue(),
++      logger: log,
++    });
++    await adapter.start();
++    expect(adapter.cache.size("base")).toBe(0);
++    expect(log.warn.mock.calls[0]?.[0]).toBe("debt_to_cover_resolve_failed");
++  });
++
++  it("uses the snapshot provider's real sizing", async () => {
++    const { provider } = setup(
++      new Map([[WHALE.toLowerCase(), usdcWethRows(10_000_000_000n, 5n * 10n ** 18n)]]),
++      new Map([[WHALE.toLowerCase(), whaleAccount]]),
++    );
++    const adapter = new PipelineDetectionAdapter({
++      chain: "base",
++      monitor: { scanOnce: async () => [monitorCandidate] } as never,
++      arbitrageQueue: new ArbitrageOpportunityQueue(),
++      snapshotProvider: provider,
++    });
++    await adapter.start();
++    expect(createReserveAwareCandidates(adapter.cache, "base")[0]?.debtToCover).toBe(5_000_000_000n);
++  });
++});
+diff --git a/test/unit/liquidationSizing.test.ts b/test/unit/liquidationSizing.test.ts
+new file mode 100644
+index 0000000..2298788
+--- /dev/null
++++ b/test/unit/liquidationSizing.test.ts
+@@ -0,0 +1,164 @@
++import { describe, expect, it } from "vitest";
++import type { Address } from "viem";
++import type { AaveReservePair } from "../../src/config/chains";
++import type { AaveReservePosition } from "../../src/protocols/aaveReservePositions";
++import { planAaveLiquidation, type LiquidationPlan } from "../../src/protocols/liquidationSizing";
++
++const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
++const WETH = "0x4200000000000000000000000000000000000006" as Address;
++const CBBTC = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
++const GHO = "0x6Bb7a212910682DCFdbd5BCBb3e28FB4E8da10Ee" as Address;
++
++const USDC_PRICE = 100_000_000n; // $1.00
++const WETH_PRICE = 300_000_000_000n; // $3,000
++const CBBTC_PRICE = 8_000_000_000_000n; // $80,000
++
++const wethUsdc: AaveReservePair = {
++  collateralAsset: WETH, debtAsset: USDC, defaultDebtToCoverWei: 1_000_000n, repayValueUsd: 1, liquidationBonusBps: 500,
++};
++const cbBtcUsdc: AaveReservePair = {
++  collateralAsset: CBBTC, debtAsset: USDC, defaultDebtToCoverWei: 100_000n, repayValueUsd: 1, liquidationBonusBps: 750,
++};
++const cbBtcWeth: AaveReservePair = {
++  collateralAsset: CBBTC, debtAsset: WETH, defaultDebtToCoverWei: 10n ** 15n, repayValueUsd: 1, liquidationBonusBps: 750,
++};
++
++function usdcDebt(raw: bigint): AaveReservePosition {
++  return { asset: USDC, decimals: 6, priceUsd8: USDC_PRICE, collateralBalance: 0n, variableDebt: raw, stableDebt: 0n, usageAsCollateralEnabled: false };
++}
++function wethCollateral(raw: bigint, enabled = true): AaveReservePosition {
++  return { asset: WETH, decimals: 18, priceUsd8: WETH_PRICE, collateralBalance: raw, variableDebt: 0n, stableDebt: 0n, usageAsCollateralEnabled: enabled };
++}
++function cbBtcCollateral(raw: bigint): AaveReservePosition {
++  return { asset: CBBTC, decimals: 8, priceUsd8: CBBTC_PRICE, collateralBalance: raw, variableDebt: 0n, stableDebt: 0n, usageAsCollateralEnabled: true };
++}
++
++function planned(result: ReturnType<typeof planAaveLiquidation>): LiquidationPlan {
++  if (result.kind !== "planned") {
++    throw new Error(`expected planned, got ${result.kind}`);
++  }
++  return result.plan;
++}
++
++const HF_099 = 990_000_000_000_000_000n;
++const HF_090 = 900_000_000_000_000_000n;
++
++describe("planAaveLiquidation close factor", () => {
++  it("HF 0.99 -> 50% close factor of total debt", () => {
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(10_000_000_000n), wethCollateral(5n * 10n ** 18n)], // $10k debt, $15k WETH
++      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 10_000n * 100_000_000n,
++    }));
++    expect(plan.closeFactorBps).toBe(5_000);
++    expect(plan.debtToCover).toBe(5_000_000_000n);
++    expect(plan.cappedBy).toBe("close_factor");
++  });
++
++  it("HF 0.90 -> 100% close factor", () => {
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(10_000_000_000n), wethCollateral(5n * 10n ** 18n)],
++      pairs: [wethUsdc], healthFactor: HF_090, totalDebtBase: 10_000n * 100_000_000n,
++    }));
++    expect(plan.closeFactorBps).toBe(10_000);
++    expect(plan.debtToCover).toBe(10_000_000_000n);
++    expect(plan.cappedBy).toBe("actual_debt");
++  });
++
++  it("is capped by actual reserve debt when 50% of total debt exceeds it", () => {
++    // $10k total debt, only $3k of it is USDC (rest in an unconfigured reserve): cap = min($3k, $5k) = $3k
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(3_000_000_000n), wethCollateral(5n * 10n ** 18n)],
++      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 10_000n * 100_000_000n,
++    }));
++    expect(plan.debtToCover).toBe(3_000_000_000n);
++    expect(plan.cappedBy).toBe("actual_debt");
++    expect(plan.actualDebtUsd).toBeCloseTo(3_000, 6);
++  });
++
++  it("is capped by collateral: debtToCover*(1+bonus) <= collateral USD", () => {
++    // $10k USDC debt, HF 0.90 (100%), only 1 WETH ($3k) collateral -> 3000/1.05 = $2857.142857
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(10_000_000_000n), wethCollateral(10n ** 18n)],
++      pairs: [wethUsdc], healthFactor: HF_090, totalDebtBase: 10_000n * 100_000_000n,
++    }));
++    expect(plan.cappedBy).toBe("collateral");
++    expect(plan.debtToCover).toBe(2_857_142_857n);
++    expect(plan.debtToCoverUsd * 1.05).toBeLessThanOrEqual(3_000);
++  });
++
++  it("smallPositionFullClose (Aave v3.3+ rule) raises close factor to 100% below $2k", () => {
++    const reserves = [usdcDebt(1_500_000_000n), wethCollateral(10n ** 18n)];
++    const base = { reserves, pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 1_500n * 100_000_000n };
++    expect(planned(planAaveLiquidation(base)).closeFactorBps).toBe(5_000);
++    const full = planned(planAaveLiquidation({ ...base, smallPositionFullClose: true }));
++    expect(full.closeFactorBps).toBe(10_000);
++    expect(full.debtToCover).toBe(1_500_000_000n);
++  });
++});
++
++describe("planAaveLiquidation pair selection", () => {
++  it("returns pair_not_held when no configured pair matches holdings", () => {
++    const result = planAaveLiquidation({
++      reserves: [
++        { asset: GHO, decimals: 18, priceUsd8: USDC_PRICE, collateralBalance: 0n, variableDebt: 10n ** 21n, stableDebt: 0n, usageAsCollateralEnabled: false },
++        wethCollateral(10n ** 18n),
++      ],
++      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 1_000n * 100_000_000n,
++    });
++    expect(result.kind).toBe("pair_not_held");
++  });
++
++  it("ignores collateral that is not enabled as collateral", () => {
++    const result = planAaveLiquidation({
++      reserves: [usdcDebt(1_000_000_000n), wethCollateral(10n ** 18n, false)],
++      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 1_000n * 100_000_000n,
++    });
++    expect(result.kind).toBe("pair_not_held");
++  });
++
++  it("chooses the largest-USD collateral that forms a configured pair with the largest-USD debt", () => {
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(10_000_000_000n), wethCollateral(10n ** 18n), cbBtcCollateral(50_000_000n)], // WETH $3k, cbBTC $40k
++      pairs: [wethUsdc, cbBtcUsdc], healthFactor: HF_099, totalDebtBase: 10_000n * 100_000_000n,
++    }));
++    expect(plan.collateralAsset).toBe(CBBTC);
++    expect(plan.debtAsset).toBe(USDC);
++    expect(plan.liquidationBonusBps).toBe(750);
++  });
++});
++
++describe("planAaveLiquidation decimals", () => {
++  it("uses reserve decimals (WETH 18 debt, cbBTC 8 collateral)", () => {
++    // 2 WETH debt ($6k), 0.1 cbBTC collateral ($8k), HF 0.99 -> 50% of $6k total = 1 WETH
++    const plan = planned(planAaveLiquidation({
++      reserves: [
++        { asset: WETH, decimals: 18, priceUsd8: WETH_PRICE, collateralBalance: 0n, variableDebt: 2n * 10n ** 18n, stableDebt: 0n, usageAsCollateralEnabled: false },
++        cbBtcCollateral(10_000_000n),
++      ],
++      pairs: [cbBtcWeth], healthFactor: HF_099, totalDebtBase: 6_000n * 100_000_000n,
++    }));
++    expect(plan.debtDecimals).toBe(18);
++    expect(plan.collateralDecimals).toBe(8);
++    expect(plan.debtToCover).toBe(10n ** 18n);
++    expect(plan.debtToCoverUsd).toBeCloseTo(3_000, 6);
++    expect(plan.actualDebtUsd).toBeCloseTo(6_000, 6);
++  });
++
++  it("USDC 6-decimals: $10k debt at HF 0.99 yields ~$5k debtToCover, not ~$1 (regression)", () => {
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(10_000_000_000n), wethCollateral(5n * 10n ** 18n)],
++      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 10_000n * 100_000_000n,
++    }));
++    expect(plan.debtToCoverUsd).toBeCloseTo(5_000, 6);
++    expect(plan.debtToCover).not.toBe(wethUsdc.defaultDebtToCoverWei);
++  });
++
++  it("includes stable debt in actual debt", () => {
++    const plan = planned(planAaveLiquidation({
++      reserves: [{ ...usdcDebt(1_000_000_000n), stableDebt: 500_000_000n }, wethCollateral(5n * 10n ** 18n)],
++      pairs: [wethUsdc], healthFactor: HF_090, totalDebtBase: 1_500n * 100_000_000n,
++    }));
++    expect(plan.actualDebtRaw).toBe(1_500_000_000n);
++    expect(plan.debtToCover).toBe(1_500_000_000n);
++  });
++});
+diff --git a/test/unit/replay0xf20e51765799.test.ts b/test/unit/replay0xf20e51765799.test.ts
+new file mode 100644
+index 0000000..12375d7
+--- /dev/null
++++ b/test/unit/replay0xf20e51765799.test.ts
+@@ -0,0 +1,209 @@
++import { readFileSync } from "node:fs";
++import { join } from "node:path";
++import { describe, expect, it, vi } from "vitest";
++import type { Address } from "viem";
++import { createChainRegistry } from "../../src/config/chainRegistry";
++import { getChainConfig, type AaveReservePair } from "../../src/config/chains";
++import { AaveSnapshotProvider } from "../../src/monitors/aaveSnapshotProvider";
++import { createReserveAwareCandidates, ReserveAwareBorrowerCache } from "../../src/monitors/reserveAwareBorrowerCache";
++import { LiquidationCandidateGate } from "../../src/orchestrator/liquidationCandidateGate";
++import { computeDebtUsdFromWei } from "../../src/protocols/liquidationCandidateFilter";
++import { ViemAaveV3Protocol, type LiquidationCandidate } from "../../src/protocols/aaveV3";
++import { resolveAccountReservePositions } from "../../src/protocols/aaveReservePositions";
++import { BorrowerCooldownRegistry } from "../../src/utils/borrowerCooldown";
++import type { PriceOracleCache } from "../../src/utils/priceOracleCache";
++import { FakeAaveReserveClient, type FakeReserveMarket, type FakeUserRow } from "../helpers/fakeAaveReserveClient";
++
++interface ReplayFixture {
++  readonly account: Address;
++  readonly oracle: Address;
++  readonly getUserAccountData: Record<string, string>;
++  readonly reserves: readonly {
++    readonly symbol: string;
++    readonly underlyingAsset: Address;
++    readonly decimals: number;
++    readonly scaledATokenBalance: string;
++    readonly scaledVariableDebt: string;
++    readonly usageAsCollateralEnabledOnUser: boolean;
++    readonly liquidityIndex: string;
++    readonly variableBorrowIndex: string;
++    readonly priceUsd8: string;
++  }[];
++}
++
++const fixture = JSON.parse(
++  readFileSync(join(__dirname, "../fixtures/replay-0xf20e-51765799.json"), "utf8"),
++) as ReplayFixture;
++
++const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
++const WETH = "0x4200000000000000000000000000000000000006" as Address;
++const CBBTC = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
++const account = fixture.account;
++const totalDebtBase = BigInt(fixture.getUserAccountData.totalDebtBase!);
++const totalCollateralBase = BigInt(fixture.getUserAccountData.totalCollateralBase!);
++const healthFactor = BigInt(fixture.getUserAccountData.healthFactor!);
++const priceOf = (asset: Address): bigint => BigInt(
++  fixture.reserves.find((row) => row.underlyingAsset.toLowerCase() === asset.toLowerCase())!.priceUsd8,
++);
++
++const registry = createChainRegistry({
++  chains: [{ chain: "base", rpcUrl: "https://base.example", fallbackRpcUrls: [], aaveSubgraphUrl: "https://subgraph.example" }],
++});
++
++function logger() {
++  return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
++}
++
++function buildProvider(rows: readonly FakeUserRow[], markets: Map<string, FakeReserveMarket>, pairs?: readonly AaveReservePair[]) {
++  const fake = new FakeAaveReserveClient(markets, new Map([[account.toLowerCase(), rows]]), fixture.oracle);
++  const accountData = [
++    totalCollateralBase,
++    totalDebtBase,
++    BigInt(fixture.getUserAccountData.availableBorrowsBase!),
++    BigInt(fixture.getUserAccountData.currentLiquidationThreshold!),
++    BigInt(fixture.getUserAccountData.ltv!),
++    healthFactor,
++  ] as const;
++  const chain = pairs === undefined
++    ? getChainConfig("base")
++    : { ...getChainConfig("base"), aave: { ...getChainConfig("base").aave, reservePairs: pairs } };
++  const protocol = new ViemAaveV3Protocol(
++    { readContract: async () => accountData, multicall: fake.multicall.bind(fake) } as never,
++    chain,
++    undefined,
++    undefined,
++    50,
++    registry,
++  );
++  const log = logger();
++  const provider = new AaveSnapshotProvider("base", protocol, registry, log, pairs === undefined ? {} : { reservePairs: pairs });
++  return { provider, log };
++}
++
++const fixtureMarkets = new Map<string, FakeReserveMarket>(fixture.reserves.map((row) => [row.underlyingAsset.toLowerCase(), {
++  liquidityIndex: BigInt(row.liquidityIndex),
++  variableBorrowIndex: BigInt(row.variableBorrowIndex),
++  priceUsd8: BigInt(row.priceUsd8),
++  decimals: row.decimals,
++}]));
++const fixtureRows: FakeUserRow[] = fixture.reserves.map((row) => ({
++  underlyingAsset: row.underlyingAsset,
++  scaledATokenBalance: BigInt(row.scaledATokenBalance),
++  usageAsCollateralEnabledOnUser: row.usageAsCollateralEnabledOnUser,
++  scaledVariableDebt: BigInt(row.scaledVariableDebt),
++}));
++
++function dustGate() {
++  const log = logger();
++  const gate = new LiquidationCandidateGate({
++    minDebtUsd: 50, // hardFloor 50 as logged on host
++    resolveGasCostUsd: async () => 0.01,
++    resolveFlashFeeBps: async () => 5,
++    borrowerCooldown: new BorrowerCooldownRegistry({ cooldownMs: 60_000, nowMs: () => 0 }),
++    logger: log,
++    priceOracle: {
++      forceRefreshUsdPrices: async () => ({ [USDC]: priceOf(USDC), [WETH]: priceOf(WETH), [CBBTC]: priceOf(CBBTC) }),
++    } as unknown as PriceOracleCache,
++  });
++  return { gate, log };
++}
++
++async function evaluate(candidates: readonly LiquidationCandidate[]) {
++  const { gate, log } = dustGate();
++  const kept = await gate.filterCandidates("base", candidates, "replay_0xf20e");
++  const evaluated = log.info.mock.calls.find((call) => call[0] === "liquidation_evaluated")?.[1] as Record<string, unknown>;
++  return { kept, evaluated };
++}
++
++describe("replay 0xf20e @ Base block 51765799", () => {
++  it("BEFORE fix: static defaultDebtToCoverWei priced as ~$0.9999", async () => {
++    const legacy: LiquidationCandidate = {
++      account, collateralAsset: WETH, debtAsset: USDC, debtToCover: 1_000_000n,
++      repayValueUsd: 1, liquidationBonusBps: 500, healthFactor,
++    };
++    const { kept, evaluated } = await evaluate([legacy]);
++    expect(evaluated.debtUsd).toBeCloseTo(0.99986806, 8);
++    expect(kept).toHaveLength(0);
++    console.log("[replay 0xf20e] BEFORE debtUsd", evaluated.debtUsd);
++  });
++
++  it("REAL on-chain reserves: debt is cbBTC (11 sats = totalDebtBase 923715); no configured Base pair -> pair_not_held_skip", async () => {
++    const { provider, log } = buildProvider(fixtureRows, fixtureMarkets);
++    const snapshots = await provider.refreshBorrowers("base", [account]);
++    expect(snapshots).toHaveLength(0);
++    const skip = log.info.mock.calls.find((call) => call[0] === "pair_not_held_skip")?.[1] as Record<string, unknown>;
++    expect(skip).toBeDefined();
++    expect(skip.heldDebtAssets).toEqual([CBBTC]);
++    expect(log.warn.mock.calls.some((call) => call[0] === "debt_to_cover_resolve_failed")).toBe(false);
++    // Resolver rounding reproduces getUserAccountData exactly: ceil(10 scaled * index) = 11 sats; ceil(11 * $83,974.09) = 923715 base
++    const fake = new FakeAaveReserveClient(fixtureMarkets, new Map([[account.toLowerCase(), fixtureRows]]), fixture.oracle);
++    const resolved = await resolveAccountReservePositions({
++      client: fake,
++      addresses: { pool: getChainConfig("base").aave.pool, poolAddressesProvider: getChainConfig("base").aave.poolAddressesProvider, uiPoolDataProvider: getChainConfig("base").aave.uiPoolDataProvider },
++      oracle: fixture.oracle,
++      accounts: [account],
++      assets: [USDC, WETH, CBBTC],
++    });
++    const result = resolved.get(account.toLowerCase());
++    if (result === undefined || !result.ok) {
++      throw new Error("expected resolved positions");
++    }
++    const cbBtcDebt = result.positions.reserves.find((row) => row.asset === CBBTC)!;
++    expect(cbBtcDebt.variableDebt).toBe(11n);
++    expect(cbBtcDebt.decimals).toBe(8);
++    expect((cbBtcDebt.variableDebt * cbBtcDebt.priceUsd8 + 10n ** 8n - 1n) / 10n ** 8n).toBe(totalDebtBase);
++    expect(computeDebtUsdFromWei(cbBtcDebt.variableDebt, 8, cbBtcDebt.priceUsd8)).toBeCloseTo(0.0092, 4);
++    console.log("[replay 0xf20e] REAL reserves -> pair_not_held_skip", JSON.stringify(skip));
++  });
++
++  it("REAL reserves with a hypothetical cbBTC-debt pair: actualDebtUsd ~0.0092, debtToCoverUsd ~0.0042 (50%, whole sats), dust-rejected", async () => {
++    const pairs: AaveReservePair[] = [{
++      collateralAsset: USDC, debtAsset: CBBTC, defaultDebtToCoverWei: 1n, repayValueUsd: 1, liquidationBonusBps: 500,
++    }];
++    const { provider } = buildProvider(fixtureRows, fixtureMarkets, pairs);
++    const snapshots = await provider.refreshBorrowers("base", [account]);
++    expect(snapshots).toHaveLength(1);
++    const plan = snapshots[0]!.liquidationPlan!;
++    expect(plan.actualDebtRaw).toBe(11n);
++    expect(plan.debtDecimals).toBe(8);
++    expect(plan.closeFactorBps).toBe(5_000);
++    expect(plan.debtToCover).toBe(5n); // floor(461857.5 base / $83,974.09) = 5 sats
++    const cache = new ReserveAwareBorrowerCache();
++    cache.upsert(snapshots[0]!);
++    const { kept, evaluated } = await evaluate(createReserveAwareCandidates(cache, "base"));
++    expect(kept).toHaveLength(0);
++    expect(evaluated.actualDebtUsd).toBeCloseTo(0.00923715, 8);
++    expect(evaluated.debtUsd).toBeGreaterThan(0.004);
++    expect(evaluated.debtUsd).toBeLessThanOrEqual(0.0046186);
++    expect(evaluated.pass).toBe(false);
++    console.log("[replay 0xf20e] AFTER (real cbBTC debt)", JSON.stringify(evaluated));
++  });
++
++  it("DERIVED bot-assumed layout (USDC debt / WETH collateral from account totals): actualDebtUsd ~0.0092, debtToCoverUsd ~0.0046, dust-rejected", async () => {
++    // Derived, not on-chain: express totalDebtBase as USDC debt and totalCollateralBase as WETH collateral.
++    const markets = new Map<string, FakeReserveMarket>([
++      [USDC.toLowerCase(), { liquidityIndex: 10n ** 27n, variableBorrowIndex: 10n ** 27n, priceUsd8: priceOf(USDC), decimals: 6 }],
++      [WETH.toLowerCase(), { liquidityIndex: 10n ** 27n, variableBorrowIndex: 10n ** 27n, priceUsd8: priceOf(WETH), decimals: 18 }],
++    ]);
++    const usdcDebtRaw = (totalDebtBase * 1_000_000n) / priceOf(USDC); // 9238
++    const wethCollateralRaw = (totalCollateralBase * 10n ** 18n) / priceOf(WETH);
++    const { provider } = buildProvider([
++      { underlyingAsset: USDC, scaledATokenBalance: 0n, usageAsCollateralEnabledOnUser: false, scaledVariableDebt: usdcDebtRaw },
++      { underlyingAsset: WETH, scaledATokenBalance: wethCollateralRaw, usageAsCollateralEnabledOnUser: true, scaledVariableDebt: 0n },
++    ], markets);
++    const snapshots = await provider.refreshBorrowers("base", [account]);
++    expect(snapshots).toHaveLength(1);
++    const cache = new ReserveAwareBorrowerCache();
++    cache.upsert(snapshots[0]!);
++    const candidates = createReserveAwareCandidates(cache, "base");
++    expect(candidates[0]?.debtToCover).not.toBe(1_000_000n);
++    const { kept, evaluated } = await evaluate(candidates);
++    expect(kept).toHaveLength(0);
++    expect(evaluated.actualDebtUsd).toBeCloseTo(0.0092, 4);
++    expect(evaluated.debtUsd).toBeCloseTo(0.0046, 4);
++    expect(evaluated.debtToCoverUsd).toBeCloseTo(0.0046, 4);
++    expect(evaluated.closeFactorBps).toBe(5_000);
++    expect(evaluated.pass).toBe(false);
++    console.log("[replay 0xf20e] AFTER (derived USDC debt)", JSON.stringify(evaluated));
++  });
++});
+-- 
+2.47.3
+
