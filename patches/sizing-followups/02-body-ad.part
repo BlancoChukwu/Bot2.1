@@ -1,0 +1,672 @@
+7-field vs v1 mismatch)", async () => {
++    await expect(assertLiquidationReceiverReadiness(client({
++      callError: Object.assign(new Error("Execution reverted"), {
++        cause: { data: RECEIVER_DEBT_ASSET_MISMATCH_SELECTOR },
+       }),
+-    ).resolves.toBeUndefined();
++    }), {
++      chain: "base",
++      receiver,
++      expectedSwapRouter: expectedRouter,
++      expectedCodeHashes: [keccak256(FAKE_BYTECODE)],
++    })).rejects.toThrow(/DebtAssetMismatch \(calldata layout mismatch\)/);
++  });
++
++  it("blocks LIVE when layout probe returns empty revert", async () => {
++    await expect(assertLiquidationReceiverReadiness(client({
++      callError: Object.assign(new Error("Execution reverted"), { cause: { data: "0x" } }),
++    }), {
++      chain: "base",
++      receiver,
++      expectedSwapRouter: expectedRouter,
++      expectedCodeHashes: [keccak256(FAKE_BYTECODE)],
++    })).rejects.toThrow(/empty_revert/);
++  });
++
++  it("resolves when code hash pins + version/pool/router + HF_NOT_BELOW_THRESHOLD layout probe pass", async () => {
++    await expect(assertLiquidationReceiverReadiness(client({}), {
++      chain: "base",
++      receiver,
++      expectedSwapRouter: expectedRouter,
++      expectedCodeHashes: [keccak256(FAKE_BYTECODE)],
++    })).resolves.toBeUndefined();
++  });
++
++  it("blocks LIVE on layout-probe RPC error", async () => {
++    await expect(assertLiquidationReceiverReadiness(client({
++      callError: new Error("over rate limit"),
++    }), {
++      chain: "base",
++      receiver,
++      expectedSwapRouter: expectedRouter,
++      expectedCodeHashes: [keccak256(FAKE_BYTECODE)],
++    })).rejects.toThrow(/layout probe eth_call failed \(RPC\)/);
++  });
++
++  it("resolveExpectedReceiverCodeHashes defaults to the pinned live v1 hash", () => {
++    expect(resolveExpectedReceiverCodeHashes(LIVE_RECEIVER, {})).toEqual([LIVE_CODEHASH]);
++    expect(resolveExpectedReceiverCodeHashes(LIVE_RECEIVER, {
++      LIQUIDATION_RECEIVER_CODEHASH: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++    })).toEqual(["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
+   });
+ });
+ 
+-describe("liquidationFlashReceiverAbi", () => {
+-  it("declares receiverVersion, aavePool, swapRouter", () => {
+-    const names = liquidationFlashReceiverAbi.map((e) => e.name);
+-    expect(names).toEqual(expect.arrayContaining(["receiverVersion", "aavePool", "swapRouter"]));
++describe("classifyLayoutProbeRevert", () => {
++  it("accepts HealthFactorNotBelowThreshold and rejects DebtAssetMismatch / empty", () => {
++    expect(classifyLayoutProbeRevert(AAVE_HF_NOT_BELOW_THRESHOLD_SELECTOR).ok).toBe(true);
++    expect(classifyLayoutProbeRevert(RECEIVER_DEBT_ASSET_MISMATCH_SELECTOR).ok).toBe(false);
++    expect(classifyLayoutProbeRevert("0x").ok).toBe(false);
++    expect(classifyLayoutProbeRevert(undefined).ok).toBe(false);
+   });
+ });
+diff --git a/test/unit/liquidationSizing.test.ts b/test/unit/liquidationSizing.test.ts
+index 2298788..dda912b 100644
+--- a/test/unit/liquidationSizing.test.ts
++++ b/test/unit/liquidationSizing.test.ts
+@@ -1,17 +1,28 @@
+ import { describe, expect, it } from "vitest";
+ import type { Address } from "viem";
++import { resolveAaveV33LiquidationRules } from "../../src/config/aavePoolVersion";
+ import type { AaveReservePair } from "../../src/config/chains";
+ import type { AaveReservePosition } from "../../src/protocols/aaveReservePositions";
+-import { planAaveLiquidation, type LiquidationPlan } from "../../src/protocols/liquidationSizing";
++import {
++  CLOSE_FACTOR_HF_THRESHOLD,
++  MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD,
++  MIN_LEFTOVER_BASE,
++  planAaveLiquidation,
++  simulateCollateralToLiquidate,
++  type LiquidationPlan,
++} from "../../src/protocols/liquidationSizing";
+ 
+ const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
+ const WETH = "0x4200000000000000000000000000000000000006" as Address;
+ const CBBTC = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
+ const GHO = "0x6Bb7a212910682DCFdbd5BCBb3e28FB4E8da10Ee" as Address;
+ 
+-const USDC_PRICE = 100_000_000n; // $1.00
+-const WETH_PRICE = 300_000_000_000n; // $3,000
+-const CBBTC_PRICE = 8_000_000_000_000n; // $80,000
++const USDC_PRICE = 100_000_000n;
++const WETH_PRICE = 300_000_000_000n;
++const CBBTC_PRICE = 8_000_000_000_000n;
++
++const BONUS_500 = { liquidationBonusBps: 500, liquidationProtocolFeeBps: 1_000 } as const;
++const BONUS_750 = { liquidationBonusBps: 750, liquidationProtocolFeeBps: 1_000 } as const;
+ 
+ const wethUsdc: AaveReservePair = {
+   collateralAsset: WETH, debtAsset: USDC, defaultDebtToCoverWei: 1_000_000n, repayValueUsd: 1, liquidationBonusBps: 500,
+@@ -27,76 +38,151 @@ function usdcDebt(raw: bigint): AaveReservePosition {
+   return { asset: USDC, decimals: 6, priceUsd8: USDC_PRICE, collateralBalance: 0n, variableDebt: raw, stableDebt: 0n, usageAsCollateralEnabled: false };
+ }
+ function wethCollateral(raw: bigint, enabled = true): AaveReservePosition {
+-  return { asset: WETH, decimals: 18, priceUsd8: WETH_PRICE, collateralBalance: raw, variableDebt: 0n, stableDebt: 0n, usageAsCollateralEnabled: enabled };
++  return { asset: WETH, decimals: 18, priceUsd8: WETH_PRICE, collateralBalance: raw, variableDebt: 0n, stableDebt: 0n, usageAsCollateralEnabled: enabled, ...BONUS_500 };
+ }
+ function cbBtcCollateral(raw: bigint): AaveReservePosition {
+-  return { asset: CBBTC, decimals: 8, priceUsd8: CBBTC_PRICE, collateralBalance: raw, variableDebt: 0n, stableDebt: 0n, usageAsCollateralEnabled: true };
++  return { asset: CBBTC, decimals: 8, priceUsd8: CBBTC_PRICE, collateralBalance: raw, variableDebt: 0n, stableDebt: 0n, usageAsCollateralEnabled: true, ...BONUS_750 };
+ }
+ 
+ function planned(result: ReturnType<typeof planAaveLiquidation>): LiquidationPlan {
+   if (result.kind !== "planned") {
+-    throw new Error(`expected planned, got ${result.kind}`);
++    throw new Error(`expected planned, got ${JSON.stringify(result)}`);
+   }
+   return result.plan;
+ }
+ 
+ const HF_099 = 990_000_000_000_000_000n;
++const HF_097 = 970_000_000_000_000_000n;
+ const HF_090 = 900_000_000_000_000_000n;
++const HF_095 = CLOSE_FACTOR_HF_THRESHOLD;
++
++describe("Aave v3.3 constants", () => {
++  it("matches LiquidationLogic.sol (aave-dao/aave-v3-origin @ v3.3.0)", () => {
++    expect(MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD).toBe(2000n * 10n ** 8n);
++    expect(MIN_LEFTOVER_BASE).toBe(1000n * 10n ** 8n);
++    expect(CLOSE_FACTOR_HF_THRESHOLD).toBe(950_000_000_000_000_000n);
++  });
++});
+ 
+-describe("planAaveLiquidation close factor", () => {
+-  it("HF 0.99 -> 50% close factor of total debt", () => {
++describe("planAaveLiquidation close factor (v3.3 default ON)", () => {
++  it("HF 0.97 + both reserves > $2k -> 50% of total debt", () => {
++    // $10k USDC debt / $15k WETH collateral, HF 0.97: both >= $2k and HF > 0.95 => 50%.
+     const plan = planned(planAaveLiquidation({
+-      reserves: [usdcDebt(10_000_000_000n), wethCollateral(5n * 10n ** 18n)], // $10k debt, $15k WETH
+-      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 10_000n * 100_000_000n,
++      reserves: [usdcDebt(10_000_000_000n), wethCollateral(5n * 10n ** 18n)],
++      pairs: [wethUsdc], healthFactor: HF_097, totalDebtBase: 10_000n * 100_000_000n,
+     }));
++    expect(plan.v33Rules).toBe(true);
+     expect(plan.closeFactorBps).toBe(5_000);
+     expect(plan.debtToCover).toBe(5_000_000_000n);
+     expect(plan.cappedBy).toBe("close_factor");
++    expect(plan.noDustAdjustment).toBe("none");
+   });
+ 
+-  it("HF 0.90 -> 100% close factor", () => {
++  it("HF 0.90 -> 100% (HF <= CLOSE_FACTOR_HF_THRESHOLD)", () => {
+     const plan = planned(planAaveLiquidation({
+       reserves: [usdcDebt(10_000_000_000n), wethCollateral(5n * 10n ** 18n)],
+       pairs: [wethUsdc], healthFactor: HF_090, totalDebtBase: 10_000n * 100_000_000n,
+     }));
+     expect(plan.closeFactorBps).toBe(10_000);
+     expect(plan.debtToCover).toBe(10_000_000_000n);
++  });
++
++  it("HF exactly 0.95 -> 100% (threshold is inclusive / HF > 0.95 for the 50% branch)", () => {
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(10_000_000_000n), wethCollateral(5n * 10n ** 18n)],
++      pairs: [wethUsdc], healthFactor: HF_095, totalDebtBase: 10_000n * 100_000_000n,
++    }));
++    expect(plan.closeFactorBps).toBe(10_000);
++  });
++
++  it("~$1.5k position (debt < $2k) -> 100% of that debt reserve", () => {
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(1_500_000_000n), wethCollateral(10n ** 18n)],
++      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 1_500n * 100_000_000n,
++    }));
++    expect(plan.closeFactorBps).toBe(10_000);
++    expect(plan.debtToCover).toBe(1_500_000_000n);
+     expect(plan.cappedBy).toBe("actual_debt");
+   });
+ 
++  it("collateral < $2k (even with large debt) -> 100%", () => {
++    // $10k debt / 0.5 WETH ($1.5k) collateral: collateral below threshold => 100%.
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(10_000_000_000n), wethCollateral(5n * 10n ** 17n)],
++      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 10_000n * 100_000_000n,
++    }));
++    expect(plan.closeFactorBps).toBe(10_000);
++  });
++
++  it("legacy switch (v33Rules=false): HF 0.99 stays 50% even below $2k", () => {
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(1_500_000_000n), wethCollateral(10n ** 18n)],
++      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 1_500n * 100_000_000n, v33Rules: false,
++    }));
++    expect(plan.v33Rules).toBe(false);
++    expect(plan.closeFactorBps).toBe(5_000);
++    expect(plan.debtToCover).toBe(750_000_000n);
++  });
++
+   it("is capped by actual reserve debt when 50% of total debt exceeds it", () => {
+-    // $10k total debt, only $3k of it is USDC (rest in an unconfigured reserve): cap = min($3k, $5k) = $3k
+     const plan = planned(planAaveLiquidation({
+       reserves: [usdcDebt(3_000_000_000n), wethCollateral(5n * 10n ** 18n)],
+-      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 10_000n * 100_000_000n,
++      pairs: [wethUsdc], healthFactor: HF_097, totalDebtBase: 10_000n * 100_000_000n,
+     }));
+     expect(plan.debtToCover).toBe(3_000_000_000n);
+     expect(plan.cappedBy).toBe("actual_debt");
+-    expect(plan.actualDebtUsd).toBeCloseTo(3_000, 6);
+   });
+ 
+-  it("is capped by collateral: debtToCover*(1+bonus) <= collateral USD", () => {
+-    // $10k USDC debt, HF 0.90 (100%), only 1 WETH ($3k) collateral -> 3000/1.05 = $2857.142857
++  it("tiny position (0xf20e layout): 100% of the chosen reserve debt", () => {
++    // 11 sats cbBTC debt (~$9.25) / ~$12 USDC collateral.
+     const plan = planned(planAaveLiquidation({
+-      reserves: [usdcDebt(10_000_000_000n), wethCollateral(10n ** 18n)],
+-      pairs: [wethUsdc], healthFactor: HF_090, totalDebtBase: 10_000n * 100_000_000n,
++      reserves: [
++        { asset: CBBTC, decimals: 8, priceUsd8: CBBTC_PRICE, collateralBalance: 0n, variableDebt: 11n, stableDebt: 0n, usageAsCollateralEnabled: false },
++        { asset: USDC, decimals: 6, priceUsd8: USDC_PRICE, collateralBalance: 12_000n, variableDebt: 0n, stableDebt: 0n, usageAsCollateralEnabled: true, ...BONUS_500 },
++      ],
++      pairs: [{ collateralAsset: USDC, debtAsset: CBBTC, defaultDebtToCoverWei: 1n, repayValueUsd: 1, liquidationBonusBps: 500 }],
++      healthFactor: HF_099, totalDebtBase: 925n * 1_000_000n, // ~$9.25 in 8-dec base
++    }));
++    expect(plan.closeFactorBps).toBe(10_000);
++    expect(plan.debtToCover).toBe(11n);
++    expect(plan.debtAsset).toBe(CBBTC);
++  });
++});
++
++describe("planAaveLiquidation MustNotLeaveDust (v3.3)", () => {
++  it("bumps to full liquidatable debt when a floor-rounded collateral cap would leave dust", () => {
++    // $3k USDC debt / exactly $3k WETH collateral, HF 0.90 (100%). The bonus-inflated seize is $3150 > $3k, so
++    // the protocol would seize ALL collateral; submitting the full $3k debtToCover is correct (bumped_to_full_debt).
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(3_000_000_000n), wethCollateral(10n ** 18n)],
++      pairs: [wethUsdc], healthFactor: HF_090, totalDebtBase: 3_000n * 100_000_000n,
+     }));
++    expect(plan.closeFactorBps).toBe(10_000);
+     expect(plan.cappedBy).toBe("collateral");
+-    expect(plan.debtToCover).toBe(2_857_142_857n);
+-    expect(plan.debtToCoverUsd * 1.05).toBeLessThanOrEqual(3_000);
++    expect(plan.noDustAdjustment).toBe("bumped_to_full_debt");
++    expect(plan.debtToCover).toBe(3_000_000_000n);
++    expect(plan.expectedDebtRepaidRaw).toBeLessThan(3_000_000_000n);
++    expect(plan.expectedCollateralOutRaw + plan.expectedProtocolFeeRaw).toBe(10n ** 18n);
+   });
+ 
+-  it("smallPositionFullClose (Aave v3.3+ rule) raises close factor to 100% below $2k", () => {
+-    const reserves = [usdcDebt(1_500_000_000n), wethCollateral(10n ** 18n)];
+-    const base = { reserves, pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 1_500n * 100_000_000n };
+-    expect(planned(planAaveLiquidation(base)).closeFactorBps).toBe(5_000);
+-    const full = planned(planAaveLiquidation({ ...base, smallPositionFullClose: true }));
+-    expect(full.closeFactorBps).toBe(10_000);
+-    expect(full.debtToCover).toBe(1_500_000_000n);
++  it("reduces a 50% close that would leave < $1k of leftover collateral", () => {
++    // $3k USDC debt / $2.5k WETH (5/6 ETH) collateral, HF 0.97. Both >= $2k => 50% = $1.5k of debt.
++    // Seize $1.5k * 1.05 = $1.575k of $2.5k => leftover collateral $0.925k < MIN_LEFTOVER_BASE ($1k),
++    // leftover debt $1.5k >= $1k => MustNotLeaveDust. Size down so both leftovers >= $1k.
++    const plan = planned(planAaveLiquidation({
++      reserves: [usdcDebt(3_000_000_000n), wethCollateral((5n * 10n ** 18n) / 6n)],
++      pairs: [wethUsdc], healthFactor: HF_097, totalDebtBase: 3_000n * 100_000_000n,
++    }));
++    expect(plan.closeFactorBps).toBe(5_000);
++    expect(plan.noDustAdjustment).toBe("reduced_to_min_leftover");
++    expect(plan.debtToCover).toBeLessThan(1_500_000_000n);
++    const seizedUsd = Number(plan.expectedCollateralOutRaw + plan.expectedProtocolFeeRaw) * Number(WETH_PRICE) / 1e18 / 1e8;
++    expect(plan.collateralUsd - seizedUsd).toBeGreaterThanOrEqual(10);
++    expect(plan.actualDebtUsd - plan.expectedDebtRepaidUsd).toBeGreaterThanOrEqual(10);
+   });
+ });
+ 
+-describe("planAaveLiquidation pair selection", () => {
++describe("planAaveLiquidation pair selection + bonus fail-closed", () => {
+   it("returns pair_not_held when no configured pair matches holdings", () => {
+     const result = planAaveLiquidation({
+       reserves: [
+@@ -108,46 +194,54 @@ describe("planAaveLiquidation pair selection", () => {
+     expect(result.kind).toBe("pair_not_held");
+   });
+ 
+-  it("ignores collateral that is not enabled as collateral", () => {
++  it("returns bonus_unavailable (fail closed) when on-chain bonus is missing", () => {
+     const result = planAaveLiquidation({
+-      reserves: [usdcDebt(1_000_000_000n), wethCollateral(10n ** 18n, false)],
++      reserves: [
++        usdcDebt(1_000_000_000n),
++        { asset: WETH, decimals: 18, priceUsd8: WETH_PRICE, collateralBalance: 10n ** 18n, variableDebt: 0n, stableDebt: 0n, usageAsCollateralEnabled: true },
++      ],
+       pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 1_000n * 100_000_000n,
+     });
+-    expect(result.kind).toBe("pair_not_held");
++    expect(result.kind).toBe("bonus_unavailable");
++  });
++
++  it("ignores collateral that is not enabled as collateral", () => {
++    expect(planAaveLiquidation({
++      reserves: [usdcDebt(1_000_000_000n), wethCollateral(10n ** 18n, false)],
++      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 1_000n * 100_000_000n,
++    }).kind).toBe("pair_not_held");
+   });
+ 
+   it("chooses the largest-USD collateral that forms a configured pair with the largest-USD debt", () => {
+     const plan = planned(planAaveLiquidation({
+-      reserves: [usdcDebt(10_000_000_000n), wethCollateral(10n ** 18n), cbBtcCollateral(50_000_000n)], // WETH $3k, cbBTC $40k
+-      pairs: [wethUsdc, cbBtcUsdc], healthFactor: HF_099, totalDebtBase: 10_000n * 100_000_000n,
++      reserves: [usdcDebt(10_000_000_000n), wethCollateral(10n ** 18n), cbBtcCollateral(50_000_000n)],
++      pairs: [wethUsdc, cbBtcUsdc], healthFactor: HF_097, totalDebtBase: 10_000n * 100_000_000n,
+     }));
+     expect(plan.collateralAsset).toBe(CBBTC);
+     expect(plan.debtAsset).toBe(USDC);
+-    expect(plan.liquidationBonusBps).toBe(750);
++    expect(plan.liquidationBonusBps).toBe(750); // on-chain (passed via reserve), not the pair config
+   });
+ });
+ 
+ describe("planAaveLiquidation decimals", () => {
+   it("uses reserve decimals (WETH 18 debt, cbBTC 8 collateral)", () => {
+-    // 2 WETH debt ($6k), 0.1 cbBTC collateral ($8k), HF 0.99 -> 50% of $6k total = 1 WETH
+     const plan = planned(planAaveLiquidation({
+       reserves: [
+         { asset: WETH, decimals: 18, priceUsd8: WETH_PRICE, collateralBalance: 0n, variableDebt: 2n * 10n ** 18n, stableDebt: 0n, usageAsCollateralEnabled: false },
+         cbBtcCollateral(10_000_000n),
+       ],
+-      pairs: [cbBtcWeth], healthFactor: HF_099, totalDebtBase: 6_000n * 100_000_000n,
++      pairs: [cbBtcWeth], healthFactor: HF_097, totalDebtBase: 6_000n * 100_000_000n,
+     }));
+     expect(plan.debtDecimals).toBe(18);
+     expect(plan.collateralDecimals).toBe(8);
+     expect(plan.debtToCover).toBe(10n ** 18n);
+     expect(plan.debtToCoverUsd).toBeCloseTo(3_000, 6);
+-    expect(plan.actualDebtUsd).toBeCloseTo(6_000, 6);
+   });
+ 
+-  it("USDC 6-decimals: $10k debt at HF 0.99 yields ~$5k debtToCover, not ~$1 (regression)", () => {
++  it("USDC 6-decimals: $10k debt at HF 0.97 yields ~$5k debtToCover, not ~$1 (regression)", () => {
+     const plan = planned(planAaveLiquidation({
+       reserves: [usdcDebt(10_000_000_000n), wethCollateral(5n * 10n ** 18n)],
+-      pairs: [wethUsdc], healthFactor: HF_099, totalDebtBase: 10_000n * 100_000_000n,
++      pairs: [wethUsdc], healthFactor: HF_097, totalDebtBase: 10_000n * 100_000_000n,
+     }));
+     expect(plan.debtToCoverUsd).toBeCloseTo(5_000, 6);
+     expect(plan.debtToCover).not.toBe(wethUsdc.defaultDebtToCoverWei);
+@@ -162,3 +256,36 @@ describe("planAaveLiquidation decimals", () => {
+     expect(plan.debtToCover).toBe(1_500_000_000n);
+   });
+ });
++
++describe("simulateCollateralToLiquidate", () => {
++  it("matches Aave PercentageMath (bonus + protocol fee)", () => {
++    // $1000 USDC debt, $1 WETH collateral price, 5% bonus, 10% protocol fee of bonus.
++    const sim = simulateCollateralToLiquidate({
++      debtToCover: 1_000_000_000n,
++      debtPriceUsd8: USDC_PRICE,
++      debtDecimals: 6,
++      collateralPriceUsd8: WETH_PRICE,
++      collateralDecimals: 18,
++      collateralBalance: 10n ** 18n,
++      liquidationBonusBps: 500,
++      liquidationProtocolFeeBps: 1_000,
++    });
++    // base = 1000/3000 WETH = 1/3e18; *1.05 = 0.35e18.
++    expect(sim.collateralSeized).toBe(350_000_000_000_000_000n);
++    // bonus portion = 0.35e18 - percentDiv(0.35e18, 10500) = 0.35e18 - 333_333_333_333_333_333 = 16_666_666_666_666_667
++    // fee = percentMul(that, 1000) = 1_666_666_666_666_667
++    expect(sim.protocolFee).toBe(1_666_666_666_666_667n);
++    expect(sim.liquidatorCollateral).toBe(sim.collateralSeized - sim.protocolFee);
++    expect(sim.debtRepaid).toBe(1_000_000_000n);
++  });
++});
++
++describe("AAVE_V33_LIQUIDATION_RULES switch", () => {
++  it("defaults ON; false/0/off/no disable", () => {
++    expect(resolveAaveV33LiquidationRules({})).toBe(true);
++    expect(resolveAaveV33LiquidationRules({ AAVE_V33_LIQUIDATION_RULES: "true" })).toBe(true);
++    for (const off of ["false", "0", "off", "NO"]) {
++      expect(resolveAaveV33LiquidationRules({ AAVE_V33_LIQUIDATION_RULES: off })).toBe(false);
++    }
++  });
++});
+diff --git a/test/unit/phase2RealSizing.test.ts b/test/unit/phase2RealSizing.test.ts
+new file mode 100644
+index 0000000..066c386
+--- /dev/null
++++ b/test/unit/phase2RealSizing.test.ts
+@@ -0,0 +1,57 @@
++import { describe, expect, it, vi } from "vitest";
++import type { Address } from "viem";
++import { fetchLiquidationCandidates } from "../../src/backtesting/phase2TargetedDryRun";
++import { createChainRegistry } from "../../src/config/chainRegistry";
++import { getChainConfig } from "../../src/config/chains";
++import { AaveSnapshotProvider } from "../../src/monitors/aaveSnapshotProvider";
++import { ViemAaveV3Protocol } from "../../src/protocols/aaveV3";
++import { FakeAaveReserveClient, RAY } from "../helpers/fakeAaveReserveClient";
++
++const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
++const WETH = "0x4200000000000000000000000000000000000006" as Address;
++const CBBTC = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
++const DUST = "0x00000000000000000000000000000000000000d1" as Address;
++const HEALTHY = "0x00000000000000000000000000000000000000d2" as Address;
++
++describe("phase-2 dry-run uses real sizing (planAaveLiquidation), not getBestLiquidationPair/default sizing", () => {
++  it("sizes a dust cbBTC-debt account from real reserves and skips healthy accounts", async () => {
++    const markets = new Map([
++      [USDC.toLowerCase(), { liquidityIndex: RAY, variableBorrowIndex: RAY, priceUsd8: 100_000_000n, decimals: 6 }],
++      [WETH.toLowerCase(), { liquidityIndex: RAY, variableBorrowIndex: RAY, priceUsd8: 300_000_000_000n, decimals: 18 }],
++      [CBBTC.toLowerCase(), { liquidityIndex: RAY, variableBorrowIndex: RAY, priceUsd8: 8_000_000_000_000n, decimals: 8 }],
++    ]);
++    const fake = new FakeAaveReserveClient(markets, new Map([[DUST.toLowerCase(), [
++      { underlyingAsset: CBBTC, scaledATokenBalance: 0n, usageAsCollateralEnabledOnUser: false, scaledVariableDebt: 11n },
++      { underlyingAsset: USDC, scaledATokenBalance: 12_000n, usageAsCollateralEnabledOnUser: true, scaledVariableDebt: 0n },
++    ]]]));
++    const accountData = new Map<string, readonly bigint[]>([
++      [DUST.toLowerCase(), [1_200_000n, 880_000n, 0n, 7_800n, 7_500n, 990_000_000_000_000_000n]],
++      [HEALTHY.toLowerCase(), [10n ** 12n, 10n ** 10n, 0n, 7_800n, 7_500n, 5n * 10n ** 18n]],
++    ]);
++    const registry = createChainRegistry({
++      chains: [{ chain: "base", rpcUrl: "https://base.example", fallbackRpcUrls: [], aaveSubgraphUrl: "https://subgraph.example" }],
++    });
++    const protocol = new ViemAaveV3Protocol(
++      {
++        readContract: async (parameters: { readonly args: readonly [Address] }) => accountData.get(parameters.args[0].toLowerCase()),
++        multicall: fake.multicall.bind(fake),
++      } as never,
++      getChainConfig("base"), undefined, undefined, 50, registry,
++    );
++    const getBestLiquidationPair = vi.spyOn(protocol, "getBestLiquidationPair");
++    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
++    const { candidates, skippedHealthy } = await fetchLiquidationCandidates(
++      protocol, [DUST, HEALTHY], log, new AaveSnapshotProvider("base", protocol, registry, log), "base", 100,
++    );
++    expect(getBestLiquidationPair).not.toHaveBeenCalled();
++    expect(skippedHealthy).toBe(1);
++    expect(candidates).toHaveLength(1);
++    expect(candidates[0]!.debtAsset).toBe(CBBTC);
++    expect(candidates[0]!.collateralAsset).toBe(USDC);
++    expect(candidates[0]!.debtToCover).toBe(11n);
++    expect(candidates[0]!.appliedCloseFactorBps).toBe(10_000);
++    const sized = log.info.mock.calls.find((call) => call[0] === "phase2_real_sizing")?.[1] as Record<string, unknown>;
++    expect(sized.debtToCover).toBe("11");
++    expect(sized.expectedMinCollateralOut).not.toBeNull();
++  });
++});
+diff --git a/test/unit/receiverLayoutMismatch.test.ts b/test/unit/receiverLayoutMismatch.test.ts
+new file mode 100644
+index 0000000..07678ce
+--- /dev/null
++++ b/test/unit/receiverLayoutMismatch.test.ts
+@@ -0,0 +1,53 @@
++import { describe, expect, it } from "vitest";
++import { decodeAbiParameters, encodeAbiParameters, parseAbiParameters, type Address } from "viem";
++import {
++  decodeLiquidationRouteV1,
++  encodeLiquidationRoute,
++  encodeMoonwellRoute,
++  MULTI_PROTOCOL_RECEIVER_PARAMS,
++} from "../../src/protocols/liquidationFlashLoanReceiver";
++
++const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
++const WETH = "0x4200000000000000000000000000000000000006" as Address;
++const USER = "0xf20e421cf0b314d61177466d3c9c0cb5e1342ecb" as Address;
++/** Exactly what the live v1 receiver does: abi.decode(params,(address,address,address,uint256,bool)). */
++const v1DecodeLayout = parseAbiParameters("address,address,address,uint256,bool");
++
++describe("receiver calldata layout (live v1 @ 0x379c…ada6)", () => {
++  it("RECREATES today's bug: the 8cbab38 7-field payload decoded with the v1 layout => DebtAssetMismatch", () => {
++    // (a) realistic debtToCover: v1 reads word 4 (the 7-field debtToCover) as `bool receiveAToken`; 4619 is not 0/1 =>
++    // Solidity abi.decode reverts with EMPTY data (viem's strict decoder rejects it the same way).
++    const realistic = encodeAbiParameters(parseAbiParameters(MULTI_PROTOCOL_RECEIVER_PARAMS), [
++      0, WETH, USDC, USER, 4_619n, 1n, false,
++    ]);
++    expect(() => decodeAbiParameters(v1DecodeLayout, realistic)).toThrow(/boolean/);
++    // (b) debtToCover=1 makes the bool word valid => decode "succeeds" with shifted fields => DebtAssetMismatch.
++    const sevenField = encodeAbiParameters(parseAbiParameters(MULTI_PROTOCOL_RECEIVER_PARAMS), [
++      0, WETH, USDC, USER, 1n, 1n, false,
++    ]);
++    const [collateral, debt] = decodeAbiParameters(v1DecodeLayout, sevenField);
++    expect(collateral).toBe("0x0000000000000000000000000000000000000000"); // routeType word
++    expect(debt.toLowerCase()).toBe(WETH.toLowerCase()); // collateral word lands in debtAsset
++    // v1: `if (debtAsset != asset) revert DebtAssetMismatch();` with asset = flash-borrowed USDC
++    expect(debt.toLowerCase()).not.toBe(USDC.toLowerCase());
++    // Same shape as the isolated Moonwell encoder: never used for the Aave route.
++    expect((encodeMoonwellRoute({ collateralAsset: WETH, debtAsset: USDC, user: USER, debtToCover: 1n, minCollateralOut: 1n }).length - 2) / 64).toBe(7);
++  });
++
++  it("FIX: encodeLiquidationRoute emits the v1 5-field layout and round-trips through the v1 decoder", () => {
++    const encoded = encodeLiquidationRoute({ collateralAsset: WETH, debtAsset: USDC, user: USER, debtToCover: 4_619n });
++    expect((encoded.length - 2) / 64).toBe(5);
++    const [collateral, debt, user, debtToCover, receiveAToken] = decodeAbiParameters(v1DecodeLayout, encoded);
++    expect(collateral).toBe(WETH);
++    expect(debt).toBe(USDC);
++    expect(user.toLowerCase()).toBe(USER);
++    expect(debtToCover).toBe(4_619n);
++    expect(receiveAToken).toBe(false);
++    expect(decodeLiquidationRouteV1(encoded).debtAsset).toBe(USDC);
++    // Byte-exact vs the 042e442 encoder layout.
++    expect(encoded).toBe(encodeAbiParameters(
++      parseAbiParameters("address collateralAsset,address debtAsset,address user,uint256 debtToCover,bool receiveAToken"),
++      [WETH, USDC, USER, 4_619n, false],
++    ));
++  });
++});
+diff --git a/test/unit/replay0xf20e51765799.test.ts b/test/unit/replay0xf20e51765799.test.ts
+index 12375d7..2087508 100644
+--- a/test/unit/replay0xf20e51765799.test.ts
++++ b/test/unit/replay0xf20e51765799.test.ts
+@@ -28,6 +28,8 @@ interface ReplayFixture {
+     readonly liquidityIndex: string;
+     readonly variableBorrowIndex: string;
+     readonly priceUsd8: string;
++    readonly liquidationBonusRaw: number;
++    readonly liquidationProtocolFeeBps: number;
+   }[];
+ }
+ 
+@@ -54,7 +56,12 @@ function logger() {
+   return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+ }
+ 
+-function buildProvider(rows: readonly FakeUserRow[], markets: Map<string, FakeReserveMarket>, pairs?: readonly AaveReservePair[]) {
++function buildProvider(
++  rows: readonly FakeUserRow[],
++  markets: Map<string, FakeReserveMarket>,
++  pairs?: readonly AaveReservePair[],
++  v33Rules?: boolean,
++) {
+   const fake = new FakeAaveReserveClient(markets, new Map([[account.toLowerCase(), rows]]), fixture.oracle);
+   const accountData = [
+     totalCollateralBase,
+@@ -76,7 +83,10 @@ function buildProvider(rows: readonly FakeUserRow[], markets: Map<string, FakeRe
+     registry,
+   );
+   const log = logger();
+-  const provider = new AaveSnapshotProvider("base", protocol, registry, log, pairs === undefined ? {} : { reservePairs: pairs });
++  const provider = new AaveSnapshotProvider("base", protocol, registry, log, {
++    ...(pairs === undefined ? {} : { reservePairs: pairs }),
++    ...(v33Rules === undefined ? {} : { v33Rules }),
++  });
+   return { provider, log };
+ }
+ 
+@@ -85,6 +95,8 @@ const fixtureMarkets = new Map<string, FakeReserveMarket>(fixture.reserves.map((
+   variableBorrowIndex: BigInt(row.variableBorrowIndex),
+   priceUsd8: BigInt(row.priceUsd8),
+   decimals: row.decimals,
++  liquidationBonusRaw: row.liquidationBonusRaw,
++  liquidationProtocolFeeBps: row.liquidationProtocolFeeBps,
+ }]));
+ const fixtureRows: FakeUserRow[] = fixture.reserves.map((row) => ({
+   underlyingAsset: row.underlyingAsset,
+@@ -127,14 +139,37 @@ describe("replay 0xf20e @ Base block 51765799", () => {
+     console.log("[replay 0xf20e] BEFORE debtUsd", evaluated.debtUsd);
+   });
+ 
+-  it("REAL on-chain reserves: debt is cbBTC (11 sats = totalDebtBase 923715); no configured Base pair -> pair_not_held_skip", async () => {
++  it("REAL on-chain reserves + default Base pairs: selects cbBTC debt / USDC collateral, v3.3 100% close (11 sats), dust-rejected", async () => {
+     const { provider, log } = buildProvider(fixtureRows, fixtureMarkets);
+     const snapshots = await provider.refreshBorrowers("base", [account]);
+-    expect(snapshots).toHaveLength(0);
+-    const skip = log.info.mock.calls.find((call) => call[0] === "pair_not_held_skip")?.[1] as Record<string, unknown>;
+-    expect(skip).toBeDefined();
+-    expect(skip.heldDebtAssets).toEqual([CBBTC]);
++    expect(snapshots).toHaveLength(1);
++    expect(log.info.mock.calls.some((call) => call[0] === "pair_not_held_skip")).toBe(false);
+     expect(log.warn.mock.calls.some((call) => call[0] === "debt_to_cover_resolve_failed")).toBe(false);
++    const plan = snapshots[0]!.liquidationPlan!;
++    // USDC collateral ($0.0118) > WETH collateral ($0.0000145): largest-value collateral wins.
++    expect(plan.debtAsset).toBe(CBBTC);
++    expect(plan.collateralAsset).toBe(USDC);
++    expect(plan.actualDebtRaw).toBe(11n);
++    expect(plan.debtDecimals).toBe(8);
++    expect(plan.v33Rules).toBe(true);
++    expect(plan.closeFactorBps).toBe(10_000); // reserve debt < $2k (and collateral < $2k) => 100%
++    expect(plan.debtToCover).toBe(11n); // full reserve debt
++    expect(plan.expectedDebtRepaidRaw).toBe(11n);
++    expect(plan.cappedBy).toBe("actual_debt");
++    expect(plan.noDustAdjustment).toBe("none");
++    expect(plan.liquidationBonusBps).toBe(500); // on-chain USDC collateral bonus (10500) at block 51765799
++    expect(plan.actualDebtUsd).toBeCloseTo(0.00923715, 8);
++    const cache = new ReserveAwareBorrowerCache();
++    cache.upsert(snapshots[0]!);
++    const { kept, evaluated } = await evaluate(createReserveAwareCandidates(cache, "base"));
++    expect(kept).toHaveLength(0);
++    expect(evaluated.pass).toBe(false);
++    expect(evaluated.debtAsset).toBe(CBBTC);
++    expect(evaluated.collateralAsset).toBe(USDC);
++    expect(evaluated.closeFactorBps).toBe(10_000);
++    expect(evaluated.debtToCover).toBe("11");
++    expect(evaluated.debtUsd).toBeCloseTo(0.00923715, 8);
++    expect(evaluated.actualDebtUsd).toBeCloseTo(0.00923715, 8);
+     // Resolver rounding reproduces getUserAccountData exactly: ceil(10 scaled * index) = 11 sats; ceil(11 * $83,974.09) = 923715 base
+     const fake = new FakeAaveReserveClient(fixtureMarkets, new Map([[account.toLowerCase(), fixtureRows]]), fixture.oracle);
+     const resolved = await resolveAccountReservePositions({
+@@ -150,36 +185,46 @@ describe("replay 0xf20e @ Base block 51765799", () => {
+     }
+     const cbBtcDebt = result.positions.reserves.find((row) => row.asset === CBBTC)!;
+     expect(cbBtcDebt.variableDebt).toBe(11n);
+-    expect(cbBtcDebt.decimals).toBe(8);
+     expect((cbBtcDebt.variableDebt * cbBtcDebt.priceUsd8 + 10n ** 8n - 1n) / 10n ** 8n).toBe(totalDebtBase);
+     expect(computeDebtUsdFromWei(cbBtcDebt.variableDebt, 8, cbBtcDebt.priceUsd8)).toBeCloseTo(0.0092, 4);
+-    console.log("[replay 0xf20e] REAL reserves -> pair_not_held_skip", JSON.stringify(skip));
++    console.log("[replay 0xf20e] AFTER (v3.3 default, 6 Base pairs)", JSON.stringify({
++      pair: `${plan.collateralAsset}/${plan.debtAsset}`,
++      actualDebtUsd: plan.actualDebtUsd,
++      debtToCover: plan.debtToCover.toString(),
++      debtToCoverUsd: plan.debtToCoverUsd,
++      closeFactorBps: plan.closeFactorBps,
++      liquidationBonusBps: plan.liquidationBonusBps,
++      pass: evaluated.pass,
++      reason: evaluated.reason ?? evaluated.rejectReason ?? null,
++      evaluated,
++    }));
+   });
+ 
+-  it("REAL reserves with a hypothetical cbBTC-debt pair: actualDebtUsd ~0.0092, debtToCoverUsd ~0.0042 (50%, whole sats), dust-rejected", async () => {
+-    const pairs: AaveReservePair[] = [{
+-      collateralAsset: USDC, debtAsset: CBBTC, defaultDebtToCoverWei: 1n, repayValueUsd: 1, liquidationBonusBps: 500,
+-    }];
+-    const { provider } = buildProvider(fixtureRows, fixtureMarkets, pairs);
++  it("v3.3 rules disabled (legacy switch): same pair, 50% close factor -> 5 sats, still dust-rejected", async () => {
++    const { provider } = buildProvider(fixtureRows, fixtureMarkets, undefined, false);
+     const snapshots = await provider.refreshBorrowers("base", [account]);
+     expect(snapshots).toHaveLength(1);
+     const plan = snapshots[0]!.liquidationPlan!;
+-    expect(plan.actualDebtRaw).toBe(11n);
+-    expect(plan.debtDecimals).toBe(8);
++    expect(plan.debtAsset).toBe(CBBTC);
++    expect(plan.v33Rules).toBe(false);
+     expect(plan.closeFactorBps).toBe(5_000);
+     expect(plan.debtToCover).toBe(5n); // floor(461857.5 base / $83,974.09) = 5 sats
+     const cache = new ReserveAwareBorrowerCache();
+     cache.upsert(snapshots[0]!);
+     const { kept, evaluated } = await evaluate(createReserveAwareCandidates(cache, "base"));
+     expect(kept).toHaveLength(0);
+-    expect(evaluated.actualDebtUsd).toBeCloseTo(0.00923715, 8);
+-    expect(evaluated.debtUsd).toBeGreaterThan(0.004);
+-    expect(evaluated.debtUsd).toBeLessThanOrEqual(0.0046186);
+     expect(evaluated.pass).toBe(false);
+-    console.log("[replay 0xf20e] AFTER (real cbBTC debt)", JSON.stringify(evaluated));
+   });
+ 
+-  it("DERIVED bot-assumed layout (USDC debt / WETH collateral from account totals): actualDebtUsd ~0.0092, debtToCoverUsd ~0.0046, dust-rejected", async () => {
++  it("legacy single WETH/USDC pair config: no USDC debt -> pair_not_held_skip", async () => {
++    const pairs: AaveReservePair[] = [getChainConfig("base").aave.reservePairs[0]!];
++    const { provider, log } = buildProvider(fixtureRows, fixtureMarkets, pairs);
++    expect(await provider.refreshBorrowers("base", [account])).toHaveLength(0);
++    const skip = log.info.mock.calls.find((call) => call[0] === "pair_not_held_skip")?.[1] as Record<string, unknown>;
++    expect(skip.heldDebtAssets).toEqual([CBBTC]);
++  });
++
++  it("DERIVED bot-assumed layout (USDC debt / WETH collateral from account totals): v3.3 100% -> debtToCoverUsd ~0.0092, dust-rejected", async () => {
+     // Derived, not on-chain: express totalDebtBase as USDC debt and totalCollateralBase as WETH collateral.
+     const markets = new Map<string, FakeReserveMarket>([
+       [USDC.toLowerCase(), { liquidityIndex: 10n ** 27n, variableBorrowIndex: 10n ** 27n, priceUsd8: priceOf(USDC), decimals: 6 }],
+@@ -200,9 +245,9 @@ describe("replay 0xf20e @ Base block 51765799", () => {
+     const { kept, evaluated } = await evaluate(candidates);
+     expect(kept).toHaveLength(0);
+     expect(evaluated.actualDebtUsd).toBeCloseTo(0.0092, 4);
+-    expect(evaluated.debtUsd).toBeCloseTo(0.0046, 4);
+-    expect(evaluated.debtToCoverUsd).toBeCloseTo(0.0046, 4);
+-    expect(evaluated.closeFactorBps).toBe(5_000);
++    expect(evaluated.debtUsd).toBeCloseTo(0.0092, 4);
++    expect(evaluated.debtToCoverUsd).toBeCloseTo(0.0092, 4);
++    expect(evaluated.closeFactorBps).toBe(10_000);
+     expect(evaluated.pass).toBe(false);
+     console.log("[replay 0xf20e] AFTER (derived USDC debt)", JSON.stringify(evaluated));
+   });
+-- 
+2.47.3
+
