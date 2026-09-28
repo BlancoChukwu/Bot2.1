@@ -1,0 +1,827 @@
+ on-chain bonus, v1 receiver layout.
+
+(1) Aave v3.3 LiquidationLogic ON by default (Base Pool revision 11):
+    100% close factor unless chosen collateral AND debt reserve >= $2k base and
+    HF > 0.95; MustNotLeaveDust (MIN_LEFTOVER_BASE = $1k) handled by submitting
+    full liquidatable debt when collateral-capped, or sizing down a 50% close
+    that would strand < $1k collateral. AAVE_V33_LIQUIDATION_RULES=false restores
+    legacy sizing. Constants cited from aave-v3-origin v3.3.0 + main.
+(2) Base pairs: all 6 permutations of WETH/USDC/cbBTC (validated vs Aave MCP +
+    Pool.getConfiguration 2026-09-28; fixture records LT/bonus/fees, Chainlink
+    feeds, Uniswap V3 pools). defaultDebtToCoverWei ~$1 legacy placeholder only.
+    0xf20e @ 51765799 now selects cbBTC debt / USDC collateral, 100% close
+    (11 sats, $0.0092), still dust-rejected by the $50 floor.
+(3) Liquidation bonus + protocol fee read on-chain in the batched reserve
+    multicall (eMode-aware via getEModeCategoryCollateralConfig/Bitmap); missing
+    => liquidation_bonus_unavailable_skip (fail closed, no config fallback).
+    estimateMinimumCollateralOut fixed: returned debt-token raw units labelled as
+    collateral (and re-applied close factor, ignored price ratio/protocol fee).
+    Phase-2 dry run now sizes via AaveSnapshotProvider/planAaveLiquidation.
+(A) Aave flash route back on the live v1 receiver 5-field layout (8cbab38 sent
+    the 7-field MultiProtocol layout => DebtAssetMismatch / empty revert).
+    Readiness pins the receiver runtime code hash (LIQUIDATION_RECEIVER_CODEHASH,
+    default v1 hash for 0x379c...ada6) and runs a v1 layout probe
+    (executeOperation from Pool must revert HealthFactorNotBelowThreshold /
+    HF_NOT_LIQUIDATABLE); any mismatch or RPC error blocks LIVE.
+---
+ src/backtesting/phase2TargetedDryRun.ts       |  68 +++-
+ src/config/aavePoolVersion.ts                 |  19 +-
+ src/config/chains.ts                          |  57 ++-
+ src/executors/liquidationExecutionAdapter.ts  |  54 ++-
+ src/index.ts                                  |  34 +-
+ src/monitors/aaveSnapshotProvider.ts          |  37 +-
+ src/monitors/reserveAwareBorrowerCache.ts     |  11 +-
+ src/orchestrator/liquidationCandidateGate.ts  |  14 +-
+ .../liquidationReceiverReadiness.ts           | 237 ++++++++++--
+ src/protocols/aaveReservePositions.ts         | 239 +++++++++++-
+ src/protocols/aaveV3.ts                       |  13 +
+ src/protocols/liquidationFlashLoanReceiver.ts |  56 ++-
+ src/protocols/liquidationSizing.ts            | 350 +++++++++++++++---
+ .../base-aave-reserve-params-2026-09-28.json  |  27 ++
+ test/fixtures/replay-0xf20e-51765799.json     |  18 +-
+ test/helpers/fakeAaveReserveClient.ts         |  62 +++-
+ test/unit/aaveReservePositionsBonus.test.ts   | 123 ++++++
+ test/unit/baseReservePairs.test.ts            |  43 +++
+ test/unit/liquidationExecutionAdapter.test.ts |  97 +++--
+ .../unit/liquidationReceiverReadiness.test.ts | 260 ++++++++-----
+ test/unit/liquidationSizing.test.ts           | 207 +++++++++--
+ test/unit/phase2RealSizing.test.ts            |  57 +++
+ test/unit/receiverLayoutMismatch.test.ts      |  53 +++
+ test/unit/replay0xf20e51765799.test.ts        |  93 +++--
+ 24 files changed, 1905 insertions(+), 324 deletions(-)
+ create mode 100644 test/fixtures/base-aave-reserve-params-2026-09-28.json
+ create mode 100644 test/unit/aaveReservePositionsBonus.test.ts
+ create mode 100644 test/unit/baseReservePairs.test.ts
+ create mode 100644 test/unit/phase2RealSizing.test.ts
+ create mode 100644 test/unit/receiverLayoutMismatch.test.ts
+
+diff --git a/src/backtesting/phase2TargetedDryRun.ts b/src/backtesting/phase2TargetedDryRun.ts
+index 8cb8f29..a2b3245 100644
+--- a/src/backtesting/phase2TargetedDryRun.ts
++++ b/src/backtesting/phase2TargetedDryRun.ts
+@@ -3,7 +3,9 @@ import type { LoggerLike, BotMetrics } from "../bot";
+ import type { SupportedChain } from "../config/chains";
+ import { getChainConfig } from "../config/chains";
+ import type { OracleFeedRegistry } from "../utils/priceOracleCache";
+-import { buildLiquidationExecutionRequest } from "../executors/liquidationExecutionAdapter";
++import { buildLiquidationExecutionRequest, estimateMinimumCollateralOut } from "../executors/liquidationExecutionAdapter";
++import { AaveSnapshotProvider } from "../monitors/aaveSnapshotProvider";
++import { candidateFromPlan } from "../monitors/reserveAwareBorrowerCache";
+ import { SafeTransactionExecutor } from "../executors/safeTransactionExecutor";
+ import { ViemExecutionClient, type ViemExecutionClientConfig } from "../executors/viemExecutionClient";
+ import { LocalNonceManager } from "../executors/nonceManager";
+@@ -111,10 +113,22 @@ export async function runPhase2TargetedDustDryRun(
+     metrics: input.metrics,
+   });
+ 
++  const sizingRegistry = createChainRegistry({
++    chains: [{
++      chain,
++      rpcUrl: input.config.rpcUrl,
++      fallbackRpcUrls: input.config.fallbackRpcUrls,
++      aaveSubgraphUrl: input.config.aaveSubgraphUrl,
++      flashLoanProviders: ["aaveV3"],
++    }],
++  });
+   const { candidates: rawCandidates, skippedHealthy } = await fetchLiquidationCandidates(
+     input.protocol,
+     accounts,
+     input.logger,
++    new AaveSnapshotProvider(chain, input.protocol, sizingRegistry, input.logger),
++    chain,
++    input.config.slippageBps,
+   );
+   const kept = await gate.filterCandidates(chain, rawCandidates, "phase2_dust_replay");
+   const gasCostUsd = await resolveGasCostUsd();
+@@ -207,16 +221,25 @@ export async function runPhase2TargetedDustDryRun(
+   };
+ }
+ 
+-async function fetchLiquidationCandidates(
++/**
++ * Real sizing (same path as LIVE): healthy accounts are counted and skipped; liquidatable accounts are resolved via
++ * per-reserve positions + planAaveLiquidation (on-chain bonus, v3.3 close factor / no-dust) through
++ * AaveSnapshotProvider. Accounts whose sizing fails (resolve failure, pair not held, bonus unavailable, dust rule)
++ * are logged by the provider and produce no candidate. getBestLiquidationPair / defaultDebtToCoverWei is NOT used.
++ */
++export async function fetchLiquidationCandidates(
+   protocol: AaveV3Protocol,
+   accounts: readonly Address[],
+   logger: LoggerLike,
++  sizing: Pick<AaveSnapshotProvider, "refreshBorrowers">,
++  chain: SupportedChain,
++  slippageBps = 0,
+ ): Promise<{ candidates: LiquidationCandidate[]; skippedHealthy: number }> {
+-  if (protocol.getUserAccount === undefined || protocol.getBestLiquidationPair === undefined) {
+-    throw new Error("Protocol must support getUserAccount and getBestLiquidationPair for targeted dry-run");
++  if (protocol.getUserAccount === undefined) {
++    throw new Error("Protocol must support getUserAccount for targeted dry-run");
+   }
+-  const candidates: LiquidationCandidate[] = [];
+   let skippedHealthy = 0;
++  const liquidatable: Address[] = [];
+   for (const account of accounts) {
+     const userAccount = await protocol.getUserAccount(account);
+     if (userAccount.healthFactor >= liquidationHealthFactor) {
+@@ -227,16 +250,33 @@ async function fetchLiquidationCandidates(
+       });
+       continue;
+     }
+-    const pair = await protocol.getBestLiquidationPair(userAccount);
+-    candidates.push({
+-      account,
+-      collateralAsset: pair.collateralAsset,
+-      debtAsset: pair.debtAsset,
+-      debtToCover: pair.debtToCover,
+-      repayValueUsd: pair.repayValueUsd,
+-      liquidationBonusBps: pair.liquidationBonusBps,
+-      healthFactor: userAccount.healthFactor,
++    liquidatable.push(account);
++  }
++  if (liquidatable.length === 0) {
++    return { candidates: [], skippedHealthy };
++  }
++  const snapshots = await sizing.refreshBorrowers(chain, liquidatable);
++  const candidates: LiquidationCandidate[] = [];
++  for (const snapshot of snapshots) {
++    if (snapshot.liquidationPlan === undefined) {
++      continue;
++    }
++    const candidate = candidateFromPlan(snapshot, snapshot.liquidationPlan);
++    const minCollateralOut = estimateMinimumCollateralOut(candidate, slippageBps);
++    logger.info("phase2_real_sizing", {
++      account: candidate.account,
++      collateralAsset: candidate.collateralAsset,
++      debtAsset: candidate.debtAsset,
++      debtToCover: candidate.debtToCover.toString(),
++      expectedDebtRepaidRaw: candidate.expectedDebtRepaidRaw?.toString() ?? null,
++      repayValueUsd: candidate.repayValueUsd,
++      actualDebtUsd: candidate.actualDebtUsd ?? null,
++      closeFactorBps: candidate.appliedCloseFactorBps ?? null,
++      liquidationBonusBps: candidate.liquidationBonusBps,
++      noDustAdjustment: candidate.noDustAdjustment ?? null,
++      expectedMinCollateralOut: minCollateralOut?.toString() ?? null,
+     });
++    candidates.push(candidate);
+   }
+   return { candidates, skippedHealthy };
+ }
+diff --git a/src/config/aavePoolVersion.ts b/src/config/aavePoolVersion.ts
+index 2a0d8d1..1810daa 100644
+--- a/src/config/aavePoolVersion.ts
++++ b/src/config/aavePoolVersion.ts
+@@ -5,10 +5,27 @@ export function resolveAavePoolVersion(): AavePoolVersion {
+   return raw === "v4" ? "v4" : "v3";
+ }
+ 
+-/** v3: protocol caps at 50% unless HF < 0.95 (then 100%). v4: target HF repayment — not yet wired. */
++/**
++ * Legacy (pre-v3.3) close factor: 50% unless HF < 0.95 (then 100%). v4: target HF repayment — not yet wired.
++ * Aave v3.3+ sizing (small-position 100% close + MustNotLeaveDust) lives in `protocols/liquidationSizing.ts`.
++ */
+ export function defaultCloseFactorBps(poolVersion: AavePoolVersion, healthFactorWad: bigint): number {
+   if (poolVersion === "v4") {
+     return 10_000;
+   }
+   return healthFactorWad < 950_000_000_000_000_000n ? 10_000 : 5_000;
+ }
++
++/**
++ * Aave v3.3+ LiquidationLogic rules (100% close factor for positions whose chosen collateral OR debt reserve is
++ * < $2,000 base, HF <= 0.95 inclusive, and the MustNotLeaveDust leftover rule). Base Pool
++ * 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5 reports POOL_REVISION 11 (verified 2026-09-28 via public RPC).
++ * Default ON. Disable with AAVE_V33_LIQUIDATION_RULES=false|0|off|no (legacy 50/100 at HF<0.95 only).
++ */
++export function resolveAaveV33LiquidationRules(env: Record<string, string | undefined> = process.env): boolean {
++  const raw = env.AAVE_V33_LIQUIDATION_RULES;
++  if (raw === undefined || raw.trim() === "") {
++    return true;
++  }
++  return !["false", "0", "off", "no"].includes(raw.trim().toLowerCase());
++}
+diff --git a/src/config/chains.ts b/src/config/chains.ts
+index 157dcc9..8f6acbb 100644
+--- a/src/config/chains.ts
++++ b/src/config/chains.ts
+@@ -15,9 +15,22 @@ export const aaveV3TheGraphSubgraphIds: Record<SupportedChain, string> = {
+ export interface AaveReservePair {
+   readonly collateralAsset: Address;
+   readonly debtAsset: Address;
++  /**
++   * LEGACY ONLY (subgraph/monitor candidate placeholder, ~$1). NEVER used for sizing: real debtToCover comes from
++   * per-reserve positions (protocols/liquidationSizing.ts); candidates carrying it are always re-resolved.
++   */
+   readonly defaultDebtToCoverWei: bigint;
+   readonly repayValueUsd: number;
++  /**
++   * Config/reference value only (bps over 100% of the COLLATERAL reserve). Sizing and profit use the on-chain
++   * (eMode-aware) bonus from Pool.getConfiguration and fail closed when it cannot be read.
++   */
+   readonly liquidationBonusBps: number;
++  /**
++   * Recommended Uniswap V3 fee tier for the collateral->debt single-hop swap. INFORMATIONAL: the deployed v1
++   * LiquidationFlashReceiver has one immutable swapFee (3000 on Base, read 2026-09-28) used for every pair.
++   */
++  readonly swapFeeTier?: 100 | 500 | 3000 | 10000;
+ }
+ 
+ export interface ChainConfig {
+@@ -53,6 +66,36 @@ const arbitrumUsdc = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
+ const arbitrumWeth = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
+ const baseUsdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+ const baseWeth = "0x4200000000000000000000000000000000000006";
++const baseCbBtc = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
++
++/**
++ * Base Aave V3 reserve parameters (Aave MCP get_reserve_details + Pool.getConfiguration via https://mainnet.base.org,
++ * retrieved 2026-09-28 10:27-10:30 MDT, block ~51911812). All three: active, not frozen/paused, borrowing enabled,
++ * not siloed, no isolation debt ceiling, liquidation protocol fee 10% (1000 bps).
++ *   WETH  id 0  LTV 80%  LT 83%  bonus 105.0% (500)   eMode 1 "ETH correlated" collateral: bonus 102%
++ *   USDC  id 4  LTV 75%  LT 78%  bonus 105.0% (500)   (eMode 10 borrowable only)
++ *   cbBTC id 6  LTV 73%  LT 78%  bonus 107.5% (750)   eMode 10 "cbBTC Stablecoins" collateral: bonus 104%
++ * Every collateral/debt permutation of {WETH, USDC, cbBTC} is allowed in non-eMode (LT>0 and borrowable).
++ * `liquidationBonusBps` below = the collateral reserve's non-eMode bonus (reference only; sizing reads on-chain).
++ * Legacy defaultDebtToCoverWei ≈ $1 of the debt asset (USDC 1e6, WETH 4e14 ≈ $1.08, cbBTC 1200 sats ≈ $1.01).
++ */
++const baseLegacyDefaultDebtToCover: Record<string, bigint> = {
++  [baseUsdc]: 1_000_000n,
++  [baseWeth]: 400_000_000_000_000n,
++  [baseCbBtc]: 1_200n,
++};
++const baseCollateralBonusBps: Record<string, number> = { [baseWeth]: 500, [baseUsdc]: 500, [baseCbBtc]: 750 };
++
++function basePair(collateralAsset: Address, debtAsset: Address, swapFeeTier: 100 | 500 | 3000 | 10000): AaveReservePair {
++  return {
++    collateralAsset,
++    debtAsset,
++    defaultDebtToCoverWei: baseLegacyDefaultDebtToCover[debtAsset]!,
++    repayValueUsd: 1,
++    liquidationBonusBps: baseCollateralBonusBps[collateralAsset]!,
++    swapFeeTier,
++  };
++}
+ 
+ const sharedAavePool = "0x794a61358d6845594f94dc1db02a252b5b4814ad";
+ const sharedProvider = "0xa97684ead0e402dc232d5a977953df7ecbab3cdb";
+@@ -111,14 +154,14 @@ export const chainConfigs: Record<SupportedChain, ChainConfig> = {
+       pool: baseAavePool,
+       poolAddressesProvider: basePoolAddressesProvider,
+       uiPoolDataProvider: baseUiPoolDataProvider,
++      // First entry stays WETH/USDC (legacy firstReservePair placeholder for subgraph candidates).
+       reservePairs: [
+-        {
+-          collateralAsset: baseWeth,
+-          debtAsset: baseUsdc,
+-          defaultDebtToCoverWei: 1_000_000n,
+-          repayValueUsd: 1,
+-          liquidationBonusBps: 500,
+-        },
++        basePair(baseWeth, baseUsdc, 500),
++        basePair(baseCbBtc, baseUsdc, 500),
++        basePair(baseUsdc, baseWeth, 500),
++        basePair(baseCbBtc, baseWeth, 500),
++        basePair(baseWeth, baseCbBtc, 500),
++        basePair(baseUsdc, baseCbBtc, 500),
+       ],
+     },
+   },
+diff --git a/src/executors/liquidationExecutionAdapter.ts b/src/executors/liquidationExecutionAdapter.ts
+index 705fd99..f98b31a 100644
+--- a/src/executors/liquidationExecutionAdapter.ts
++++ b/src/executors/liquidationExecutionAdapter.ts
+@@ -8,6 +8,7 @@ import { getChainConfig } from "../config/chains";
+ import { defaultCloseFactorBps, resolveAavePoolVersion } from "../config/aavePoolVersion";
+ import { AAVE_V3_BASE_FLASH_FEE_BPS, calculateFlashWrappedLiquidationEv } from "../utils/evCalculator";
+ import type { RouteSelectionResult } from "../profitability/flashLoanProviderRouter";
++import { simulateCollateralToLiquidate } from "../protocols/liquidationSizing";
+ 
+ const usdAsset: Asset = { symbol: "USD", decimals: 8 };
+ const balancerVault = "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
+@@ -68,13 +69,12 @@ export function buildLiquidationExecutionRequest(
+   }
+   const receiver = config.flashLoanReceiverAddress;
+   const capitalAtRisk = config.flashLoanReceiverAddress === undefined ? debt : gas;
+-  const minCollateralOut = estimateMinimumCollateralOut(candidate, effectiveSlippageBps);
++  // Live v1 receiver layout (5 fields, no minCollateralOut on the wire; the receiver enforces its own swap minOut).
+   const routeParams = encodeLiquidationRoute({
+     collateralAsset: candidate.collateralAsset,
+     debtAsset: candidate.debtAsset,
+     user: candidate.account,
+     debtToCover: candidate.debtToCover,
+-    minCollateralOut,
+     receiveAToken: false,
+   });
+ 
+@@ -215,15 +215,49 @@ function toFlashWrappedEnvelope(
+   };
+ }
+ 
+-export function estimateMinimumCollateralOut(candidate: LiquidationCandidate, slippageBps: number): bigint {
+-  const poolVersion = resolveAavePoolVersion();
+-  const effectiveCloseFactorBps = candidate.closeFactorBps
+-    ?? defaultCloseFactorBps(poolVersion, candidate.healthFactor);
++/**
++ * Expected minimum COLLATERAL (native collateral-token units) the liquidator receives, after the Aave liquidation
++ * protocol fee and a slippage haircut.
++ *
++ * Bug fixed (pre-fix implementation): it returned `debtToCover * closeFactor * (1 + bonus) * (1 - slippage)` —
++ * a number in DEBT-token raw units — and labelled it collateral. With USDC (6 dec) debt / WETH (18 dec) collateral
++ * $1,000 of debt produced 997_500_000 "wei" = 1e-9 WETH (a vacuous floor); with WETH debt / USDC collateral 1 WETH
++ * produced 9.975e17 USDC units (~$1e12, unreachable). It also ignored the debt/collateral price ratio and the
++ * liquidation protocol fee. Now: Aave's own formula
++ *   base = debtRepaid * debtPrice * 10^collDec / (collPrice * 10^debtDec); gross = percentMul(base, 1e4 + bonus)
++ *   (capped at the borrower's collateral balance), minus protocol fee on the bonus portion, minus slippage.
++ * Returns undefined (fail closed — never a wrong-unit number) when prices/decimals are not on the candidate.
++ * Not sent on-chain by the v1 receiver route (no such field); used for dry-run / diagnostics.
++ */
++export function estimateMinimumCollateralOut(candidate: LiquidationCandidate, slippageBps: number): bigint | undefined {
++  if (
++    candidate.debtPriceUsd8 === undefined || candidate.collateralPriceUsd8 === undefined
++    || candidate.debtDecimals === undefined || candidate.collateralDecimals === undefined
++    || candidate.debtPriceUsd8 <= 0n || candidate.collateralPriceUsd8 <= 0n
++  ) {
++    return undefined;
++  }
++  // Planner-sized candidates already respect the protocol close factor; only legacy candidates get it applied.
++  const effectiveCloseFactorBps = candidate.appliedCloseFactorBps !== undefined
++    ? 10_000
++    : candidate.closeFactorBps ?? defaultCloseFactorBps(resolveAavePoolVersion(), candidate.healthFactor);
++  const debtRepaid = candidate.expectedDebtRepaidRaw
++    ?? (candidate.debtToCover * BigInt(effectiveCloseFactorBps)) / 10_000n;
+   const bonusBps = candidate.effectiveLiquidationBonusBps ?? candidate.liquidationBonusBps;
+-  const debtCovered = (candidate.debtToCover * BigInt(effectiveCloseFactorBps)) / 10_000n;
+-  const grossCollateral = debtCovered + (debtCovered * BigInt(bonusBps)) / 10_000n;
+-  const haircut = (grossCollateral * BigInt(slippageBps)) / 10_000n;
+-  return grossCollateral > haircut ? grossCollateral - haircut : 0n;
++  const simulation = simulateCollateralToLiquidate({
++    debtToCover: debtRepaid,
++    debtPriceUsd8: candidate.debtPriceUsd8,
++    debtDecimals: candidate.debtDecimals,
++    collateralPriceUsd8: candidate.collateralPriceUsd8,
++    collateralDecimals: candidate.collateralDecimals,
++    collateralBalance: candidate.collateralBalanceRaw ?? (1n << 255n),
++    liquidationBonusBps: bonusBps,
++    // Unknown fee => assume the worst case (protocol keeps the whole bonus portion).
++    liquidationProtocolFeeBps: candidate.liquidationProtocolFeeBps ?? 10_000,
++  });
++  const gross = simulation.liquidatorCollateral;
++  const haircut = (gross * BigInt(slippageBps)) / 10_000n;
++  return gross > haircut ? gross - haircut : 0n;
+ }
+ 
+ function usdRaw(value: number): ReturnType<typeof createAssetAmount> {
+diff --git a/src/index.ts b/src/index.ts
+index c7e360e..f29500d 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1352,6 +1352,17 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
+       nearLiqAcceleratedPoller.setAccounts(tracked as Address[]);
+       nearLiqAcceleratedPoller.start();
+     }
++    if (liquidationReceiver !== undefined && !config.simulationMode && !validateLiquidationReceiverRpc) {
++      logger.error("liquidation_receiver_readiness_blocked", {
++        chain: config.chain,
++        receiver: liquidationReceiver,
++        error: "VALIDATE_LIQUIDATION_RECEIVER_RPC=false in LIVE",
++        action: "block_live",
++      });
++      throw new Error(
++        "LIQUIDATION_RECEIVER_READINESS_BLOCKED: VALIDATE_LIQUIDATION_RECEIVER_RPC=false is not allowed in LIVE (receiver identity/layout must be verified)",
++      );
++    }
+     if (validateLiquidationReceiverRpc) {
+       const registryUniswap = getDexesForChain(config.chain).find((dex) => dex.name === "UniswapV3");
+       const expectedSwapRouter = liquidationReceiverExpectedSwapRouter ?? registryUniswap?.router;
+@@ -1360,14 +1371,27 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
+           "Liquidation receiver RPC validation needs a swap router: set LIQUIDATION_RECEIVER_EXPECTED_SWAP_ROUTER or add UniswapV3 to dexRegistry for this chain",
+         );
+       }
+-      await assertLiquidationReceiverReadiness(publicClient, {
+-        chain: config.chain,
+-        receiver: liquidationReceiver,
+-        expectedSwapRouter,
+-      });
++      try {
++        // Fail closed: code-hash pin (LIQUIDATION_RECEIVER_CODEHASH or built-in v1 hash) + v1 layout probe.
++        await assertLiquidationReceiverReadiness(publicClient, {
++          chain: config.chain,
++          receiver: liquidationReceiver,
++          expectedSwapRouter,
++        });
++      } catch (error) {
++        logger.error("liquidation_receiver_readiness_blocked", {
++          chain: config.chain,
++          receiver: liquidationReceiver,
++          error: error instanceof Error ? error.message : String(error),
++          action: "block_live",
++        });
++        throw error;
++      }
+       logger.info("liquidation_receiver_startup_verified", {
+         chain: config.chain,
+         receiver: liquidationReceiver,
++        codeHashPinned: true,
++        layoutProbe: "v1_5_field_ok",
+         swapRouter: expectedSwapRouter,
+         swapRouterSource: liquidationReceiverExpectedSwapRouter !== undefined ? "env" : "dex_registry",
+       });
+diff --git a/src/monitors/aaveSnapshotProvider.ts b/src/monitors/aaveSnapshotProvider.ts
+index c50f73f..3d3d83b 100644
+--- a/src/monitors/aaveSnapshotProvider.ts
++++ b/src/monitors/aaveSnapshotProvider.ts
+@@ -6,6 +6,7 @@ import { getChainConfig } from "../config/chains";
+ import type { AccountReservePositionsResult, AaveReservePosition } from "../protocols/aaveReservePositions";
+ import type { AaveUserAccount, AaveV3Protocol } from "../protocols/aaveV3";
+ import { planAaveLiquidation, type LiquidationPlan } from "../protocols/liquidationSizing";
++import { resolveAaveV33LiquidationRules } from "../config/aavePoolVersion";
+ import { createAsset, createAssetAmount } from "../utils/typedAssetMath";
+ import type { BorrowerSnapshot } from "./reserveAwareBorrowerCache";
+ 
+@@ -24,7 +25,12 @@ const fallbackLogger: LoggerLike = {
+ export interface AaveSnapshotProviderOptions {
+   /** Reserve pairs to consider; defaults to the chain config pairs. */
+   readonly reservePairs?: readonly AaveReservePair[];
+-  /** Aave v3.3+ small-position 100% close factor rule (off by default; see liquidationSizing). */
++  /**
++   * Aave v3.3+ rules (small-position 100% close + MustNotLeaveDust). Default: AAVE_V33_LIQUIDATION_RULES env
++   * (ON unless set false). See liquidationSizing.
++   */
++  readonly v33Rules?: boolean;
++  /** @deprecated alias of v33Rules. */
+   readonly smallPositionFullClose?: boolean;
+ }
+ 
+@@ -170,8 +176,35 @@ export class AaveSnapshotProvider {
+       pairs: this.resolveReservePairs(),
+       healthFactor: userAccount.healthFactor,
+       totalDebtBase: userAccount.totalDebtBase,
+-      ...(this.options.smallPositionFullClose === undefined ? {} : { smallPositionFullClose: this.options.smallPositionFullClose }),
++      v33Rules: this.options.v33Rules ?? this.options.smallPositionFullClose ?? resolveAaveV33LiquidationRules(),
+     });
++    if (sizing.kind === "bonus_unavailable") {
++      // Fail closed: never size/price with the pair-config bonus.
++      this.logger.warn("liquidation_bonus_unavailable_skip", {
++        chain: this.chain,
++        account: userAccount.account,
++        healthFactor: userAccount.healthFactor.toString(),
++        eModeCategoryId: resolved.positions.eModeCategoryId ?? 0,
++        collateralAsset: sizing.collateralAsset,
++        debtAsset: sizing.debtAsset,
++        action: "skip_candidate",
++      });
++      return undefined;
++    }
++    if (sizing.kind === "must_not_leave_dust") {
++      this.logger.info("must_not_leave_dust_skip", {
++        chain: this.chain,
++        account: userAccount.account,
++        healthFactor: userAccount.healthFactor.toString(),
++        collateralAsset: sizing.collateralAsset,
++        debtAsset: sizing.debtAsset,
++        actualDebtUsd: sizing.actualDebtUsd,
++        collateralUsd: sizing.collateralUsd,
++        closeFactorBps: sizing.closeFactorBps,
++        action: "skip_candidate",
++      });
++      return undefined;
++    }
+     if (sizing.kind === "pair_not_held") {
+       this.logger.info("pair_not_held_skip", {
+         chain: this.chain,
+diff --git a/src/monitors/reserveAwareBorrowerCache.ts b/src/monitors/reserveAwareBorrowerCache.ts
+index a1290ad..19e3a43 100644
+--- a/src/monitors/reserveAwareBorrowerCache.ts
++++ b/src/monitors/reserveAwareBorrowerCache.ts
+@@ -188,8 +188,16 @@ export function candidateFromPlan(
+     collateralAsset: plan.collateralAsset,
+     debtAsset: plan.debtAsset,
+     debtToCover: plan.debtToCover,
+-    repayValueUsd: plan.debtToCoverUsd,
++    // Profit is earned on the debt the protocol actually repays (collateral-capped plans submit more).
++    repayValueUsd: plan.expectedDebtRepaidUsd,
++    expectedDebtRepaidRaw: plan.expectedDebtRepaidRaw,
+     liquidationBonusBps: plan.liquidationBonusBps,
++    effectiveLiquidationBonusBps: plan.liquidationBonusBps,
++    liquidationProtocolFeeBps: plan.liquidationProtocolFeeBps,
++    collateralDecimals: plan.collateralDecimals,
++    debtPriceUsd8: plan.debtPriceUsd8,
++    collateralPriceUsd8: plan.collateralPriceUsd8,
++    collateralBalanceRaw: plan.collateralBalanceRaw,
+     // debtToCover is already close-factor capped; 10_000 keeps executors from applying it twice.
+     closeFactorBps: 10_000,
+     appliedCloseFactorBps: plan.closeFactorBps,
+@@ -198,6 +206,7 @@ export function candidateFromPlan(
+     actualDebtUsd: plan.actualDebtUsd,
+     ...(plan.totalDebtUsd === undefined ? {} : { totalDebtUsd: plan.totalDebtUsd }),
+     sizingCappedBy: plan.cappedBy,
++    noDustAdjustment: plan.noDustAdjustment,
+     healthFactor: snapshot.healthFactor,
+   };
+ }
+diff --git a/src/orchestrator/liquidationCandidateGate.ts b/src/orchestrator/liquidationCandidateGate.ts
+index 9440032..ab3dc6f 100644
+--- a/src/orchestrator/liquidationCandidateGate.ts
++++ b/src/orchestrator/liquidationCandidateGate.ts
+@@ -23,6 +23,7 @@ import { getCycleDiagnosticsCollector } from "../observability/cycleDiagnostics"
+ 
+ const baseUsdcDecimals = 6;
+ const baseWethDecimals = 18;
++const baseCbBtcDecimals = 8;
+ const defaultErc20Decimals = 18;
+ 
+ interface ResolvedDebtUsd {
+@@ -44,6 +45,9 @@ function sizingLogFields(candidate: LiquidationCandidate, resolved: ResolvedDebt
+     debtDecimals: candidate.debtDecimals ?? null,
+     totalDebtUsd: candidate.totalDebtUsd ?? null,
+     sizingCappedBy: candidate.sizingCappedBy ?? null,
++    expectedDebtRepaidRaw: candidate.expectedDebtRepaidRaw?.toString() ?? null,
++    noDustAdjustment: candidate.noDustAdjustment ?? null,
++    liquidationBonusBps: candidate.effectiveLiquidationBonusBps ?? candidate.liquidationBonusBps,
+   };
+ }
+ 
+@@ -59,6 +63,10 @@ function planLogFields(plan: LiquidationPlan): Record<string, unknown> {
+     debtDecimals: plan.debtDecimals,
+     totalDebtUsd: plan.totalDebtUsd ?? null,
+     sizingCappedBy: plan.cappedBy,
++    expectedDebtRepaidRaw: plan.expectedDebtRepaidRaw.toString(),
++    noDustAdjustment: plan.noDustAdjustment,
++    liquidationBonusBps: plan.liquidationBonusBps,
++    v33Rules: plan.v33Rules,
+   };
+ }
+ 
+@@ -322,7 +330,8 @@ export class LiquidationCandidateGate {
+     }
+     const decimals = candidate.debtDecimals ?? this.resolveDebtDecimals(candidate.debtAsset);
+     return {
+-      debtUsd: computeDebtUsdFromWei(candidate.debtToCover, decimals, debtPrice),
++      // Profit accrues on debt actually repaid (collateral-capped v3.3 plans submit the full liquidatable debt).
++      debtUsd: computeDebtUsdFromWei(candidate.expectedDebtRepaidRaw ?? candidate.debtToCover, decimals, debtPrice),
+       trusted: true,
+       ...(candidate.actualDebtRaw === undefined
+         ? {}
+@@ -341,6 +350,9 @@ export class LiquidationCandidateGate {
+     if (lower.endsWith("4200000000000000000000000000000000000006")) {
+       return baseWethDecimals;
+     }
++    if (lower.endsWith("cbb7c0000ab88b473b1f5afd9ef808440eed33bf")) {
++      return baseCbBtcDecimals;
++    }
+     return defaultErc20Decimals;
+   }
+ }
+diff --git a/src/production/liquidationReceiverReadiness.ts b/src/production/liquidationReceiverReadiness.ts
+index 9b6d46f..11d7890 100644
+--- a/src/production/liquidationReceiverReadiness.ts
++++ b/src/production/liquidationReceiverReadiness.ts
+@@ -1,7 +1,8 @@
+-import type { Address, PublicClient } from "viem";
++import { encodeFunctionData, keccak256, type Address, type Hex, type PublicClient } from "viem";
+ import { getChainConfig, type SupportedChain } from "../config/chains";
++import { encodeLiquidationRoute } from "../protocols/liquidationFlashLoanReceiver";
+ 
+-/** Minimal ABI for automated startup checks (must match `contracts/LiquidationFlashReceiver.sol`). */
++/** Minimal ABI for automated startup checks (must match `contracts/LiquidationFlashReceiver.sol` v1 @ 042e442). */
+ export const liquidationFlashReceiverAbi = [
+   {
+     type: "function",
+@@ -26,54 +27,246 @@ export const liquidationFlashReceiverAbi = [
+   },
+ ] as const;
+ 
++export const receiverExecuteOperationAbi = [
++  {
++    type: "function",
++    name: "executeOperation",
++    stateMutability: "nonpayable",
++    inputs: [
++      { name: "asset", type: "address" },
++      { name: "amount", type: "uint256" },
++      { name: "premium", type: "uint256" },
++      { name: "initiator", type: "address" },
++      { name: "params", type: "bytes" },
++    ],
++    outputs: [{ name: "", type: "bool" }],
++  },
++] as const;
++
++/**
++ * Pinned runtime code hashes (keccak256(eth_getCode)) of receivers whose calldata layout is known to match
++ * `encodeLiquidationRoute` (v1, 5 fields). Immutables (POOL, SWAP_ROUTER, swapFee, owner) are baked into runtime
++ * code, so the hash pins the exact deployment.
++ *   0x379ce85b431bd4cb3b2b11d682bac4556648ada6 (Base): LiquidationFlashReceiver v1 (042e442), 2889 bytes,
++ *   swapFee 3000, router SwapRouter02 0x2626…e481, pool 0xA238…d1c5 — hashed via https://mainnet.base.org 2026-09-28.
++ */
++export const KNOWN_RECEIVER_CODEHASHES: Readonly<Record<string, readonly Hex[]>> = {
++  "0x379ce85b431bd4cb3b2b11d682bac4556648ada6": [
++    "0xf3e6c57e86b3aaba08c3d818d006063e355569353f80bd7bd84ee72d393e23ab",
++  ],
++};
++
++/** Aave Errors.HealthFactorNotBelowThreshold() (v3.2+ custom error). */
++export const AAVE_HF_NOT_BELOW_THRESHOLD_SELECTOR = "0x930bb771";
++/** LiquidationFlashReceiver.DebtAssetMismatch() — what a wrong (7-field) layout produces on v1. */
++export const RECEIVER_DEBT_ASSET_MISMATCH_SELECTOR = "0xebbd4204";
++/** An address with no Aave position (HF = uint256.max) used by the layout probe. */
++export const LAYOUT_PROBE_USER: Address = "0x000000000000000000000000000000000000dEaD";
++
+ export interface LiquidationReceiverReadinessInput {
+   readonly chain: SupportedChain;
+   readonly receiver: Address;
+   readonly expectedSwapRouter: Address;
++  /**
++   * Allowed runtime code hashes. Default: LIQUIDATION_RECEIVER_CODEHASH env (comma-separated) or the pinned
++   * KNOWN_RECEIVER_CODEHASHES entry for this address. Empty => fail closed.
++   */
++  readonly expectedCodeHashes?: readonly Hex[];
++  /** eth_call executeOperation from the Pool with a v1 payload (default true). */
++  readonly layoutProbe?: boolean;
++}
++
++export type ReceiverReadinessClient = Pick<PublicClient, "getBytecode" | "readContract"> & {
++  call?: PublicClient["call"];
++};
++
++export function resolveExpectedReceiverCodeHashes(
++  receiver: Address,
++  env: Record<string, string | undefined> = process.env,
++): readonly Hex[] {
++  const raw = env.LIQUIDATION_RECEIVER_CODEHASH?.trim();
++  if (raw !== undefined && raw !== "") {
++    return raw.split(",").map((entry) => entry.trim().toLowerCase()).filter((entry) => /^0x[0-9a-f]{64}$/.test(entry)) as Hex[];
++  }
++  return KNOWN_RECEIVER_CODEHASHES[receiver.toLowerCase()] ?? [];
++}
++
++function blocked(message: string): Error {
++  return new Error(`LIQUIDATION_RECEIVER_READINESS_BLOCKED: ${message}`);
+ }
+ 
+ /**
+- * Verifies the deployed receiver is non-empty, exposes the expected version, is wired to the chain Aave pool,
+- * and uses the configured DEX router (prevents mis-deployed or forked bytecode).
++ * Verifies (fail closed; any RPC error blocks):
++ *  1. receiver has code and keccak256(code) is in the pinned allowlist (identity + calldata layout);
++ *  2. receiverVersion()==1, aavePool()==chain pool, swapRouter()==expected router;
++ *  3. layout probe: eth_call executeOperation FROM the Pool with a v1 5-field payload for an account with no debt
++ *     must revert with the receiver's "HF_NOT_LIQUIDATABLE" (or Aave HealthFactorNotBelowThreshold 0x930bb771).
++ *     Success, an empty revert, or DebtAssetMismatch => layout mismatch => blocked.
+  */
+ export async function assertLiquidationReceiverReadiness(
+-  client: Pick<PublicClient, "getBytecode" | "readContract">,
++  client: ReceiverReadinessClient,
+   input: LiquidationReceiverReadinessInput,
+ ): Promise<void> {
+-  const bytecode = await client.getBytecode({ address: input.receiver });
++  let bytecode: Hex | undefined;
++  try {
++    bytecode = await client.getBytecode({ address: input.receiver });
++  } catch (error) {
++    throw blocked(`eth_getCode failed for ${input.receiver} (${input.chain}): ${firstLine(error)}`);
++  }
+   if (bytecode === undefined || bytecode === "0x") {
+     throw new Error(`LIQUIDATION_RECEIVER_ADDRESS has no on-chain code at ${input.receiver} (${input.chain})`);
+   }
+ 
+-  const version = await client.readContract({
+-    address: input.receiver,
+-    abi: liquidationFlashReceiverAbi,
+-    functionName: "receiverVersion",
+-  });
++  const allowed = (input.expectedCodeHashes ?? resolveExpectedReceiverCodeHashes(input.receiver)).map((hash) => hash.toLowerCase());
++  const codeHash = keccak256(bytecode).toLowerCase();
++  if (allowed.length === 0) {
++    throw blocked(
++      `no pinned code hash for receiver ${input.receiver}; live codehash=${codeHash}. Set LIQUIDATION_RECEIVER_CODEHASH after verifying the calldata layout`,
++    );
++  }
++  if (!allowed.includes(codeHash)) {
++    throw blocked(`receiver code hash mismatch at ${input.receiver}: live=${codeHash} allowed=${allowed.join(",")}`);
++  }
++
++  const version = await readOrBlock(client, input.receiver, "receiverVersion");
+   if (version !== 1n) {
+-    throw new Error(`Liquidation receiver version mismatch: expected 1, got ${version.toString()}`);
++    throw new Error(`Liquidation receiver version mismatch: expected 1, got ${String(version)}`);
+   }
+ 
+   const expectedPool = getChainConfig(input.chain).aave.pool;
+-  const boundPool = await client.readContract({
+-    address: input.receiver,
+-    abi: liquidationFlashReceiverAbi,
+-    functionName: "aavePool",
+-  });
++  const boundPool = await readOrBlock(client, input.receiver, "aavePool") as Address;
+   if (boundPool.toLowerCase() !== expectedPool.toLowerCase()) {
+     throw new Error(
+       `Liquidation receiver is bound to the wrong Aave pool on ${input.chain}: expected ${expectedPool}, got ${boundPool}`,
+     );
+   }
+ 
+-  const boundRouter = await client.readContract({
+-    address: input.receiver,
+-    abi: liquidationFlashReceiverAbi,
+-    functionName: "swapRouter",
+-  });
++  const boundRouter = await readOrBlock(client, input.receiver, "swapRouter") as Address;
+   if (boundRouter.toLowerCase() !== input.expectedSwapRouter.toLowerCase()) {
+     throw new Error(
+       `Liquidation receiver swap router mismatch on ${input.chain}: expected ${input.expectedSwapRouter}, got ${boundRouter}`,
+     );
+   }
++
++  if (input.layoutProbe ?? true) {
++    await assertReceiverLayoutProbe(client, input.chain, input.receiver, expectedPool);
++  }
++}
++
++export function buildLayoutProbeCalldata(chain: SupportedChain, receiver: Address, params?: Hex): Hex {
++  const pair = getChainConfig(chain).aave.reservePairs[0]!;
++  return encodeFunctionData({
++    abi: receiverExecuteOperationAbi,
++    functionName: "executeOperation",
++    args: [
++      pair.debtAsset,
++      1n,
++      0n,
++      receiver,
++      params ?? encodeLiquidationRoute({
++        collateralAsset: pair.collateralAsset,
++        debtAsset: pair.debtAsset,
++        user: LAYOUT_PROBE_USER,
++        debtToCover: 1n,
++        receiveAToken: false,
++      }),
++    ],
++  });
++}
++
++/** "HF_NOT_LIQUIDATABLE" as Error(string) revert data prefix check. */
++const hfNotLiquidatableHex = Buffer.from("HF_NOT_LIQUIDATABLE", "utf8").toString("hex");
++
++export type LayoutProbeOutcome =
++  | { readonly ok: true; readonly reason: "HF_NOT_LIQUIDATABLE" | "HealthFactorNotBelowThreshold" }
++  | { readonly ok: false; readonly reason: string };
++
++export function classifyLayoutProbeRevert(data: string | undefined): LayoutProbeOutcome {
++  if (data === undefined || data === "0x" || data === "") {
++    return { ok: false, reason: "empty_revert (calldata layout mismatch)" };
++  }
++  const lower = data.toLowerCase();
++  if (lower.startsWith(AAVE_HF_NOT_BELOW_THRESHOLD_SELECTOR)) {
++    return { ok: true, reason: "HealthFactorNotBelowThreshold" };
++  }
++  if (lower.startsWith("0x08c379a0") && lower.includes(hfNotLiquidatableHex)) {
++    return { ok: true, reason: "HF_NOT_LIQUIDATABLE" };
++  }
++  if (lower.startsWith(RECEIVER_DEBT_ASSET_MISMATCH_SELECTOR)) {
++    return { ok: false, reason: "DebtAssetMismatch (calldata layout mismatch)" };
++  }
++  return { ok: false, reason: `unexpected_revert:${lower.slice(0, 74)}` };
++}
++
++async function assertReceiverLayoutProbe(
++  client: ReceiverReadinessClient,
++  chain: SupportedChain,
++  receiver: Address,
++  pool: Address,
++): Promise<void> {
++  if (client.call === undefined) {
++    throw blocked("layout probe requires eth_call support on the readiness client");
++  }
++  const data = buildLayoutProbeCalldata(chain, receiver);
++  let revertData: string | undefined;
++  try {
++    await client.call({ account: pool, to: receiver, data });
++    throw blocked(`layout probe unexpectedly succeeded at ${receiver} (expected HF_NOT_LIQUIDATABLE revert)`);
++  } catch (error) {
++    if (error instanceof Error && error.message.startsWith("LIQUIDATION_RECEIVER_READINESS_BLOCKED")) {
++      throw error;
++    }
++    revertData = extractRevertData(error);
++    if (revertData === undefined && !isExecutionRevert(error)) {
++      throw blocked(`layout probe eth_call failed (RPC): ${firstLine(error)}`);
++    }
++  }
++  const outcome = classifyLayoutProbeRevert(revertData);
++  if (!outcome.ok) {
++    throw blocked(`layout probe failed at ${receiver}: ${outcome.reason}`);
++  }
++}
++
++async function readOrBlock(
++  client: ReceiverReadinessClient,
++  receiver: Address,
++  functionName: "receiverVersion" | "aavePool" | "swapRouter",
++): Promise<unknown> {
++  try {
++    return await client.readContract({ address: receiver, abi: liquidationFlashReceiverAbi, functionName });
++  } catch (error) {
++    throw blocked(`${functionName}() read failed at ${receiver}: ${firstLine(error)}`);
++  }
++}
++
++export function extractRevertData(error: unknown): string | undefined {
++  let current: unknown = error;
++  for (let depth = 0; depth < 8 && 
