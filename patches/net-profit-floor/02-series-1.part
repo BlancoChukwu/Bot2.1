@@ -1,0 +1,414 @@
+   const orchestrator = new PipelineOrchestrator({
+     registry,
+     detection,
+     executor,
+     deadLetters: new PipelineDeadLetterQueue(),
+     liquidationGate,
++    ...(receiverSweeper === undefined
++      ? {}
++      : {
++        onLiquidationFilled: (fill) => receiverSweeper.scheduleAfterFill({
++          opportunityId: fill.opportunityId,
++          txHash: fill.txHash,
++          collateralAsset: fill.candidate.collateralAsset,
++          debtAsset: fill.candidate.debtAsset,
++        }),
++      }),
+     simFailureCircuit,
+     ...(watchlistCoordinator === undefined
+       ? {}
+@@ -1631,6 +1675,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
+     }
+   });
+   shutdown.addHook("arb_queue_stop", async () => arbQueue.stop());
++  shutdown.addHook("receiver_sweep_stop", async () => receiverSweeper?.stop());
+   shutdown.addHook("oracle_poll_stop", async () => priceOracleCache?.stopBackgroundPoll());
+@SP@
+   return new PipelineBotRunner(
+diff --git a/src/orchestrator/pipelineOrchestrator.ts b/src/orchestrator/pipelineOrchestrator.ts
+index 333076a..61f7d3d 100644
+--- a/src/orchestrator/pipelineOrchestrator.ts
++++ b/src/orchestrator/pipelineOrchestrator.ts
+@@ -1,4 +1,4 @@
+-import type { Address } from "viem";
++import type { Address, Hash } from "viem";
+ import type { BotMetrics, LoggerLike } from "../bot";
+ import type { ChainRegistry, CircuitBreakerName, CircuitBreakerState } from "../config/chainRegistry";
+ import type { SupportedChain } from "../config/chains";
+@@ -73,6 +73,16 @@ export interface PipelineOrchestratorConfig {
+     opportunity: Opportunity,
+   ): SafeExecutionRequest | undefined | Promise<SafeExecutionRequest | undefined>;
+   readonly liquidationGate?: LiquidationCandidateGate;
++  /**
++   * Called AFTER a confirmed liquidation fill (receipt success) has been recorded/logged. Fire-and-forget: it is
++   * invoked inside its own try/catch and must never block or mask the fill result (used for the receiver sweep).
++   */
++  readonly onLiquidationFilled?: (fill: {
++    readonly chain: SupportedChain;
++    readonly opportunityId: string;
++    readonly txHash: Hash;
++    readonly candidate: LiquidationCandidate;
++  }) => void;
+   readonly watchlistStaleness?: StalenessGuard;
+   /** Event-watchlist periodic HF sweep (e.g. when block WS subscription is unavailable). */
+   readonly watchlistSweep?: (chain: SupportedChain) => Promise<void>;
+@@ -371,6 +381,8 @@ export class PipelineOrchestrator {
+     try {
+       const result = await this.config.executor.execute(request);
+       this.recordExecutionResult(plan, request, result, summary);
++      // Fill is logged/recorded above; the sweep hook is fire-and-forget and cannot delay or mask it.
++      this.notifyLiquidationFilled(plan, request, result);
+       await this.recordLearningOutcome(plan, toLearningOutcome(result));
+     } catch (error) {
+       summary.failed += 1;
+@@ -385,6 +397,36 @@ export class PipelineOrchestrator {
+     }
+   }
+@SP@
++  /** Post-fill hook, after the fill record + learning outcome are written. Never throws. */
++  private notifyLiquidationFilled(
++    plan: PipelineExecutionPlan,
++    request: SafeExecutionRequest,
++    result: SafeExecutionResult,
++  ): void {
++    if (
++      result.status !== "sent"
++      || plan.opportunity.kind !== "liquidation"
++      || this.config.onLiquidationFilled === undefined
++    ) {
++      return;
++    }
++    try {
++      this.config.onLiquidationFilled({
++        chain: request.chain,
++        opportunityId: request.opportunityId,
++        txHash: result.txHash,
++        candidate: plan.opportunity.candidate,
++      });
++    } catch (error) {
++      this.config.logger.error("receiver_sweep_failed", {
++        chain: request.chain,
++        opportunityId: request.opportunityId,
++        phase: "post_fill_hook",
++        error: error instanceof Error ? error.message : String(error),
++      });
++    }
++  }
++
+   private recordExecutionResult(
+     plan: PipelineExecutionPlan,
+     request: SafeExecutionRequest,
+diff --git a/test/integration/pipelineOrchestrator.sweepHook.test.ts b/test/integration/pipelineOrchestrator.sweepHook.test.ts
+new file mode 100644
+index 0000000..018243d
+--- /dev/null
++++ b/test/integration/pipelineOrchestrator.sweepHook.test.ts
+@@ -0,0 +1,116 @@
++import { describe, expect, it } from "vitest";
++import type { Address } from "viem";
++import { createBotMetrics, createLogger } from "../../src/bot";
++import { createChainRegistry } from "../../src/config/chainRegistry";
++import { PipelineDeadLetterQueue, PipelineOrchestrator } from "../../src/orchestrator/pipelineOrchestrator";
++import { ReserveAwareBorrowerCache, type BorrowerSnapshot } from "../../src/monitors/reserveAwareBorrowerCache";
++import type { SafeExecutionRequest } from "../../src/executors/safeTransactionExecutor";
++import { createAsset, createAssetAmount } from "../../src/utils/typedAssetMath";
++
++const usd = createAsset({ symbol: "USD", decimals: 8 });
++const usdc = createAsset({ symbol: "USDC", decimals: 6 });
++const weth = createAsset({ symbol: "WETH", decimals: 18 });
++const wethAddress = "0x4200000000000000000000000000000000000006";
++const usdcAddress = "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85";
++
++function snapshot(account: Address): BorrowerSnapshot {
++  return {
++    chain: "optimism",
++    account,
++    healthFactor: 900_000_000_000_000_000n,
++    updatedAtMs: 1_000,
++    reserves: [
++      {
++        assetAddress: wethAddress,
++        asset: weth,
++        collateralBalance: createAssetAmount(weth, 1_000_000_000_000_000_000n),
++        variableDebt: createAssetAmount(weth, 0n),
++        stableDebt: createAssetAmount(weth, 0n),
++        priceInQuote: createAssetAmount(usd, 300_000_000_000n),
++        usageAsCollateralEnabled: true,
++        liquidationBonusBps: 500,
++      },
++      {
++        assetAddress: usdcAddress,
++        asset: usdc,
++        collateralBalance: createAssetAmount(usdc, 0n),
++        variableDebt: createAssetAmount(usdc, 2_000_000_000n),
++        stableDebt: createAssetAmount(usdc, 0n),
++        priceInQuote: createAssetAmount(usd, 100_000_000n),
++        usageAsCollateralEnabled: false,
++        liquidationBonusBps: 0,
++      },
++    ],
++  };
++}
++
++function requestFor(account: Address): SafeExecutionRequest {
++  return {
++    chain: "optimism",
++    account,
++    opportunityId: `op:${account}`,
++    gasProfileKey: "aaveV3:flashLiquidation",
++    routeInput: {
++      chain: "optimism",
++      opportunityId: `op:${account}`,
++      revenue: createAssetAmount(usd, 10_000_000_000n),
++      debt: createAssetAmount(usd, 9_800_000_000n),
++      gas: createAssetAmount(usd, 25_000_000n),
++      swapCost: createAssetAmount(usd, 5_000_000n),
++      slippageBuffer: createAssetAmount(usd, 10_000_000n),
++      safetyBuffer: createAssetAmount(usd, 5_000_000n),
++      capitalAtRisk: createAssetAmount(usd, 9_800_000_000n),
++      minimumMarginBps: 50,
++    },
++    buildTransaction: (route) => ({
++      to: "0x0000000000000000000000000000000000000002",
++      data: "0x1234",
++      provider: route.provider,
++    }),
++  };
++}
++
++function build(onLiquidationFilled: (fill: unknown) => void, logs: { name: string }[]) {
++  const account = "0x0000000000000000000000000000000000000001";
++  const cache = new ReserveAwareBorrowerCache();
++  cache.upsert(snapshot(account));
++  const logger = createLogger("silent");
++  const spy = { ...logger, info: (m: string) => { logs.push({ name: m }); }, warn: () => undefined, error: (m: string) => { logs.push({ name: m }); } };
++  const orchestrator = new PipelineOrchestrator({
++    registry: createChainRegistry({
++      chains: [{ chain: "optimism", rpcUrl: "https://optimism.example", fallbackRpcUrls: [], aaveSubgraphUrl: "https://subgraph.example", flashLoanProviders: ["aaveV3"] }],
++    }),
++    detection: { cache, start: async () => undefined, stop: () => undefined, pollFallback: async () => undefined, getCircuitBreakerState: () => ({ status: "closed", failures: 0 }) },
++    executor: { execute: async () => ({ status: "sent", txHash: "0xabc" }) },
++    deadLetters: new PipelineDeadLetterQueue(),
++    logger: spy as never,
++    metrics: createBotMetrics(),
++    buildExecutionRequest: (candidate) => requestFor(candidate.account),
++    onLiquidationFilled: onLiquidationFilled as never,
++  });
++  return orchestrator;
++}
++
++describe("PipelineOrchestrator post-fill sweep hook", () => {
++  it("fires after pipeline_execution_sent is logged, with the fill's assets", async () => {
++    const logs: { name: string }[] = [];
++    const seen: unknown[] = [];
++    const orchestrator = build((fill) => { seen.push(fill); logs.push({ name: "HOOK" }); }, logs);
++    const summary = await orchestrator.runOnce();
++    expect(summary).toMatchObject({ sent: 1, failed: 0 });
++    expect(seen).toHaveLength(1);
++    expect(seen[0]).toMatchObject({ chain: "optimism", txHash: "0xabc", candidate: { collateralAsset: wethAddress, debtAsset: usdcAddress } });
++    const names = logs.map((l) => l.name);
++    expect(names.indexOf("pipeline_execution_sent")).toBeGreaterThanOrEqual(0);
++    expect(names.indexOf("HOOK")).toBeGreaterThan(names.indexOf("pipeline_execution_sent"));
++  });
++
++  it("a throwing hook cannot mask or fail the fill: sent counted, no dead-letter, distinct error event", async () => {
++    const logs: { name: string }[] = [];
++    const orchestrator = build(() => { throw new Error("sweep exploded"); }, logs);
++    const summary = await orchestrator.runOnce();
++    expect(summary).toMatchObject({ attempted: 1, sent: 1, failed: 0, deadLetters: 0 });
++    expect(logs.map((l) => l.name)).toContain("pipeline_execution_sent");
++    expect(logs.map((l) => l.name)).toContain("receiver_sweep_failed");
++  });
++});
+diff --git a/test/integration/receiverSweep.fork.test.ts b/test/integration/receiverSweep.fork.test.ts
+new file mode 100644
+index 0000000..e283039
+--- /dev/null
++++ b/test/integration/receiverSweep.fork.test.ts
+@@ -0,0 +1,125 @@
++/**
++ * Fork test: fill-residual then sweep against the REAL live v1 receiver bytecode/state on a local anvil fork of Base.
++ *
++ * Opt-in (network + anvil binary): RUN_FORK_TESTS=1 ANVIL_BIN=/path/to/anvil BASE_FORK_URL=https://mainnet.base.org
++ * KEYLESS: uses anvil `--auto-impersonate`/`anvil_impersonateAccount` for the receiver's on-chain owner
++ * (0x922B…3842, the bot executor wallet) — no private key of any kind is used or needed, and nothing is ever signed
++ * or broadcast to mainnet (anvil is a local sandbox; the fork only READS Base state).
++ */
++import { spawn, type ChildProcess } from "node:child_process";
++import { createPublicClient, createWalletClient, encodeAbiParameters, http, keccak256, parseAbi, type Address } from "viem";
++import { base } from "viem/chains";
++import { afterAll, beforeAll, describe, expect, it } from "vitest";
++import { ReceiverSweeper } from "../../src/executors/receiverSweeper";
++import { LocalNonceManager } from "../../src/executors/nonceManager";
++
++const RUN = process.env.RUN_FORK_TESTS === "1";
++const ANVIL = process.env.ANVIL_BIN ?? "anvil";
++const FORK_URL = process.env.BASE_FORK_URL ?? "https://mainnet.base.org";
++const PORT = 18545 + Math.floor(Math.random() * 500);
++const RPC = `http://127.0.0.1:${PORT}`;
++
++const RECEIVER = "0x379ce85b431bd4cb3b2b11d682bac4556648ada6" as Address;
++const OWNER = "0x922BfCcb570C0847001A3E6746c2980EE0053842" as Address; // live bot executor wallet == receiver _owner
++const STRANGER = "0x00000000000000000000000000000000000000aa" as Address;
++const WETH = "0x4200000000000000000000000000000000000006" as Address;
++const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
++const CBBTC = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
++const erc20 = parseAbi(["function balanceOf(address) view returns (uint256)"]);
++
++let proc: ChildProcess | undefined;
++
++async function rpc(method: string, params: unknown[]): Promise<unknown> {
++  const res = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
++  const json = await res.json() as { result?: unknown; error?: { message: string } };
++  if (json.error) throw new Error(json.error.message);
++  return json.result;
++}
++
++/** Give the receiver `amount` of a token by writing its balances mapping slot (deal-style). */
++async function deal(token: Address, slot: bigint, amount: bigint): Promise<void> {
++  const key = keccak256(encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [RECEIVER, slot]));
++  await rpc("anvil_setStorageAt", [token, key, `0x${amount.toString(16).padStart(64, "0")}`]);
++}
++
++describe.skipIf(!RUN)("receiver sweep on Base fork (keyless, impersonated owner)", () => {
++  const pub = createPublicClient({ chain: base, transport: http(RPC) });
++
++  beforeAll(async () => {
++    proc = spawn(ANVIL, ["--fork-url", FORK_URL, "--port", String(PORT), "--chain-id", "8453", "--silent"], { stdio: "ignore" });
++    for (let i = 0; i < 90; i += 1) {
++      try { await rpc("eth_blockNumber", []); break; } catch { await new Promise((r) => setTimeout(r, 500)); }
++    }
++    await rpc("anvil_impersonateAccount", [OWNER]);
++    await rpc("anvil_impersonateAccount", [STRANGER]);
++    await rpc("anvil_setBalance", [OWNER, "0x56BC75E2D63100000"]);
++    await rpc("anvil_setBalance", [STRANGER, "0x56BC75E2D63100000"]);
++  }, 60_000);
++
++  afterAll(() => { proc?.kill("SIGTERM"); });
++
++  function sweeperFor(signer: Address, live = true) {
++    const wallet = createWalletClient({ chain: base, transport: http(RPC), account: signer });
++    return new ReceiverSweeper({
++      chain: "base",
++      receiver: RECEIVER,
++      signer: { address: signer },
++      publicClient: pub as never,
++      walletClient: wallet as never,
++      nonceManager: new LocalNonceManager(),
++      logger: { info: () => undefined, warn: () => undefined, error: () => undefined },
++      tokens: () => [WETH, USDC, CBBTC],
++      live,
++      maxAttempts: 2,
++      backoffBaseMs: 10,
++    });
++  }
++
++  it("live receiver is real v1 (bytecode present) and onlyOwner: owner eth_call ok, stranger reverts", async () => {
++    expect((await pub.getCode({ address: RECEIVER }))?.length).toBeGreaterThan(2_000);
++    expect(await sweeperFor(OWNER).verifyAuthorization(USDC)).toBe(true);
++    expect(await sweeperFor(STRANGER).verifyAuthorization(USDC)).toBe(false);
++  }, 60_000);
++
++  it("fill residual (WETH slot 3, USDC slot 9, dust cbBTC) -> sweep moves FULL balances to the executor wallet", async () => {
++    // Post-fill leftovers left on the receiver (as after a swap that over-delivers / a partial fill).
++    await deal(WETH, 3n, 123_456_789_012_345_678n);
++    await deal(USDC, 9n, 7_654_321n);
++    const before = {
++      recvWeth: await pub.readContract({ address: WETH, abi: erc20, functionName: "balanceOf", args: [RECEIVER] }),
++      recvUsdc: await pub.readContract({ address: USDC, abi: erc20, functionName: "balanceOf", args: [RECEIVER] }),
++      ownerWeth: await pub.readContract({ address: WETH, abi: erc20, functionName: "balanceOf", args: [OWNER] }),
++      ownerUsdc: await pub.readContract({ address: USDC, abi: erc20, functionName: "balanceOf", args: [OWNER] }),
++      strangerWeth: await pub.readContract({ address: WETH, abi: erc20, functionName: "balanceOf", args: [STRANGER] }),
++    };
++    expect(before.recvWeth).toBe(123_456_789_012_345_678n);
++    expect(before.recvUsdc).toBe(7_654_321n);
++
++    const sweeper = sweeperFor(OWNER);
++    const out = await sweeper.sweepConfiguredTokens();
++    expect(out.find(([t]) => t === WETH)?.[1].status).toBe("swept");
++    expect(out.find(([t]) => t === USDC)?.[1].status).toBe("swept");
++    expect(out.find(([t]) => t === CBBTC)?.[1].status).toBe("skipped_zero_balance");
++
++    const read = (token: Address, who: Address) => pub.readContract({ address: token, abi: erc20, functionName: "balanceOf", args: [who] });
++    expect(await read(WETH, RECEIVER)).toBe(0n);
++    expect(await read(USDC, RECEIVER)).toBe(0n);
++    expect(await read(WETH, OWNER)).toBe(before.ownerWeth + before.recvWeth);
++    expect(await read(USDC, OWNER)).toBe(before.ownerUsdc + before.recvUsdc);
++    expect(await read(WETH, STRANGER)).toBe(before.strangerWeth); // nobody but the executor received funds
++  }, 90_000);
++
++  it("a non-owner signer cannot sweep (receiver funds untouched, failure surfaces, no throw)", async () => {
++    await deal(USDC, 9n, 1_000_000n);
++    const out = await sweeperFor(STRANGER).sweepConfiguredTokens();
++    expect(out.find(([t]) => t === USDC)?.[1].status).toBe("failed");
++    expect(await pub.readContract({ address: USDC, abi: erc20, functionName: "balanceOf", args: [RECEIVER] })).toBe(1_000_000n);
++  }, 60_000);
++
++  it("not-live sweeper leaves funds in place", async () => {
++    await deal(USDC, 9n, 42n);
++    const out = await sweeperFor(OWNER, false).sweepConfiguredTokens();
++    expect(out.find(([t]) => t === USDC)?.[1]).toEqual({ status: "dry_run", balance: 42n });
++    expect(await pub.readContract({ address: USDC, abi: erc20, functionName: "balanceOf", args: [RECEIVER] })).toBe(42n);
++  }, 60_000);
++});
+diff --git a/test/unit/receiverSweeper.test.ts b/test/unit/receiverSweeper.test.ts
+new file mode 100644
+index 0000000..e197a0e
+--- /dev/null
++++ b/test/unit/receiverSweeper.test.ts
+@@ -0,0 +1,176 @@
++import { describe, expect, it, vi } from "vitest";
++import { decodeFunctionData, parseAbi, type Address } from "viem";
++import { ReceiverSweeper, type ReceiverSweeperConfig } from "../../src/executors/receiverSweeper";
++import { LocalNonceManager } from "../../src/executors/nonceManager";
++
++const RECEIVER = "0x379ce85b431bd4cb3b2b11d682bac4556648ada6" as Address;
++const EXECUTOR = "0x922BfCcb570C0847001A3E6746c2980EE0053842" as Address;
++const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
++const WETH = "0x4200000000000000000000000000000000000006" as Address;
++const CBBTC = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address;
++const rescueAbi = parseAbi(["function rescue(address token, address to, uint256 amount)"]);
++
++function harness(over: Partial<ReceiverSweeperConfig> & { balances?: Record<string, bigint>; failSendTimes?: number; live?: boolean } = {}) {
++  const balances: Record<string, bigint> = { ...(over.balances ?? {}) };
++  const sent: { to: Address; data: `0x${string}` }[] = [];
++  let sendFailures = over.failSendTimes ?? 0;
++  const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
++  const alert = vi.fn();
++  const sleeps: number[] = [];
++  const publicClient = {
++    readContract: vi.fn(async (args: Record<string, unknown>) => balances[(args.address as string).toLowerCase()] ?? 0n),
++    call: vi.fn(async () => "0x"),
++    estimateGas: vi.fn(async () => 100_000n),
++    getGasPrice: vi.fn(async () => 1_000_000n),
++    getTransactionCount: vi.fn(async () => 7),
++    waitForTransactionReceipt: vi.fn(async () => ({ status: "success" as const })),
++  };
++  const walletClient = {
++    account: { address: EXECUTOR },
++    sendTransaction: vi.fn(async (args: Record<string, unknown>) => {
++      if (sendFailures > 0) {
++        sendFailures -= 1;
++        throw new Error("rpc boom");
++      }
++      sent.push({ to: args.to as Address, data: args.data as `0x${string}` });
++      const { args: decoded } = decodeFunctionData({ abi: rescueAbi, data: args.data as `0x${string}` });
++      balances[(decoded![0] as string).toLowerCase()] = 0n;
++      return `0x${"ab".repeat(32)}` as `0x${string}`;
++    }),
++  };
++  const sweeper = new ReceiverSweeper({
++    chain: "base",
++    receiver: RECEIVER,
++    signer: { address: EXECUTOR },
++    publicClient,
++    walletClient,
++    nonceManager: new LocalNonceManager(),
++    logger,
++    tokens: () => [WETH, USDC, CBBTC],
++    live: over.live ?? true,
++    alert,
++    backoffBaseMs: 10,
++    sleep: async (ms) => { sleeps.push(ms); },
++    ...over,
++  });
