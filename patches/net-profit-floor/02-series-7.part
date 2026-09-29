@@ -1,0 +1,184 @@
++    const b = gate({ priceOracle: untrustedOracle });
++    await b.g.filterCandidates("base", [candidate(30_000_000n, 30)], "t");
++    expect(shadowLogs(b.logger)).toHaveLength(1);
++    expect(shadowLogs(b.logger)[0]).toMatchObject({ debtTrusted: false, net025: false, net1: false, net5: false, debt50: false, livePass: false });
++  });
++
++  it("shadow is emitted even for borrower-cooldown-free paths with oracle sanity failure, and counters accumulate", async () => {
++    const { g, logger } = gate({ oracleSanityCheck: async () => ({ pass: false, deviationPct: 9 }) });
++    await g.filterCandidates("base", [candidate(600_000_000n, 600)], "t");
++    expect(shadowLogs(logger)[0]).toMatchObject({ net5: true, debt50: true, livePass: false });
++    expect(g.floorShadowCounters.snapshot()).toMatchObject({ total: 1, net5: 1, debt50: 1, live: 0 });
++  });
++
++  it("missing gas (0 / NaN) or missing protocol fee never passes", async () => {
++    for (const gas of [0, Number.NaN]) {
++      const { g } = gate({ resolveGasCostUsd: async () => gas });
++      expect(await g.filterCandidates("base", [candidate(600_000_000n, 600)], "t")).toHaveLength(0);
++    }
++    const { g, logger } = gate();
++    expect(await g.filterCandidates("base", [candidate(600_000_000n, 600, { noProtocolFee: true })], "t")).toHaveLength(0);
++    const evaluated = logger.info.mock.calls.find((c) => c[0] === "liquidation_evaluated")![1] as Record<string, unknown>;
++    expect(evaluated).toMatchObject({ pass: false, reason: "inputs_missing", netProfitUsd: null });
++  });
++
++  it("uses the on-chain effective bonus (not the config default) and fails closed if verdict debt exceeds real on-chain debt", async () => {
++    const oracle = { forceRefreshUsdPrices: async () => ({ [debtAsset]: 100_000_000n, [collateralAsset]: 300_000_000_000n }) } as unknown as PriceOracleCache;
++    const { g, logger } = gate({ priceOracle: oracle });
++    // expected repaid raw = 600 USDC but real actual debt only 100 USDC => inconsistent => reject
++    const inconsistent = candidate(600_000_000n, 600, { actualDebtRaw: 100_000_000n, expectedDebtRepaidRaw: 600_000_000n });
++    expect(await g.filterCandidates("base", [inconsistent], "t")).toHaveLength(0);
++    expect(logger.info.mock.calls.find((c) => c[0] === "liquidation_evaluated")![1]).toMatchObject({ debtExceedsOnChainDebt: true, pass: false });
++    const consistent = candidate(600_000_000n, 600, { actualDebtRaw: 1_200_000_000n, expectedDebtRepaidRaw: 600_000_000n, effectiveLiquidationBonusBps: 1_000 });
++    const kept = await g.filterCandidates("base", [consistent], "t");
++    expect(kept).toHaveLength(1);
++    const evals = logger.info.mock.calls.filter((c) => c[0] === "liquidation_evaluated");
++    expect((evals[1]![1] as Record<string, unknown>).bonusRate).toBeCloseTo(0.1, 9);
+   });
+ });
+diff --git a/test/unit/liquidationProfitabilityGate.test.ts b/test/unit/liquidationProfitabilityGate.test.ts
+index 79819df..9dd3107 100644
+--- a/test/unit/liquidationProfitabilityGate.test.ts
++++ b/test/unit/liquidationProfitabilityGate.test.ts
+@@ -1,28 +1,146 @@
+ import { describe, expect, it } from "vitest";
+-import { evaluateLiquidationProfitability } from "../../src/profitability/liquidationProfitabilityGate";
+-
+-describe("evaluateLiquidationProfitability", () => {
+-  it("uses max(dynamicFloor, hardFloor) as effective gate", () => {
+-    const result = evaluateLiquidationProfitability({
+-      debtUsd: 80,
+-      liquidationBonusBps: 500,
+-      gasCostUsd: 2,
+-      flashFeeBps: 5,
+-      hardFloorUsd: 50,
+-    });
+-    expect(result.effectiveFloor).toBe(Math.max(result.dynamicFloor, 50));
+-    expect(result.pass).toBe(80 >= result.effectiveFloor);
++import {
++  computeFloorShadow,
++  estimateLiquidationGasCostUsd,
++  evaluateLiquidationProfitability,
++  FloorShadowCounters,
++  type LiquidationProfitabilityInput,
++} from "../../src/profitability/liquidationProfitabilityGate";
++
++// bonus 5%, protocol fee 10% of bonus, flash 5bps, swap 30bps, slippage 20bps
++const base: LiquidationProfitabilityInput = {
++  debtUsd: 1_000,
++  liquidationBonusBps: 500,
++  liquidationProtocolFeeBps: 1_000,
++  gasCostUsd: 0.1,
++  flashFeeBps: 5,
++  swapRequired: true,
++  swapFeeBps: 30,
++  slippageBps: 20,
++  minNetProfitUsd: 1,
++  minDebtSanityUsd: 5,
++};
++
++describe("evaluateLiquidationProfitability (net-profit floor)", () => {
++  it("computes net = bonus*(1-protocolFee) - gas - flash - swapFee - slippage", () => {
++    const r = evaluateLiquidationProfitability(base);
++    // bonus 50, protocol 5 => 45 ; flash 0.5 ; swapped 1050 => fee 3.15, slip 2.1 ; gas 0.1
++    expect(r.bonusCaptureUsd).toBeCloseTo(45, 9);
++    expect(r.protocolFeeUsd).toBeCloseTo(5, 9);
++    expect(r.flashFeeUsd).toBeCloseTo(0.5, 9);
++    expect(r.swapFeeUsd).toBeCloseTo(3.15, 9);
++    expect(r.slippageUsd).toBeCloseTo(2.1, 9);
++    expect(r.netProfitUsd).toBeCloseTo(45 - 0.1 - 0.5 - 3.15 - 2.1, 9);
++    expect(r.pass).toBe(true);
++    expect(r.reason).toBe("ok");
++  });
++
++  it("$50 is no longer a hard gate: a $30 debt with positive net >= $1 PASSES; $60 with net < $1 FAILS", () => {
++    const small = evaluateLiquidationProfitability({ ...base, debtUsd: 30 });
++    expect(small.netProfitUsd!).toBeCloseTo(30 * 0.03925 - 0.1, 9); // ~1.0775
++    expect(small.pass).toBe(true);
++    const bigButGassy = evaluateLiquidationProfitability({ ...base, debtUsd: 60, gasCostUsd: 2 });
++    expect(bigButGassy.netProfitUsd!).toBeLessThan(1);
++    expect(bigButGassy.pass).toBe(false); // >$50 debt no longer implies pass
++  });
++
++  it("barely over / barely under the net floor (edge)", () => {
++    const at = evaluateLiquidationProfitability(base);
++    const perUsd = (at.netProfitUsd! + base.gasCostUsd!) / base.debtUsd; // net per $ of debt before gas
++    // Solve debt where net == 1.0 exactly
++    const debtAtFloor = (base.gasCostUsd! + 1) / perUsd;
++    const over = evaluateLiquidationProfitability({ ...base, debtUsd: debtAtFloor + 0.01 });
++    const exact = evaluateLiquidationProfitability({ ...base, debtUsd: debtAtFloor });
++    const under = evaluateLiquidationProfitability({ ...base, debtUsd: debtAtFloor - 0.01 });
++    expect(over.pass).toBe(true);
++    expect(exact.netProfitUsd!).toBeCloseTo(1, 9);
++    expect(under.pass).toBe(false);
++    expect(under.reason).toBe("below_min_net_profit");
++    expect(under.netProfitUsd!).toBeLessThan(1);
++    expect(over.dynamicFloor).toBeCloseTo(debtAtFloor, 6);
++  });
++
++  it("high gas makes a big debt fail; low gas lets a small debt pass (no $50 cliff)", () => {
++    expect(evaluateLiquidationProfitability({ ...base, debtUsd: 500, gasCostUsd: 20 }).pass).toBe(false);
++    const small = evaluateLiquidationProfitability({ ...base, debtUsd: 40, gasCostUsd: 0.02 });
++    expect(small.netProfitUsd!).toBeCloseTo(40 * 0.045 - 0.02 - 40 * 0.0005 - 42 * 0.003 - 42 * 0.002, 9);
++    expect(small.pass).toBe(small.netProfitUsd! >= 1);
++  });
++
++  it("debt sanity floor is independent: net ok but debt < sanity => fail with its own reason", () => {
++    const r = evaluateLiquidationProfitability({ ...base, debtUsd: 20, minDebtSanityUsd: 25, minNetProfitUsd: 0.01 });
++    expect(r.netProfitUsd!).toBeGreaterThan(0.01);
++    expect(r.pass).toBe(false);
++    expect(r.reason).toBe("below_debt_sanity_floor");
++  });
++
++  it("same-asset (no swap leg) omits swap fee + slippage and needs no swap inputs", () => {
++    const r = evaluateLiquidationProfitability({ ...base, swapRequired: false, swapFeeBps: undefined, slippageBps: undefined });
++    expect(r.inputsOk).toBe(true);
++    expect(r.swapFeeUsd).toBe(0);
++    expect(r.slippageUsd).toBe(0);
+   });
+@SP@
+-  it("fails sub-dollar dust even when hard floor is low", () => {
+-    const result = evaluateLiquidationProfitability({
+-      debtUsd: 1,
+-      liquidationBonusBps: 500,
+-      gasCostUsd: 5,
+-      flashFeeBps: 5,
+-      hardFloorUsd: 50,
++  describe("fail closed — missing inputs never silently pass", () => {
++    const cases: [string, Partial<LiquidationProfitabilityInput>, string][] = [
++      ["gas undefined", { gasCostUsd: undefined }, "gasCostUsd"],
++      ["gas NaN (missing native price)", { gasCostUsd: Number.NaN }, "gasCostUsd"],
++      ["gas 0 (config default, not real)", { gasCostUsd: 0 }, "gasCostUsd"],
++      ["bonus undefined", { liquidationBonusBps: undefined }, "liquidationBonusBps"],
++      ["bonus 0", { liquidationBonusBps: 0 }, "liquidationBonusBps"],
++      ["protocol fee undefined", { liquidationProtocolFeeBps: undefined }, "liquidationProtocolFeeBps"],
++      ["protocol fee > 100%", { liquidationProtocolFeeBps: 10_001 }, "liquidationProtocolFeeBps"],
++      ["flash fee undefined", { flashFeeBps: undefined }, "flashFeeBps"],
++      ["swap fee undefined", { swapFeeBps: undefined }, "swapFeeBps"],
++      ["slippage undefined", { slippageBps: undefined }, "slippageBps"],
++      ["debt price missing => debtUsd 0", { debtUsd: 0 }, "debtUsd"],
++      ["debt NaN", { debtUsd: Number.NaN }, "debtUsd"],
++    ];
++    for (const [name, patch, field] of cases) {
++      it(name, () => {
++        const r = evaluateLiquidationProfitability({ ...base, ...patch });
++        expect(r.pass).toBe(false);
++        expect(r.reason).toBe("inputs_missing");
++        expect(r.missingInputs).toContain(field);
++        expect(r.netProfitUsd).toBeNull();
++      });
++    }
++    it("even with floors set to 0 a missing input still fails", () => {
++      const r = evaluateLiquidationProfitability({ ...base, gasCostUsd: undefined, minNetProfitUsd: 0, minDebtSanityUsd: 0 });
++      expect(r.pass).toBe(false);
+     });
+-    expect(result.pass).toBe(false);
+-    expect(result.netProfitUsd).toBeLessThan(0);
++  });
++
++  it("estimateLiquidationGasCostUsd returns NaN (unknown), not 0, when the native price is missing", () => {
++    expect(Number.isNaN(estimateLiquidationGasCostUsd(1_000_000n, 0n))).toBe(true);
++    expect(estimateLiquidationGasCostUsd(1_000_000_000n, 300_000_000_000n)).toBeGreaterThan(0);
++  });
++});
++
