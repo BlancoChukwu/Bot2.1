@@ -1,0 +1,49 @@
++5. Fixtures: extend `test/fixtures/base-aave-reserve-params-*.json` with the 3 reserves (incl. eMode categories 7/8/9/1, LT/bonus above) and `test/unit/baseReservePairs.test.ts`, `aaveReservePositionsBonus.test.ts` (eMode bonus 1%/2%/1.25% cases), sizing tests with 18-dec/18-dec pairs (no decimal scaling — different failure mode than USDC/WETH).
++6. Fork test (anvil, keyless — pattern in `test/integration/receiverSweep.fork.test.ts`) of an eMode-8 wstETH/WETH liquidation against a receiver v2 build.
++Effort: config+oracle+fixtures+unit tests ≈ **1–1.5 dev-days**; receiver v2 (per-call fee, new readiness pin, deploy/verify) ≈ **3–5 days** incl. audit-lite + fork proofs; **LIVE benefit is uncertain** — see A1 (thin, low-bonus, big-debt-only).
++
++## B) Sizing the Moonwell rebase (Grok-Work tip `e722227`)
++
++### B1. Lineage
++`Grok-Work` = `31aa6ec` + 9 commits (`0c99138 … e722227`), **without** `78930ac` (stale-critical fix, present on `gw-review` `1860fb0`), `2a8429f` (real debtToCover) or `9b3937b` (sizing follow-ups). Target: `9b3937b` (+ `fix/net-profit-floor`). Merge-base with `9b3937b` is `31aa6ec`.
++
++### B2. Delta to carry (11 files, +620/−38) — [V: `git diff --stat 31aa6ec e722227`]
++| File | Change | Rebase risk vs 9b3937b |
++|---|---|---|
++| `contracts/MultiProtocolFlashReceiver.sol` (+173) | Moonwell liquidate/redeem/wrap route, `authorizedInitiator`, mToken map | none in git (untouched by 9b3937b); **gate for LIVE** (B3) |
++| `src/config/chains.ts` (+71) | extra Base pairs incl. cbETH/weETH/wstETH/EURC/GHO | **CONFLICT** — 9b3937b rewrote Base pairs (`basePair()`, 6 WETH/USDC/cbBTC pairs, `swapFeeTier`) |
++| `src/config/reservePairPolicy.ts` (+43) | `selectBestReservePairForAccount` (config heuristic) | **Conflicts with lesson**: pair must come from on-chain per-reserve positions (`AaveSnapshotProvider`/liquidationSizing) — drop or reduce to Moonwell-only |
++| `src/config/moonwellBase.ts` (+85) | Moonwell Core mToken map | clean add |
++| `src/executors/moonwellLiquidationAdapter.ts` (±20) | quote-based `minCollateralOut` via `estimateMinimumCollateralOut` | **CONFLICT-ish** — 9b3937b rewrote `estimateMinimumCollateralOut` (Aave v3.3 sim, prot. fee, fail-closed undefined); adapter must handle `undefined` |
++| `scripts/deploy-liquidation-receiver-base.ts` (±5) | pass initiator + mToken arrays | clean |
++| `test/unit/baseReservePairs.test.ts` (+41) | pair tests | **CONFLICT** (9b3937b rewrote) |
++| `test/unit/moonwellRouteEncoding.test.ts`, `test/integration/multiProtocolMoonwell.fork.test.ts` (+161) | encoding parity + historical fork | clean adds; fork test needs archive RPC (block 50623620) |
++| `docs/GROK_WORK.md`, `PROGRESS_SNAPSHOT.md` | docs | trivial |
++Only **2 files overlap by path** with `31aa6ec..9b3937b` (`chains.ts`, `baseReservePairs.test.ts`) — mechanical rebase is small (~half a day), the substance is B3.
++
++### B3. Gaps vs SLD 7 pre-merge requirements (evidence: `git show e722227:contracts/MultiProtocolFlashReceiver.sol`)
++| SLD-7 item | State at e722227 | Work |
++|---|---|---|
++| **Sweep / rescue** | **No `rescue`/sweep function** (only `setAuthorizedInitiator`, `setMToken`, views). Moonwell route redeems mToken→underlying and can strand tokens/native ETH (`_wrapNativeEth`). | Solidity: add `onlyOwner rescue(token,to,amount)` + ETH rescue. Bot side: `ReceiverSweeper` (this branch) already targets `rescue(address,address,uint256)`; needs the new receiver in its token list + `verifyAuthorization` (works unchanged, receiver has `owner()`). ~1 day incl. tests |
++| **Initiator fail-closed** | `if (authorizedInitiator != address(0) && initiator != authorizedInitiator) revert` → **fail-OPEN when unset (zero)**; constructor/deploy can leave it 0. | Change to `initiator == address(0) || != authorized ⇒ revert`; require non-zero at construction; readiness probe (`eth_call` `authorizedInitiator()`) in `liquidationReceiverReadiness.ts`. ~0.5 day |
++| **minOut math** | `amountOutMinimum = minDebtOut; if 0 → 1` — **caller-supplied, 0 ⇒ 1 wei (no protection)**; encoder uses `estimateMinimumCollateralOut` which returns *collateral*-unit min and was mislabeled as debt-out in the previous impl (fixed in 9b3937b for Aave; Moonwell adapter still consumes it as debtOut — **unit mismatch risk** [U, verify in adapter]). v1 Aave receiver instead computes `need*(1-2%)` on-chain. | Compute minDebtOut on-chain from `owe - debtBal` with slippage bps (as v1), or validate `minDebtOut >= owe*(1-x)`; reject 0. Add fork test with adverse pool state. ~1 day |
++| **Real pair selector** | `selectBestReservePairForAccount` picks from config bonus heuristic (`collateralHeavy ? highest bonus : pair[0]`) — violates "pair from on-chain per-reserve positions only". | Delete for Aave path (9b3937b's `liquidationSizing` planner is the selector); Moonwell needs its own per-market position read (`mToken.balanceOfUnderlying/borrowBalanceStored`, `comptroller.getAccountLiquidity`, close factor, seize via `liquidateCalculateSeizeTokens`). New code ~300–400 LOC + tests, **2–3 days** |
++| **Build artifacts** | `contracts/build/*.json` are tracked in `e722227` **and were deleted in the `sizingfix` worktree** (`git status` shows `D`). Readiness code-hash pin is for v1 only. | Rebuild via `npm run compile:contracts`, commit artifacts with recorded solc version/optimizer, add MultiProtocol runtime code-hash pin. ~0.5 day |
++| **Receiver layout verify** | v1 readiness = code hash + 5-field layout probe. Multi-protocol uses a **different params layout** (`routeType, collateral, debt, user, debtToCover, minCollateralOut, receiveAToken` = 7 fields) and `receiverVersion` (not to be trusted per lesson). | Extend `assertLiquidationReceiverReadiness` with a per-receiver-kind code-hash + layout probe (decode a canned 7-field payload via `eth_call` to executeOperation with bad caller expecting `OnlyPool`/`UnauthorizedInitiator`). ~1 day |
++| **78930ac lineage** | Grok-Work lacks `78930ac` (fresh HF<1 arms pipeline despite stale-critical) and `2a8429f`/`9b3937b`. | Rebase onto `9b3937b` (which already includes 78930ac via `2a8429f`←`78930ac`) — resolves automatically; re-run its tests. 0 extra |
++
++### B4. Effort (concrete)
++| Work item | Files/areas | Estimate |
++|---|---|---|
++| Mechanical rebase onto new tip; resolve `chains.ts`, `baseReservePairs.test.ts`, `moonwellLiquidationAdapter.ts` | 3 files | 0.5 d |
++| Drop config pair heuristic; Moonwell per-market position read + pair selector | new `moonwellPositions.ts`, adapter, `index.ts` wiring | 2–3 d |
++| Receiver Solidity: rescue, fail-closed initiator, on-chain minOut; rebuild artifacts | `MultiProtocolFlashReceiver.sol`, `contracts/build/*`, compile script | 1.5–2 d |
++| Readiness/layout/code-hash for multi-protocol receiver | `liquidationReceiverReadiness.ts` + tests | 1 d |
++| Sweep + net-profit floor integration for Moonwell candidates (Moonwell flash premium/bonus/close-factor inputs, no missing-input silent pass) | `liquidationCandidateGate.ts` inputs, sweeper token list | 1 d |
++| Fork proofs (historical block 50623620 + adverse-slippage + non-owner/initiator cases) | `test/integration/*moonwell*` | 1–1.5 d |
++| **Total** | | **≈ 7–9 dev-days** (+ deploy/verify/soak, not counted) |
++
++Recommendation: do **not** merge `Grok-Work` wholesale. Cherry-pick `moonwellBase.ts`, `moonwellRouteEncoding` tests and the receiver route as a *new* branch after the Solidity gaps above are closed; keep `ENABLE_NON_AAVE_LIQUIDATION=false` until receiver v-next is deployed, code-hash pinned and fork-proven.
+@SIG@
+2.47.3
+
