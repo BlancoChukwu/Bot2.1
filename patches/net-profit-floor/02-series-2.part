@@ -1,0 +1,369 @@
++  return { sweeper, sent, logger, alert, sleeps, publicClient, walletClient, balances };
++}
++
++const fill = { opportunityId: "base:0xabc:usdc", txHash: `0x${"cd".repeat(32)}` as `0x${string}`, collateralAsset: WETH, debtAsset: USDC };
++const lower = (a: string) => a.toLowerCase();
++
++describe("ReceiverSweeper", () => {
++  it("skips tokens with zero balance (no tx, no dust threshold) and sweeps a 1-wei balance in full to the executor", async () => {
++    const h = harness({ balances: { [lower(USDC)]: 1n } });
++    const out = await h.sweeper.sweepConfiguredTokens();
++    expect(out.find(([t]) => t === WETH)?.[1].status).toBe("skipped_zero_balance");
++    expect(out.find(([t]) => t === CBBTC)?.[1].status).toBe("skipped_zero_balance");
++    expect(out.find(([t]) => t === USDC)?.[1].status).toBe("swept");
++    expect(h.sent).toHaveLength(1);
++    const { args } = decodeFunctionData({ abi: rescueAbi, data: h.sent[0]!.data });
++    expect(args).toEqual([USDC, EXECUTOR, 1n]);
++    expect(h.sent[0]!.to).toBe(RECEIVER);
++  });
++
++  it("all-zero balances => zero txs", async () => {
++    const h = harness();
++    await h.sweeper.sweepConfiguredTokens();
++    expect(h.walletClient.sendTransaction).not.toHaveBeenCalled();
++  });
++
++  it("not live: logs would-sweep and sends nothing", async () => {
++    const h = harness({ live: false, balances: { [lower(WETH)]: 5n } });
++    const out = await h.sweeper.sweepConfiguredTokens();
++    expect(out.find(([t]) => t === WETH)?.[1]).toEqual({ status: "dry_run", balance: 5n });
++    expect(h.walletClient.sendTransaction).not.toHaveBeenCalled();
++    expect(h.publicClient.call).not.toHaveBeenCalled();
++    expect(h.logger.info).toHaveBeenCalledWith("receiver_sweep_dry_run", expect.objectContaining({ to: EXECUTOR, balance: "5" }));
++  });
++
++  it("retries with exponential backoff, then succeeds", async () => {
++    const h = harness({ balances: { [lower(USDC)]: 9n }, failSendTimes: 2 });
++    const out = await h.sweeper.sweepConfiguredTokens();
++    expect(out.find(([t]) => t === USDC)?.[1].status).toBe("swept");
++    expect(h.sleeps).toEqual([10, 20]);
++    const failures = h.logger.error.mock.calls.filter((c) => c[0] === "receiver_sweep_failed");
++    expect(failures).toHaveLength(2);
++    expect(failures[0]![1]).toMatchObject({ attempt: 1, final: false });
++    expect(h.alert).not.toHaveBeenCalled(); // alert only on the final failure
++  });
++
++  it("persistent failure: distinct error event + alert on final attempt, returns failed, never throws", async () => {
++    const h = harness({ balances: { [lower(USDC)]: 9n }, failSendTimes: 99, maxAttempts: 3 });
++    const out = await h.sweeper.sweepConfiguredTokens();
++    expect(out.find(([t]) => t === USDC)?.[1]).toEqual({ status: "failed", error: "rpc boom" });
++    const failures = h.logger.error.mock.calls.filter((c) => c[0] === "receiver_sweep_failed");
++    expect(failures).toHaveLength(3);
++    expect(failures[2]![1]).toMatchObject({ final: true, token: USDC });
++    expect(h.alert).toHaveBeenCalledWith("receiver_sweep_failed", expect.objectContaining({ final: true }));
++  });
++
++  it("failure of the alert channel or logger.error never throws out of the sweeper", async () => {
++    const h = harness({
++      balances: { [lower(USDC)]: 9n },
++      failSendTimes: 99,
++      maxAttempts: 1,
++      alert: () => { throw new Error("alert down"); },
++    });
++    await expect(h.sweeper.sweepConfiguredTokens()).resolves.toBeDefined();
++  });
++
++  it("scheduleAfterFill is non-blocking and a sweep failure cannot mask the fill (never throws, returns void immediately)", async () => {
++    const h = harness({ balances: { [lower(USDC)]: 9n }, failSendTimes: 99, maxAttempts: 1 });
++    h.publicClient.readContract.mockImplementation(() => new Promise(() => undefined)); // hangs forever
++    const ret = h.sweeper.scheduleAfterFill(fill);
++    expect(ret).toBeUndefined();
++    // Also: synchronous throw inside scheduling is swallowed
++    const h2 = harness();
++    h2.publicClient.readContract.mockImplementation(() => { throw new Error("sync boom"); });
++    expect(() => h2.sweeper.scheduleAfterFill(fill)).not.toThrow();
++    await new Promise((r) => setTimeout(r, 10));
++    expect(h2.logger.error).toHaveBeenCalledWith("receiver_sweep_failed", expect.objectContaining({ error: "sync boom" }));
++  });
++
++  it("post-fill sweep covers the fill's collateral+debt tokens plus configured pair tokens", async () => {
++    const OTHER = "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22" as Address; // cbETH
++    const h = harness({ balances: { [lower(OTHER)]: 3n, [lower(USDC)]: 2n } });
++    h.sweeper.scheduleAfterFill({ ...fill, collateralAsset: OTHER });
++    await vi.waitFor(() => expect(h.sent).toHaveLength(2));
++    const tokens = h.sent.map((s) => decodeFunctionData({ abi: rescueAbi, data: s.data }).args![0]);
++    expect(tokens).toEqual(expect.arrayContaining([OTHER, USDC]));
++    expect(h.logger.info).toHaveBeenCalledWith("receiver_sweep_ok", expect.objectContaining({ opportunityId: fill.opportunityId, to: EXECUTOR }));
++  });
++
++  it("periodic loop: schedules at >= 30s floor and sweeps leftover on each tick; stop() clears it", async () => {
++    const ticks: (() => void)[] = [];
++    let cleared: unknown;
++    const h = harness({
++      balances: { [lower(CBBTC)]: 4n },
++      setIntervalFn: (fn, ms) => { ticks.push(fn); expect(ms).toBe(30_000); return "H"; },
++      clearIntervalFn: (handle) => { cleared = handle; },
++    });
++    h.sweeper.startPeriodic(1_000); // below floor -> clamped to 30s
++    h.sweeper.startPeriodic(1_000); // idempotent
++    expect(ticks).toHaveLength(1);
++    ticks[0]!();
++    await vi.waitFor(() => expect(h.sent).toHaveLength(1));
++    h.sweeper.stop();
++    expect(cleared).toBe("H");
++  });
++
++  it("verifyAuthorization: eth_call FROM the executor; revert (OnlyOwner) disables sweeping and alerts", async () => {
++    const h = harness({ balances: { [lower(USDC)]: 9n } });
++    h.publicClient.call.mockRejectedValueOnce(new Error("execution reverted: 0x5fc483c5"));
++    expect(await h.sweeper.verifyAuthorization(USDC)).toBe(false);
++    expect(h.publicClient.call).toHaveBeenCalledWith(expect.objectContaining({ account: EXECUTOR, to: RECEIVER }));
++    expect(h.logger.error).toHaveBeenCalledWith("receiver_sweep_authorization_failed", expect.anything());
++    expect(h.alert).toHaveBeenCalled();
++    await h.sweeper.sweepConfiguredTokens();
++    expect(h.walletClient.sendTransaction).not.toHaveBeenCalled();
++    expect(h.logger.warn).toHaveBeenCalledWith("receiver_sweep_disabled", expect.anything());
++  });
++
++  it("rejects a wallet whose account differs from the signer", () => {
++    expect(() => harness({ walletClient: { account: { address: WETH }, sendTransaction: vi.fn() } })).toThrow(/does not match signer/);
++  });
++});
+diff --git a/test/unit/receiverSweeperGuard.test.ts b/test/unit/receiverSweeperGuard.test.ts
+new file mode 100644
+index 0000000..a0593ce
+--- /dev/null
++++ b/test/unit/receiverSweeperGuard.test.ts
+@@ -0,0 +1,106 @@
++import { readFileSync, readdirSync, statSync } from "node:fs";
++import { join } from "node:path";
++import { describe, expect, it } from "vitest";
++import { decodeFunctionData, parseAbi, type Address } from "viem";
++import { ReceiverSweeper } from "../../src/executors/receiverSweeper";
++import { LocalNonceManager } from "../../src/executors/nonceManager";
++
++const SRC = join(__dirname, "../../src");
++const rescueAbi = parseAbi(["function rescue(address token, address to, uint256 amount)"]);
++const EXECUTOR = "0x922BfCcb570C0847001A3E6746c2980EE0053842" as Address;
++const ATTACKER = "0x00000000000000000000000000000000000000aa" as Address;
++
++function walk(dir: string): string[] {
++  return readdirSync(dir).flatMap((name) => {
++    const p = join(dir, name);
++    return statSync(p).isDirectory() ? walk(p) : p.endsWith(".ts") ? [p] : [];
++  });
++}
++
++describe("receiver sweep destination guard", () => {
++  const sweeperSrc = readFileSync(join(SRC, "executors/receiverSweeper.ts"), "utf8");
++  const code = sweeperSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
++
++  it("receiverSweeper.ts reads no env / process / config", () => {
++    expect(code).not.toMatch(/process\.env/);
++    expect(code).not.toMatch(/\bprocess\b/);
++    expect(code).not.toMatch(/^import (?!type).*from "\.\.\/config\//m); // type-only imports (SupportedChain) are fine
++    expect(code).not.toMatch(/optionalEnv|parseAddress/);
++  });
++
++  it("config type exposes no destination-like field", () => {
++    const iface = code.slice(code.indexOf("export interface ReceiverSweeperConfig"), code.indexOf("export interface FillSweepInput"));
++    expect(iface).not.toMatch(/\b(to|destination|recipient|payout|sweepTo|beneficiary)\??:/i);
++    const fillIface = code.slice(code.indexOf("export interface FillSweepInput"), code.indexOf("export type SweepTokenOutcome"));
++    expect(fillIface).not.toMatch(/\b(to|destination|recipient)\??:/i);
++  });
++
++  it("the only rescue encoder uses this.destination, which is only assigned from signer.address", () => {
++    const encodes = [...code.matchAll(/functionName:\s*"rescue"[^)]*\)/g)];
++    expect(encodes).toHaveLength(1);
++    expect(encodes[0]![0]).toContain("this.destination");
++    const assigns = [...code.matchAll(/this\.destination\s*=\s*([^;]+);/g)].map((m) => m[1]!.trim());
++    expect(assigns).toEqual(["config.signer.address"]);
++    expect(code).toMatch(/private async sweepToken\(\s*trigger: "post_fill" \| "periodic",\s*token: Address,\s*fill\?: FillSweepInput,\s*\)/);
++  });
++
++  it("no other module in src encodes/sends rescue() or references the sweeper except index.ts wiring", () => {
++    const offenders = walk(SRC).filter((f) => {
++      if (f.endsWith("executors/receiverSweeper.ts")) return false;
++      const text = readFileSync(f, "utf8");
++      return /["']rescue["']|rescue\(address/.test(text);
++    });
++    expect(offenders).toEqual([]);
++    const users = walk(SRC).filter((f) => !f.endsWith("receiverSweeper.ts") && /ReceiverSweeper/.test(readFileSync(f, "utf8")));
++    expect(users.map((f) => f.replace(SRC, ""))).toEqual(["/index.ts"]);
++  });
++
++  it("index.ts constructs the sweeper with signer = the privateKeyToAccount executor account and no env-derived destination", () => {
++    const index = readFileSync(join(SRC, "index.ts"), "utf8");
++    const start = index.indexOf("new ReceiverSweeper({");
++    const block = index.slice(start, index.indexOf("});", start));
++    expect(block).toMatch(/signer:\s*account,/);
++    expect(block).not.toMatch(/process\.env|optionalEnv|config\.\w*(Sweep|Destination|Recipient)/i);
++    expect(index).toMatch(/const account = privateKeyToAccount\(config\.privateKey\);/);
++    // the only sweep-related env var is the interval
++    const sweepEnvs = [...index.matchAll(/process\.env\.(RECEIVER_\w*|\w*SWEEP_(?:TO|DEST)\w*|\w*DESTINATION\w*)/g)].map((m) => m[1]);
++    expect(sweepEnvs).toEqual(["RECEIVER_SWEEP_INTERVAL_MS"]);
++  });
++
++  it("runtime: every encoded rescue pays the signer, even if a hostile env is set", async () => {
++    process.env.RECEIVER_SWEEP_TO = ATTACKER;
++    process.env.SWEEP_DESTINATION = ATTACKER;
++    process.env.RECEIVER_SWEEP_RECIPIENT = ATTACKER;
++    try {
++      const sentData: `0x${string}`[] = [];
++      const sweeper = new ReceiverSweeper({
++        chain: "base",
++        receiver: "0x379ce85b431bd4cb3b2b11d682bac4556648ada6",
++        signer: { address: EXECUTOR },
++        publicClient: {
++          readContract: async () => 10n,
++          call: async () => "0x",
++          estimateGas: async () => 1n,
++          getGasPrice: async () => 1n,
++          getTransactionCount: async () => 0,
++          waitForTransactionReceipt: async () => ({ status: "success" as const }),
++        },
++        walletClient: { account: { address: EXECUTOR }, sendTransaction: async (a) => { sentData.push(a.data as `0x${string}`); return `0x${"11".repeat(32)}`; } },
++        nonceManager: new LocalNonceManager(),
++        logger: { info: () => undefined, warn: () => undefined, error: () => undefined },
++        tokens: () => ["0x4200000000000000000000000000000000000006"],
++        live: true,
++      });
++      expect(sweeper.sweepDestination).toBe(EXECUTOR);
++      await sweeper.sweepConfiguredTokens();
++      expect(sentData.length).toBeGreaterThan(0);
++      for (const data of sentData) {
++        expect(decodeFunctionData({ abi: rescueAbi, data }).args![1]).toBe(EXECUTOR);
++      }
++    } finally {
++      delete process.env.RECEIVER_SWEEP_TO;
++      delete process.env.SWEEP_DESTINATION;
++      delete process.env.RECEIVER_SWEEP_RECIPIENT;
++    }
++  });
++});
+@SIG@
+2.47.3
+
+From f460c28eced554711e74fb4d4171e1fc5a1b3967 Mon Sep 17 00:00:00 2001
+From: BlancoChukwu <blanco.chukwu@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 01:43:05 -0600
+Subject: [PATCH] Net-profit floor: replace $50 hard debt floor with
+ MIN_NET_PROFIT_USD (default 1) + MIN_DEBT_SANITY_USD (default 5);
+ liquidation_floor_shadow on every eval; fail closed on missing inputs.
+
+---
+ .env.example                                  |   9 +-
+ README.md                                     |  20 +-
+ src/backtesting/phase2TargetedDryRun.ts       |   5 +-
+ src/index.ts                                  |  29 ++-
+ src/orchestrator/liquidationCandidateGate.ts  | 114 ++++++++-
+ .../liquidationProfitabilityGate.ts           | 239 +++++++++++++++---
+ src/protocols/liquidationCandidateFilter.ts   |  12 +
+ .../unit/aaveSnapshotProviderRealDebt.test.ts |   4 +-
+ test/unit/liquidationCandidateGate.test.ts    | 124 +++++++--
+ .../unit/liquidationProfitabilityGate.test.ts | 162 ++++++++++--
+ test/unit/replay0xf20e51765799.test.ts        |   4 +-
+ 11 files changed, 618 insertions(+), 104 deletions(-)
+
+diff --git a/.env.example b/.env.example
+index ddabf76..793bad6 100644
+--- a/.env.example
++++ b/.env.example
+@@ -106,8 +106,13 @@ GAS_COST_USD=0.0005
+ SLIPPAGE_BPS=20
+ FLASH_LOAN_FEE_BPS=5
+ FLASH_LOAN_SLIPPAGE_FLOOR_BPS=10
+-# Hard floor for first live sessions (set 0 after validation).
+-MIN_LIQUIDATION_DEBT_USD=50
++# Net-profit floor (replaces the old $50 hard debt floor): candidate passes only if
++#   bonus*(1-protocolFee) - gas - flashPremium - swapFee(0.3% live v1) - slippage >= MIN_NET_PROFIT_USD
++# Missing inputs (gas/bonus/protocol fee/price) FAIL CLOSED — never a silent zero.
++MIN_NET_PROFIT_USD=1
++# Small-debt sanity floor (NOT a profitability gate; tune from the 24h SIM shadow counts). Default 5.
++MIN_DEBT_SANITY_USD=5
++# DEPRECATED/IGNORED: MIN_LIQUIDATION_DEBT_USD (logs legacy_min_liquidation_debt_usd_ignored if set).
+ ARBITRAGE_MIN_PROFIT_USD=0.15
+@SP@
+ # --- Flash loans & private tx routing ---
+diff --git a/README.md b/README.md
+index 7e614db..f58e39f 100644
+--- a/README.md
++++ b/README.md
+@@ -283,10 +283,10 @@ Stale `.runtime/bot.lock` files are removed on the next start via `singleInstanc
+ After `node scripts/audit-session.mjs logs/<session>.log` passes for ≥12h and `dynamicFloor` in `liquidation_evaluated` events stays near $0.17–$0.20:
+@SP@
+ ```bash
+-MIN_LIQUIDATION_DEBT_USD=0.35
++MIN_DEBT_SANITY_USD=0.35
+ ```
+@SP@
+-Do not set `MIN_LIQUIDATION_DEBT_USD=0` until multi-protocol discovery is enabled and stable.
++Do not set `MIN_DEBT_SANITY_USD=0` until multi-protocol discovery is enabled and stable.
+@SP@
+ ### Detection/scoring internals (what the bot does)
+@SP@
+@@ -411,4 +411,18 @@ npm run build
+@SP@
+ ## License
+@SP@
+-See `package.json` (`license` field).
+\ No newline at end of file
++See `package.json` (`license` field).
++
++## Liquidation floors (net-profit gate) and shadow log
++
++The old `$50` hard debt floor (`MIN_LIQUIDATION_DEBT_USD`, now ignored) was replaced by:
++
++| Env | Default | Meaning |
++| --- | --- | --- |
++| `MIN_NET_PROFIT_USD` | `1` | Pass only if `bonus*(1-protocolFee) - gas - flashPremium - swapFee - slippage >= this`. |
++| `MIN_DEBT_SANITY_USD` | `5` | Small-debt sanity floor (not a profit gate). |
++| `RECEIVER_SWEEP_INTERVAL_MS` | `180000` | Periodic receiver sweep cadence (min 30000). Destination is not configurable. |
++
++Every liquidation evaluation emits `liquidation_floor_shadow` (booleans `net025`, `net1`, `net5`, `debt50`, plus `livePass`,
++`netProfitUsd`, cumulative `counts`). Count with e.g.
++`grep '"liquidation_floor_shadow"' logs/*.log | jq -s 'group_by(.net1) | map({net1: .[0].net1, n: length})'`.
+diff --git a/src/backtesting/phase2TargetedDryRun.ts b/src/backtesting/phase2TargetedDryRun.ts
+index a2b3245..c50e5bc 100644
+--- a/src/backtesting/phase2TargetedDryRun.ts
++++ b/src/backtesting/phase2TargetedDryRun.ts
+@@ -26,6 +26,7 @@ export interface Phase2TargetedDryRunConfig {
+   readonly fallbackRpcUrls: readonly string[];
+   readonly aaveSubgraphUrl: string;
+   readonly minLiquidationDebtUsd: number;
++  readonly minNetProfitUsd: number;
+   readonly borrowerDeadLetterCooldownMs: number;
+   readonly oracleMaxStaleMs: number;
+   readonly minProfitUsd: number;
+@@ -104,7 +105,9 @@ export async function runPhase2TargetedDustDryRun(
+   };
+@SP@
+   const gate = new LiquidationCandidateGate({
+-    minDebtUsd: input.config.minLiquidationDebtUsd,
++    minNetProfitUsd: input.config.minNetProfitUsd,
++    minDebtSanityUsd: input.config.minLiquidationDebtUsd,
++    resolveSlippageBps: async () => input.config.slippageBps,
+     resolveGasCostUsd,
+     resolveFlashFeeBps: async () => input.config.flashLoanFeeBps,
+     ...(priceOracle === undefined ? {} : { priceOracle }),
+diff --git a/src/index.ts b/src/index.ts
+index c2a0d60..2bc2b55 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -182,7 +182,10 @@ export interface RuntimeConfig {
+   readonly dailyPnlCsvPath: string | undefined;
+   readonly arbitrageMinProfitUsd: number;
+   readonly priceFeedRegistry: OracleFeedRegistry | undefined;
++  /** Small-debt SANITY floor (MIN_DEBT_SANITY_USD, default $5). Not a profitability gate. */
+   readonly minLiquidationDebtUsd: number;
++  /** Net-profit floor (MIN_NET_PROFIT_USD, default $1): gas + flash premium + swap fee + slippage netted out. */
+   readonly minNetProfitUsd: number;
+   readonly borrowerDeadLetterCooldownMs: number;
+   readonly oracleMaxStaleMs: number;
+   readonly oraclePollIntervalMs: number;
+@@ -296,12 +299,10 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
+     dailyPnlCsvPath: optionalEnv(parsedEnv, "DAILY_PNL_CSV_PATH"),
+     arbitrageMinProfitUsd: parseMinNumber(parsedEnv.ARBITRAGE_MIN_PROFIT_USD, 0.15, 0, "ARBITRAGE_MIN_PROFIT_USD"),
+     priceFeedRegistry,
+-    minLiquidationDebtUsd: parseMinNumber(
+-      parsedEnv.MIN_LIQUIDATION_DEBT_USD,
+-      Math.max(parseMinNumber(parsedEnv.MIN_PROFIT_USD, 10, 0, "MIN_PROFIT_USD"), 50),
+-      0,
+-      "MIN_LIQUIDATION_DEBT_USD",
+-    ),
++    // The old $50 hard debt floor (MIN_LIQUIDATION_DEBT_USD, default max(MIN_PROFIT_USD,50)) is REPLACED by a net-profit
++    // floor plus this small sanity floor. The legacy env var is intentionally ignored (startup logs legacy_min_liquidation_debt_usd_ignored).
++    minLiquidationDebtUsd: parseMinNumber(parsedEnv.MIN_DEBT_SANITY_USD, 5, 0, "MIN_DEBT_SANITY_USD"),
++    minNetProfitUsd: parseMinNumber(parsedEnv.MIN_NET_PROFIT_USD, 1, 0, "MIN_NET_PROFIT_USD"),
+     borrowerDeadLetterCooldownMs: parseMinNumber(
+       parsedEnv.MIN_PROFIT_USD_PLACEHOLDER, 600_000,
