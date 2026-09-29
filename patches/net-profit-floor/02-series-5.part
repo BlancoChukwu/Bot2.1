@@ -1,0 +1,220 @@
++      debtTrusted: resolved.trusted,
++      net025: shadow.net025,
++      net1: shadow.net1,
++      net5: shadow.net5,
++      debt50: shadow.debt50,
++      sanity: shadow.sanity,
++      livePass: finalPass,
++      minNetProfitUsd: this.config.minNetProfitUsd,
++      minDebtSanityUsd: this.config.minDebtSanityUsd,
++      counts: this.floorShadowCounters.snapshot(),
++      message: `liquidation_floor_shadow | net025: ${shadow.net025} | net1: ${shadow.net1} | net5: ${shadow.net5} | debt50: ${shadow.debt50} | livePass: ${finalPass} | debtUSD: ${resolved.debtUsd} | netUSD: ${profitability.netProfitUsd ?? "n/a"}`,
++    });
++  }
++
+   private buildFilterDecision(
+     resolved: { readonly debtUsd: number; readonly trusted: boolean },
+     profitabilityPass: boolean,
+     gasCostUsd: number,
++    profitabilityReason: string,
+   ): DustFilterDecision {
+     if (!resolved.trusted) {
+       return { debtUsd: resolved.debtUsd, isDust: true, reason: "oracle_untrusted" };
+     }
+     if (!profitabilityPass) {
+-      return { debtUsd: resolved.debtUsd, isDust: true, reason: "below_profitability_floor" };
++      return {
++        debtUsd: resolved.debtUsd,
++        isDust: true,
++        reason: profitabilityReason === "inputs_missing"
++          ? "profit_inputs_missing"
++          : profitabilityReason === "below_debt_sanity_floor"
++            ? "below_debt_sanity_floor"
++            : profitabilityReason === "below_min_net_profit"
++              ? "below_net_profit_floor"
++              : "below_profitability_floor",
++      };
+     }
+     return evaluateDustFilter({
+       debtUsd: resolved.debtUsd,
+diff --git a/src/profitability/liquidationProfitabilityGate.ts b/src/profitability/liquidationProfitabilityGate.ts
+index dfd87cb..95e9a5a 100644
+--- a/src/profitability/liquidationProfitabilityGate.ts
++++ b/src/profitability/liquidationProfitabilityGate.ts
+@@ -1,37 +1,82 @@
+-const defaultSafetyBuffer = 1.25;
+-const defaultLiquidationGasUnits = 420_000;
+-const defaultBonusBps = 500;
+-const defaultGasBufferMultiplier = 1.5;
++/**
++ * Liquidation profitability gate: NET-PROFIT floor (replaces the old $50 hard debt floor).
++ *
++ *   netProfitUsd = bonusCapture - gas - flashPremium - swapFee - slippage
++ *     bonusCapture = debtUsd * bonusRate * (1 - protocolFeeBps/1e4)     (Aave takes protocolFee% of the bonus)
++ *     flashPremium = debtUsd * flashFeeBps/1e4                           (Pool.FLASHLOAN_PREMIUM_TOTAL)
++ *     swapFee      = swappedUsd * swapFeeBps/1e4                         (live v1 receiver: fixed Uniswap V3 0.3%)
++ *     slippage     = swappedUsd * slippageBps/1e4
++ *     swappedUsd   = debtUsd * (1 + bonusRate)   (collateral seized is swapped back to the debt asset; 0 if same asset)
++ *
++ * pass  <=>  inputs complete  AND  netProfitUsd >= minNetProfitUsd  AND  debtUsd >= minDebtSanityUsd.
++ *
++ * FAIL CLOSED: any missing / non-finite / non-positive-where-impossible input (gas, bonus, protocol fee, flash fee,
++ * swap fee, slippage) => pass=false with reason `inputs_missing` and the missing field names. Nothing defaults to 0
++ * or to a config bonus (lesson: pair/bonus/debt come from on-chain per-reserve data only).
++ */
+ const bpsScale = 10_000;
+@SP@
++export const LIVE_V1_RECEIVER_SWAP_FEE_BPS = 30; // fixed 0.3% Uniswap V3 tier (immutable swapFee = 3000)
++export const SHADOW_NET_FLOORS_USD = [0.25, 1, 5] as const;
++export const SHADOW_DEBT_FLOOR_USD = 50;
++
+ export interface LiquidationProfitabilityInput {
+   readonly debtUsd: number;
+-  readonly liquidationBonusBps: number;
+-  readonly gasCostUsd: number;
+-  readonly flashFeeBps: number;
+-  readonly hardFloorUsd: number;
+-  readonly safetyBufferMultiplier?: number;
++  readonly liquidationBonusBps: number | undefined;
++  /** On-chain liquidationProtocolFee of the collateral reserve (bps of the bonus). */
++  readonly liquidationProtocolFeeBps: number | undefined;
++  readonly gasCostUsd: number | undefined;
++  readonly flashFeeBps: number | undefined;
++  /** false when collateral === debt asset (no swap leg). */
++  readonly swapRequired: boolean;
++  readonly swapFeeBps: number | undefined;
++  readonly slippageBps: number | undefined;
++  readonly minNetProfitUsd: number;
++  readonly minDebtSanityUsd: number;
+ }
+@SP@
++export type LiquidationProfitabilityReason =
++  | "ok"
++  | "inputs_missing"
++  | "below_min_net_profit"
++  | "below_debt_sanity_floor";
++
+ export interface LiquidationProfitabilityResult {
+   readonly pass: boolean;
+-  readonly dynamicFloor: number;
++  readonly reason: LiquidationProfitabilityReason;
++  readonly inputsOk: boolean;
++  readonly missingInputs: readonly string[];
++  /** null when inputs are missing (never a silent 0). */
++  readonly netProfitUsd: number | null;
++  readonly bonusCaptureUsd: number | null;
++  readonly protocolFeeUsd: number | null;
++  readonly gasCostUsd: number | null;
++  readonly flashFeeUsd: number | null;
++  readonly swapFeeUsd: number | null;
++  readonly slippageUsd: number | null;
++  readonly bonusRate: number | null;
++  readonly minNetProfitUsd: number;
++  readonly minDebtSanityUsd: number;
++  /** Debt at which net == minNetProfitUsd (Infinity if the per-$ margin is <= 0). null if inputs missing. */
++  readonly dynamicFloor: number | null;
++  /** = minDebtSanityUsd (field name kept for log/audit compatibility with the old gate). */
+   readonly hardFloor: number;
+-  readonly effectiveFloor: number;
+-  readonly gasCostUsd: number;
+-  readonly flashFeeUsd: number;
+-  readonly bonusRate: number;
+-  readonly netProfitUsd: number;
++  readonly effectiveFloor: number | null;
++}
++
++function ok(value: number | undefined, allowZero: boolean): value is number {
++  return value !== undefined && Number.isFinite(value) && (allowZero ? value >= 0 : value > 0);
+ }
+@SP@
+ export function estimateLiquidationGasCostUsd(
+   gasPriceWei: bigint,
+   nativePriceUsd8: bigint,
+-  gasUnits: number = defaultLiquidationGasUnits,
+-  gasBufferMultiplier: number = defaultGasBufferMultiplier,
++  gasUnits: number = 420_000,
++  gasBufferMultiplier: number = 1.5,
+ ): number {
+   if (nativePriceUsd8 <= 0n) {
+-    return 0;
++    // No price => unknown cost. NaN (not 0) so callers/gate treat it as missing.
++    return Number.NaN;
+   }
+   const bufferedGasUnits = BigInt(Math.ceil(gasUnits * gasBufferMultiplier));
+   const gasCostWei = gasPriceWei * bufferedGasUnits;
+@@ -41,24 +86,150 @@ export function estimateLiquidationGasCostUsd(
+ export function evaluateLiquidationProfitability(
+   input: LiquidationProfitabilityInput,
+ ): LiquidationProfitabilityResult {
+-  const bonusRate = input.liquidationBonusBps / bpsScale;
+-  const effectiveBonusRate = bonusRate > 0 ? bonusRate : defaultBonusBps / bpsScale;
+-  const flashFeeUsd = input.debtUsd * (input.flashFeeBps / bpsScale);
+-  const buffer = input.safetyBufferMultiplier ?? defaultSafetyBuffer;
+-  const dynamicFloor = ((input.gasCostUsd + flashFeeUsd) / effectiveBonusRate) * buffer;
+-  const hardFloor = input.hardFloorUsd;
+-  const effectiveFloor = Math.max(dynamicFloor, hardFloor);
+-  const estimatedBonus = input.debtUsd * effectiveBonusRate;
+-  const netProfitUsd = estimatedBonus - input.gasCostUsd - flashFeeUsd;
++  const missing: string[] = [];
++  if (!Number.isFinite(input.debtUsd) || input.debtUsd <= 0) missing.push("debtUsd");
++  if (!ok(input.liquidationBonusBps, false)) missing.push("liquidationBonusBps");
++  if (!ok(input.liquidationProtocolFeeBps, true) || (input.liquidationProtocolFeeBps ?? 0) > bpsScale) {
++    missing.push("liquidationProtocolFeeBps");
++  }
++  // Real gas is never 0: a 0 (e.g. GAS_COST_USD fallback default) is treated as "unknown", not as "free".
++  if (!ok(input.gasCostUsd, false)) missing.push("gasCostUsd");
++  if (!ok(input.flashFeeBps, true)) missing.push("flashFeeBps");
++  if (input.swapRequired) {
++    if (!ok(input.swapFeeBps, true)) missing.push("swapFeeBps");
++    if (!ok(input.slippageBps, true)) missing.push("slippageBps");
++  }
++  if (!Number.isFinite(input.minNetProfitUsd) || input.minNetProfitUsd < 0) missing.push("minNetProfitUsd");
++  if (!Number.isFinite(input.minDebtSanityUsd) || input.minDebtSanityUsd < 0) missing.push("minDebtSanityUsd");
++
++  if (missing.length > 0) {
++    return {
++      pass: false,
++      reason: "inputs_missing",
++      inputsOk: false,
++      missingInputs: missing,
++      netProfitUsd: null,
++      bonusCaptureUsd: null,
++      protocolFeeUsd: null,
++      gasCostUsd: null,
++      flashFeeUsd: null,
++      swapFeeUsd: null,
++      slippageUsd: null,
++      bonusRate: null,
++      minNetProfitUsd: input.minNetProfitUsd,
++      minDebtSanityUsd: input.minDebtSanityUsd,
++      dynamicFloor: null,
++      hardFloor: input.minDebtSanityUsd,
++      effectiveFloor: null,
++    };
++  }
++
++  const debtUsd = input.debtUsd;
++  const gasCostUsd = input.gasCostUsd!;
++  const bonusRate = input.liquidationBonusBps! / bpsScale;
++  const protocolFeeRate = input.liquidationProtocolFeeBps! / bpsScale;
++  const flashRate = input.flashFeeBps! / bpsScale;
++  const swapRate = input.swapRequired ? input.swapFeeBps! / bpsScale : 0;
++  const slipRate = input.swapRequired ? input.slippageBps! / bpsScale : 0;
++
++  const grossBonusUsd = debtUsd * bonusRate;
++  const protocolFeeUsd = grossBonusUsd * protocolFeeRate;
++  const bonusCaptureUsd = grossBonusUsd - protocolFeeUsd;
++  const flashFeeUsd = debtUsd * flashRate;
++  const swappedUsd = input.swapRequired ? debtUsd * (1 + bonusRate) : 0;
++  const swapFeeUsd = swappedUsd * swapRate;
++  const slippageUsd = swappedUsd * slipRate;
++  const netProfitUsd = bonusCaptureUsd - gasCostUsd - flashFeeUsd - swapFeeUsd - slippageUsd;
++
++  const marginRate = bonusRate * (1 - protocolFeeRate) - flashRate
++    - (input.swapRequired ? (1 + bonusRate) * (swapRate + slipRate) : 0);
++  const dynamicFloor = marginRate > 0
++    ? (gasCostUsd + input.minNetProfitUsd) / marginRate
++    : Number.POSITIVE_INFINITY;
+@SP@
++  const netPass = netProfitUsd >= input.minNetProfitUsd;
++  const sanityPass = debtUsd >= input.minDebtSanityUsd;
