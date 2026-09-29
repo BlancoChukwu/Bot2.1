@@ -1,0 +1,562 @@
+From ffcdbeb26809713b0b031a84ae30f99a54e610d3 Mon Sep 17 00:00:00 2001
+From: BlancoChukwu <blanco.chukwu@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 01:32:24 -0600
+Subject: [PATCH] Receiver sweep: post-fill + periodic rescue() of leftover
+ balances to executor wallet (hard-wired destination), fail-loud,
+ non-blocking.
+
+---
+ .env.example                                  |   6 +
+ src/executors/receiverSweeper.ts              | 350 ++++++++++++++++++
+ src/index.ts                                  |  47 ++-
+ src/orchestrator/pipelineOrchestrator.ts      |  44 ++-
+ .../pipelineOrchestrator.sweepHook.test.ts    | 116 ++++++
+ test/integration/receiverSweep.fork.test.ts   | 125 +++++++
+ test/unit/receiverSweeper.test.ts             | 176 +++++++++
+ test/unit/receiverSweeperGuard.test.ts        | 106 ++++++
+ 8 files changed, 968 insertions(+), 2 deletions(-)
+ create mode 100644 src/executors/receiverSweeper.ts
+ create mode 100644 test/integration/pipelineOrchestrator.sweepHook.test.ts
+ create mode 100644 test/integration/receiverSweep.fork.test.ts
+ create mode 100644 test/unit/receiverSweeper.test.ts
+ create mode 100644 test/unit/receiverSweeperGuard.test.ts
+
+diff --git a/.env.example b/.env.example
+index 97e680f..ddabf76 100644
+--- a/.env.example
++++ b/.env.example
+@@ -260,3 +260,9 @@ LIQUIDATION_SWAP_POOL_FEE=3000
+ # FTRL_OPPORTUNITY_STATE_CACHE_PATH=.runtime/ftrl-opportunities.json
+@SP@
+ # DAILY_PNL_CSV_PATH=logs/daily-pnl.csv
++
++# --- Receiver sweep (post-fill + periodic rescue of leftover tokens to the executor wallet) ---
++# Cadence only (default 180000 = 3 min, min 30000). The sweep DESTINATION is hard-wired to the executor signer
++# address in code (src/executors/receiverSweeper.ts); there is intentionally NO env/config override for it.
++# No txs are sent when SIMULATION_MODE=true or the live-tx gate is closed (it logs receiver_sweep_dry_run instead).
++RECEIVER_SWEEP_INTERVAL_MS=180000
+diff --git a/src/executors/receiverSweeper.ts b/src/executors/receiverSweeper.ts
+new file mode 100644
+index 0000000..04f8f39
+--- /dev/null
++++ b/src/executors/receiverSweeper.ts
+@@ -0,0 +1,350 @@
++import { encodeFunctionData, parseAbi, type Address, type Hash, type Hex } from "viem";
++import type { LoggerLike } from "../bot";
++import type { SupportedChain } from "../config/chains";
++import type { LocalNonceManager } from "./nonceManager";
++
++/**
++ * Post-fill / periodic sweep of the live v1 LiquidationFlashReceiver.
++ *
++ * The receiver's `rescue(token,to,amount)` is `onlyOwner` (immutable `_owner` = the bot executor wallet, verified on
++ * Base 2026-09-29: eth_call from the wallet succeeds, from any other address reverts OnlyOwner 0x5fc483c5).
++ *
++ * SAFETY INVARIANTS (guarded by test/unit/receiverSweeperGuard.test.ts):
++ *  - The destination of every rescue is `signer.address`, captured once in the constructor from the signer/executor
++ *    account object. There is NO destination/`to` field on the config, NO env read in this file, and `sweepToken`
++ *    takes no destination parameter. Funds can only ever move receiver -> executor wallet.
++ *  - A sweep failure never throws to the caller of `scheduleAfterFill` and never blocks the fill record.
++ *  - Balance zero => skip (no dust threshold). Not live => nothing is sent, "would sweep" is logged.
++ */
++
++const erc20BalanceAbi = parseAbi(["function balanceOf(address owner) view returns (uint256)"]);
++const rescueAbi = parseAbi(["function rescue(address token, address to, uint256 amount)"]);
++
++export interface ReceiverSweeperPublicClient {
++  readContract(args: Record<string, unknown>): Promise<unknown>;
++  call(args: Record<string, unknown>): Promise<unknown>;
++  estimateGas(args: Record<string, unknown>): Promise<bigint>;
++  getGasPrice(): Promise<bigint>;
++  getTransactionCount(args: Record<string, unknown>): Promise<number>;
++  waitForTransactionReceipt(args: Record<string, unknown>): Promise<{ readonly status: "success" | "reverted" }>;
++}
++
++export interface ReceiverSweeperWalletClient {
++  readonly account?: { readonly address: Address };
++  sendTransaction(args: Record<string, unknown>): Promise<Hash>;
++}
++
++export interface ReceiverSweeperConfig {
++  readonly chain: SupportedChain;
++  readonly receiver: Address;
++  /** The bot signer/executor account. Its address is the ONLY sweep destination. */
++  readonly signer: { readonly address: Address };
++  readonly publicClient: ReceiverSweeperPublicClient;
++  readonly walletClient: ReceiverSweeperWalletClient;
++  readonly nonceManager: LocalNonceManager;
++  readonly logger: LoggerLike;
++  /** Configured pair tokens (WETH/USDC/cbBTC + any others); per-fill debt/collateral tokens are added on top. */
++  readonly tokens: () => readonly Address[];
++  /** true only when real txs are permitted (not SIMULATION_MODE and live tx gate open). */
++  readonly live: boolean;
++  readonly alert?: (event: string, payload: Record<string, unknown>) => void | Promise<void>;
++  readonly maxAttempts?: number;
++  readonly backoffBaseMs?: number;
++  readonly backoffMaxMs?: number;
++  readonly sleep?: (ms: number) => Promise<void>;
++  readonly setIntervalFn?: (fn: () => void, ms: number) => unknown;
++  readonly clearIntervalFn?: (handle: unknown) => void;
++}
++
++export interface FillSweepInput {
++  readonly opportunityId: string;
++  readonly txHash?: Hash;
++  readonly collateralAsset: Address;
++  readonly debtAsset: Address;
++}
++
++export type SweepTokenOutcome =
++  | { readonly status: "skipped_zero_balance" }
++  | { readonly status: "dry_run"; readonly balance: bigint }
++  | { readonly status: "swept"; readonly balance: bigint; readonly txHash: Hash }
++  | { readonly status: "failed"; readonly error: string };
++
++export const DEFAULT_SWEEP_INTERVAL_MS = 180_000;
++export const MIN_SWEEP_INTERVAL_MS = 30_000;
++
++export class ReceiverSweeper {
++  private readonly destination: Address;
++  private readonly maxAttempts: number;
++  private readonly backoffBaseMs: number;
++  private readonly backoffMaxMs: number;
++  private readonly sleep: (ms: number) => Promise<void>;
++  private queue: Promise<unknown> = Promise.resolve();
++  private timer: unknown;
++  private disabledReason: string | undefined;
++
++  public constructor(private readonly config: ReceiverSweeperConfig) {
++    this.destination = config.signer.address;
++    const walletAddress = config.walletClient.account?.address;
++    if (walletAddress !== undefined && walletAddress.toLowerCase() !== this.destination.toLowerCase()) {
++      throw new Error("ReceiverSweeper: walletClient account does not match signer address");
++    }
++    this.maxAttempts = Math.max(1, config.maxAttempts ?? 4);
++    this.backoffBaseMs = config.backoffBaseMs ?? 1_000;
++    this.backoffMaxMs = config.backoffMaxMs ?? 30_000;
++    this.sleep = config.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
++  }
++
++  /** Read-only address the sweeper pays out to (for logs/tests). */
++  public get sweepDestination(): Address {
++    return this.destination;
++  }
++
++  /**
++   * Startup check: eth_call rescue(token, executor, 0) FROM the executor. Reverts (OnlyOwner) => sweeping is disabled
++   * and an error + alert are raised. Never sends a tx.
++   */
++  public async verifyAuthorization(probeToken: Address): Promise<boolean> {
++    try {
++      await this.config.publicClient.call({
++        account: this.destination,
++        to: this.config.receiver,
++        data: this.encodeRescue(probeToken, 0n),
++      });
++      this.disabledReason = undefined;
++      this.config.logger.info("receiver_sweep_authorization_ok", {
++        chain: this.config.chain,
++        receiver: this.config.receiver,
++        executor: this.destination,
++      });
++      return true;
++    } catch (error) {
++      this.disabledReason = "not_owner_or_call_failed";
++      this.fail("receiver_sweep_authorization_failed", {
++        receiver: this.config.receiver,
++        executor: this.destination,
++        error: errorText(error),
++      }, true);
++      return false;
++    }
++  }
++
++  /**
++   * Non-blocking hook for the fill path. Call AFTER the fill record/log is written. Never throws, never awaits the
++   * sweep; failures are logged loudly on the sweep's own channel.
++   */
++  public scheduleAfterFill(input: FillSweepInput): void {
++    try {
++      void this.enqueue(() => this.sweepTokens("post_fill", dedupe([input.collateralAsset, input.debtAsset, ...this.config.tokens()]), input))
++        .catch((error) => this.fail("receiver_sweep_failed", { trigger: "post_fill", phase: "unexpected", error: errorText(error) }, true));
++    } catch (error) {
++      this.fail("receiver_sweep_failed", { trigger: "post_fill", phase: "schedule", error: errorText(error) }, true);
++    }
++  }
++
++  /** One periodic pass over the configured pair tokens. Never throws. */
++  public async sweepConfiguredTokens(): Promise<readonly (readonly [Address, SweepTokenOutcome])[]> {
++    try {
++      return await this.enqueue(() => this.sweepTokens("periodic", dedupe(this.config.tokens())));
++    } catch (error) {
++      this.fail("receiver_sweep_failed", { trigger: "periodic", phase: "unexpected", error: errorText(error) }, true);
++      return [];
++    }
++  }
++
++  public startPeriodic(intervalMs: number): void {
++    if (this.timer !== undefined) {
++      return;
++    }
++    const effective = Math.max(intervalMs, MIN_SWEEP_INTERVAL_MS);
++    const setter = this.config.setIntervalFn ?? ((fn, ms) => {
++      const handle = setInterval(fn, ms);
++      (handle as { unref?: () => void }).unref?.();
++      return handle;
++    });
++    this.timer = setter(() => { void this.sweepConfiguredTokens(); }, effective);
++    this.config.logger.info("receiver_sweep_loop_started", {
++      chain: this.config.chain,
++      receiver: this.config.receiver,
++      executor: this.destination,
++      intervalMs: effective,
++      live: this.config.live,
++    });
++  }
++
++  public stop(): void {
++    if (this.timer === undefined) {
++      return;
++    }
++    (this.config.clearIntervalFn ?? ((handle) => clearInterval(handle as ReturnType<typeof setInterval>)))(this.timer);
++    this.timer = undefined;
++  }
++
++  private enqueue<T>(work: () => Promise<T>): Promise<T> {
++    const run = this.queue.then(work, work);
++    this.queue = run.catch(() => undefined);
++    return run;
++  }
++
++  private async sweepTokens(
++    trigger: "post_fill" | "periodic",
++    tokens: readonly Address[],
++    fill?: FillSweepInput,
++  ): Promise<readonly (readonly [Address, SweepTokenOutcome])[]> {
++    const results: (readonly [Address, SweepTokenOutcome])[] = [];
++    if (this.disabledReason !== undefined) {
++      this.config.logger.warn("receiver_sweep_disabled", { trigger, reason: this.disabledReason });
++      return results;
++    }
++    for (const token of tokens) {
++      results.push([token, await this.sweepToken(trigger, token, fill)]);
++    }
++    return results;
++  }
++
++  /** Sweeps the FULL receiver balance of `token` to the executor wallet, with retry + backoff. */
++  private async sweepToken(
++    trigger: "post_fill" | "periodic",
++    token: Address,
++    fill?: FillSweepInput,
++  ): Promise<SweepTokenOutcome> {
++    let lastError = "unknown";
++    for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
++      try {
++        const balance = await this.readBalance(token);
++        if (balance === 0n) {
++          if (trigger === "post_fill") {
++            this.config.logger.info("receiver_sweep_skipped_zero_balance", { chain: this.config.chain, token, trigger });
++          }
++          return { status: "skipped_zero_balance" };
++        }
++        if (!this.config.live) {
++          this.config.logger.info("receiver_sweep_dry_run", {
++            chain: this.config.chain,
++            receiver: this.config.receiver,
++            token,
++            balance: balance.toString(),
++            to: this.destination,
++            trigger,
++            message: "not live: would rescue full balance to executor wallet (no tx sent)",
++          });
++          return { status: "dry_run", balance };
++        }
++        const txHash = await this.sendRescue(token, balance);
++        this.config.logger.info("receiver_sweep_ok", {
++          chain: this.config.chain,
++          receiver: this.config.receiver,
++          token,
++          amount: balance.toString(),
++          to: this.destination,
++          txHash,
++          trigger,
++          attempt,
++          ...(fill === undefined ? {} : { opportunityId: fill.opportunityId, fillTxHash: fill.txHash ?? null }),
++        });
++        return { status: "swept", balance, txHash };
++      } catch (error) {
++        lastError = errorText(error);
++        const final = attempt >= this.maxAttempts;
++        this.fail("receiver_sweep_failed", {
++          receiver: this.config.receiver,
++          token,
++          trigger,
++          attempt,
++          maxAttempts: this.maxAttempts,
++          final,
++          error: lastError,
++          ...(fill === undefined ? {} : { opportunityId: fill.opportunityId, fillTxHash: fill.txHash ?? null }),
++        }, final);
++        if (!final) {
++          await this.sleep(Math.min(this.backoffBaseMs * 2 ** (attempt - 1), this.backoffMaxMs));
++        }
++      }
++    }
++    return { status: "failed", error: lastError };
++  }
++
++  private async readBalance(token: Address): Promise<bigint> {
++    const value = await this.config.publicClient.readContract({
++      address: token,
++      abi: erc20BalanceAbi,
++      functionName: "balanceOf",
++      args: [this.config.receiver],
++    });
++    if (typeof value !== "bigint" || value < 0n) {
++      throw new Error(`balanceOf returned non-bigint for ${token}`);
++    }
++    return value;
++  }
++
++  private encodeRescue(token: Address, amount: bigint): Hex {
++    // Destination is ALWAYS the executor wallet; there is deliberately no parameter to change it.
++    return encodeFunctionData({ abi: rescueAbi, functionName: "rescue", args: [token, this.destination, amount] });
++  }
++
++  private async sendRescue(token: Address, amount: bigint): Promise<Hash> {
++    const data = this.encodeRescue(token, amount);
++    const { publicClient, walletClient, nonceManager, receiver, chain } = this.config;
++    // Preflight from the executor: reverts (OnlyOwner, bad token, insufficient) surface here without spending gas.
++    await publicClient.call({ account: this.destination, to: receiver, data });
++    const gas = ((await publicClient.estimateGas({ account: this.destination, to: receiver, data })) * 12n) / 10n;
++    const gasPrice = await publicClient.getGasPrice();
++    const reservation = await nonceManager.reserve(chain, this.destination, () =>
++      publicClient.getTransactionCount({ address: this.destination, blockTag: "pending" }));
++    let hash: Hash;
++    try {
++      hash = await walletClient.sendTransaction({
++        account: walletClient.account ?? this.destination,
++        chain: undefined,
++        to: receiver,
++        data,
++        gas,
++        gasPrice,
++        nonce: reservation.nonce,
++      });
++    } catch (error) {
++      nonceManager.release(reservation);
++      throw error;
++    }
++    const receipt = await publicClient.waitForTransactionReceipt({ hash });
++    if (receipt.status !== "success") {
++      throw new Error(`rescue tx reverted: ${hash}`);
++    }
++    return hash;
++  }
++
++  private fail(event: string, payload: Record<string, unknown>, alert: boolean): void {
++    const meta = { chain: this.config.chain, ...payload };
++    try {
++      this.config.logger.error(event, meta);
++    } catch {
++      // logging must never throw into the caller
++    }
++    if (alert && this.config.alert !== undefined) {
++      try {
++        void Promise.resolve(this.config.alert(event, meta)).catch(() => undefined);
++      } catch {
++        // alert channel failure is not allowed to mask anything
++      }
++    }
++  }
++}
++
++function dedupe(tokens: readonly Address[]): Address[] {
++  const seen = new Set<string>();
++  const out: Address[] = [];
++  for (const token of tokens) {
++    const key = token.toLowerCase();
++    if (!seen.has(key)) {
++      seen.add(key);
++      out.push(token);
++    }
++  }
++  return out;
++}
++
++function errorText(error: unknown): string {
++  if (error instanceof Error) {
++    return error.message.split("\n")[0] ?? error.message;
++  }
++  return String(error);
++}
+diff --git a/src/index.ts b/src/index.ts
+index f29500d..c2a0d60 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -34,6 +34,7 @@ import { createLiquidationActions, LiquidationExecutor } from "./executors/liqui
+ import { buildArbitrageExecutionRequest } from "./executors/arbitrageExecutorAdapter";
+ import { buildLiquidationExecutionRequest } from "./executors/liquidationExecutionAdapter";
+ import { LocalNonceManager } from "./executors/nonceManager";
++import { DEFAULT_SWEEP_INTERVAL_MS, ReceiverSweeper } from "./executors/receiverSweeper";
+ import { PrivateSubmissionClient, type PrivateTxMode } from "./executors/PrivateSubmissionClient";
+ import { SafeTransactionExecutor } from "./executors/safeTransactionExecutor";
+ import { validateLiquidatableHealthFactor } from "./executors/liquidationHfPreflight";
+@@ -709,10 +710,11 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
+     walletClient,
+     logger,
+   });
++  const sharedNonceManager = new LocalNonceManager();
+   const executor = new SafeTransactionExecutor({
+     registry,
+     router,
+-    nonceManager: new LocalNonceManager(),
++    nonceManager: sharedNonceManager,
+     client: executionPreflightClient,
+     logger,
+     metrics,
+@@ -1363,6 +1365,13 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
+         "LIQUIDATION_RECEIVER_READINESS_BLOCKED: VALIDATE_LIQUIDATION_RECEIVER_RPC=false is not allowed in LIVE (receiver identity/layout must be verified)",
+       );
+     }
++    if (receiverSweeper !== undefined && !config.simulationMode && config.eventPurity.enableLiveTx) {
++      // eth_call rescue(token, executor, 0) FROM the executor: proves onlyOwner authorization; failure => loud error + sweeps disabled.
++      await receiverSweeper.verifyAuthorization(canonicalBaseUsdc);
++    }
++    if (receiverSweeper !== undefined) {
++      receiverSweeper.startPeriodic(receiverSweepIntervalMs);
++    }
+     if (validateLiquidationReceiverRpc) {
+       const registryUniswap = getDexesForChain(config.chain).find((dex) => dex.name === "UniswapV3");
+       const expectedSwapRouter = liquidationReceiverExpectedSwapRouter ?? registryUniswap?.router;
+@@ -1449,12 +1458,47 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
+     threshold: parseMinNumber(process.env.EXECUTION_SIM_FAILURE_THRESHOLD, 3, 1, "EXECUTION_SIM_FAILURE_THRESHOLD"),
+     openMs: parseMinNumber(process.env.EXECUTION_CIRCUIT_OPEN_MS, 60_000, 1_000, "EXECUTION_CIRCUIT_OPEN_MS"),
+   });
++  // Post-fill + periodic receiver sweep. Destination is hard-wired to `account.address` inside ReceiverSweeper
++  // (no env/config override exists); RECEIVER_SWEEP_INTERVAL_MS only tunes the loop cadence.
++  const receiverSweeper = liquidationReceiver === undefined
++    ? undefined
++    : new ReceiverSweeper({
++      chain: config.chain,
++      receiver: liquidationReceiver,
++      signer: account,
++      publicClient: publicClient as never,
++      walletClient: walletClient as never,
++      nonceManager: sharedNonceManager,
++      logger,
++      live: !config.simulationMode && config.eventPurity.enableLiveTx,
++      tokens: () => [
++        ...(config.chain === "base" ? [canonicalBaseWeth, canonicalBaseUsdc, canonicalBaseCbBtc] : []),
++        ...activeChainConfig.aave.reservePairs.flatMap((pair) => [pair.collateralAsset, pair.debtAsset]),
++      ],
++      alert: (event, payload) => webhookAlerter.notify(event, payload),
++    });
++  const receiverSweepIntervalMs = parseMinNumber(
++    process.env.RECEIVER_SWEEP_INTERVAL_MS,
++    DEFAULT_SWEEP_INTERVAL_MS,
++    30_000,
++    "RECEIVER_SWEEP_INTERVAL_MS",
++  );
+   const orchestrator = new PipelineOrchestrator({
+     registry,
+     detection,
+     executor,
+     deadLetters: new PipelineDeadLetterQueue(),
+     liquidationGate,
++    ...(receiverSweeper === undefined
++      ? {}
++      : {
++        onLiquidationFilled: (fill) => receiverSweeper.scheduleAfterFill({
++          opportunityId: fill.opportunityId,
++          txHash: fill.txHash,
++          collateralAsset: fill.candidate.collateralAsset,
++          debtAsset: fill.candidate.debtAsset,
++        }),
++      }),
+     simFailureCircuit,
+     ...(watchlistCoordinator === undefined
+       ? {}
+@@ -1631,6 +1675,7 @@ function buildPipelineBot(config: RuntimeConfig, metrics: BotMetrics): BotRunner
+     }
+   });
+   shutdown.addHook("arb_queue_stop", async () => arbQueue.stop());
++  shutdown.addHook("receiver_sweep_stop", async () => receiverSweeper?.stop());
+   shutdown.addHook("oracle_poll_stop", async () => priceOracleCache?.stopBackgroundPoll());
+@SP@
+   return new PipelineBotRunner(
+diff --git a/src/orchestrator/pipelineOrchestrator.ts b/src/orchestrator/pipelineOrchestrator.ts
+index 333076a..61f7d3d 100644
+--- a/src/orchestrator/pipelineOrchestrator.ts
++++ b/src/orchestrator/pipelineOrchestrator.ts
+@@ -1,4 +1,4 @@
+-import type { Address } from "viem";
++import type { Address, Hash } from "viem";
+ import type { BotMetrics, LoggerLike } from "../bot";
+ import type { ChainRegistry, CircuitBreakerName, CircuitBreakerState } from "../config/chainRegistry";
+ import type { SupportedChain } from "../config/chains";
+@@ -73,6 +73,16 @@ export interface PipelineOrchestratorConfig {
+     opportunity: Opportunity,
+   ): SafeExecutionRequest | undefined | Promise<SafeExecutionRequest | undefined>;
+   readonly liquidationGate?: LiquidationCandidateGate;
++  /**
++   * Called AFTER a confirmed liquidation fill (receipt success) has been recorded/logged. Fire-and-forget: it is
++   * invoked inside its own try/catch and must never block or mask the fill result (used for the receiver sweep).
++   */
++  readonly onLiquidationFilled?: (fill: {
++    readonly chain: SupportedChain;
++    readonly opportunityId: string;
++    readonly txHash: Hash;
++    readonly candidate: LiquidationCandidate;
++  }) => void;
+   readonly watchlistStaleness?: StalenessGuard;
+   /** Event-watchlist periodic HF sweep (e.g. when block WS subscription is unavailable). */
+   readonly watchlistSweep?: (chain: SupportedChain) => Promise<void>;
+@@ -371,6 +381,8 @@ export class PipelineOrchestrator {
+     try {
+       const result = await this.config.executor.execute(request);
+       this.recordExecutionResult(plan, request, result, summary);
++      // Fill is logged/recorded above; the sweep hook is fire-and-forget and cannot delay or mask it.
++      this.notifyLiquidationFilled(plan, request, result);
+       await this.recordLearningOutcome(plan, toLearningOutcome(result));
+     } catch (error) {
+       summary.failed += 1;
+@@ -385,6 +397,36 @@ export class PipelineOrchestrator {
+     }
+   }
+@SP@
++  /** Post-fill hook, after the fill record + learning outcome are written. Never throws. */
++  private notifyLiquidationFilled(
++    plan: PipelineExecutionPlan,
++    request: SafeExecutionRequest,
++    result: SafeExecutionResult,
++  ): void {
++    if (
++      result.status !== "sent"
++      || plan.opportunity.kind !== "liquidation"
++      || this.config.onLiquidationFilled === undefined
++    ) {
++      return;
++    }
++    try {
++      this.config.onLiquidationFilled({
++        chain: request.chain,
++        opportunityId: request.opportunityId,
++        txHash: result.txHash,
++        candidate: plan.opportunity.candidate,
++      });
++    } catch (error) {
++      this.config.logger.error("receiver_sweep_failed", {
++        chain: request.chain,
++        opportunityId: request.opportunityId,
++        phase: "post_fill_hook",
++        error: error instanceof Error ? error.message : String(error),
++      });
++    }
++  }
++
++  private recordExecutionResult(
++    plan: PipelineExecutionPlan,
++    request: SafeExecutionRequest,
++    result: SafeExecutionResult,
