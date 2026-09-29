@@ -1,0 +1,249 @@
+   return {
+-    pass: input.debtUsd >= effectiveFloor,
+-    dynamicFloor,
+-    hardFloor,
+-    effectiveFloor,
+-    gasCostUsd: input.gasCostUsd,
+-    flashFeeUsd,
+-    bonusRate: effectiveBonusRate,
++    pass: netPass && sanityPass,
++    reason: !netPass ? "below_min_net_profit" : !sanityPass ? "below_debt_sanity_floor" : "ok",
++    inputsOk: true,
++    missingInputs: [],
+     netProfitUsd,
++    bonusCaptureUsd,
++    protocolFeeUsd,
++    gasCostUsd,
++    flashFeeUsd,
++    swapFeeUsd,
++    slippageUsd,
++    bonusRate,
++    minNetProfitUsd: input.minNetProfitUsd,
++    minDebtSanityUsd: input.minDebtSanityUsd,
++    dynamicFloor,
++    hardFloor: input.minDebtSanityUsd,
++    effectiveFloor: Math.max(dynamicFloor, input.minDebtSanityUsd),
++  };
++}
++
++/** Would-pass flags for the 24h SIM floor comparison. Pure net-profit flags (sanity floor reported separately). */
++export interface FloorShadow {
++  readonly net025: boolean;
++  readonly net1: boolean;
++  readonly net5: boolean;
++  /** Legacy: debtUsd >= $50 (trusted debt only). */
++  readonly debt50: boolean;
++  /** debtUsd >= the configured sanity floor. */
++  readonly sanity: boolean;
++  readonly inputsOk: boolean;
++  /** Live verdict (net floor + sanity floor + trusted debt). */
++  readonly live: boolean;
++}
++
++export function computeFloorShadow(
++  result: LiquidationProfitabilityResult,
++  debtUsd: number,
++  debtTrusted: boolean,
++): FloorShadow {
++  const net = result.inputsOk && debtTrusted ? result.netProfitUsd : null;
++  const atLeast = (floor: number): boolean => net !== null && net >= floor;
++  return {
++    net025: atLeast(0.25),
++    net1: atLeast(1),
++    net5: atLeast(5),
++    debt50: debtTrusted && Number.isFinite(debtUsd) && debtUsd >= SHADOW_DEBT_FLOOR_USD,
++    sanity: debtTrusted && Number.isFinite(debtUsd) && debtUsd >= result.minDebtSanityUsd,
++    inputsOk: result.inputsOk && debtTrusted,
++    live: debtTrusted && result.pass,
+   };
+ }
++
++export class FloorShadowCounters {
++  public total = 0;
++  public net025 = 0;
++  public net1 = 0;
++  public net5 = 0;
++  public debt50 = 0;
++  public live = 0;
++  public inputsMissing = 0;
++
++  public record(shadow: FloorShadow): void {
++    this.total += 1;
++    if (shadow.net025) this.net025 += 1;
++    if (shadow.net1) this.net1 += 1;
++    if (shadow.net5) this.net5 += 1;
++    if (shadow.debt50) this.debt50 += 1;
++    if (shadow.live) this.live += 1;
++    if (!shadow.inputsOk) this.inputsMissing += 1;
++  }
++
++  public snapshot(): Record<string, number> {
++    return {
++      total: this.total,
++      net025: this.net025,
++      net1: this.net1,
++      net5: this.net5,
++      debt50: this.debt50,
++      live: this.live,
++      inputsMissing: this.inputsMissing,
++    };
++  }
++}
+diff --git a/src/protocols/liquidationCandidateFilter.ts b/src/protocols/liquidationCandidateFilter.ts
+index c0bf2e7..f56f926 100644
+--- a/src/protocols/liquidationCandidateFilter.ts
++++ b/src/protocols/liquidationCandidateFilter.ts
+@@ -17,6 +17,9 @@ export type DustFilterReason =
+   | "non_positive_debt"
+   | "below_min_debt"
+   | "below_profitability_floor"
++  | "below_net_profit_floor"
++  | "below_debt_sanity_floor"
++  | "profit_inputs_missing"
+   | "below_gas_multiple"
+   | "oracle_untrusted";
+@SP@
+@@ -41,6 +44,15 @@ export function formatDustReasonLabel(
+     const floor = effectiveFloorUsd ?? minDebtUsd;
+     return `below_PROFITABILITY_FLOOR(${floor.toFixed(4)})`;
+   }
++  if (reason === "below_net_profit_floor") {
++    return "below_MIN_NET_PROFIT_USD";
++  }
++  if (reason === "below_debt_sanity_floor") {
++    return `below_MIN_DEBT_SANITY_USD(${minDebtUsd})`;
++  }
++  if (reason === "profit_inputs_missing") {
++    return "profit_inputs_missing";
++  }
+   if (reason === "below_gas_multiple") {
+     return "below_GAS_COST_MULTIPLE";
+   }
+diff --git a/test/unit/aaveSnapshotProviderRealDebt.test.ts b/test/unit/aaveSnapshotProviderRealDebt.test.ts
+index 91f226a..5a94354 100644
+--- a/test/unit/aaveSnapshotProviderRealDebt.test.ts
++++ b/test/unit/aaveSnapshotProviderRealDebt.test.ts
+@@ -79,7 +79,9 @@ describe("AaveSnapshotProvider real debtToCover", () => {
+@SP@
+     const gateLog = logger();
+     const gate = new LiquidationCandidateGate({
+-      minDebtUsd: 50,
++      minNetProfitUsd: 1,
++      minDebtSanityUsd: 5,
++      resolveSlippageBps: async () => 20,
+       resolveGasCostUsd: async () => 0.05,
+       resolveFlashFeeBps: async () => 5,
+       borrowerCooldown: new BorrowerCooldownRegistry({ cooldownMs: 60_000, nowMs: () => 0 }),
+diff --git a/test/unit/liquidationCandidateGate.test.ts b/test/unit/liquidationCandidateGate.test.ts
+index 161643c..a478c70 100644
+--- a/test/unit/liquidationCandidateGate.test.ts
++++ b/test/unit/liquidationCandidateGate.test.ts
+@@ -1,40 +1,128 @@
+ import { describe, expect, it, vi } from "vitest";
+ import type { Address } from "viem";
+-import { LiquidationCandidateGate } from "../../src/orchestrator/liquidationCandidateGate";
++import { LiquidationCandidateGate, type LiquidationCandidateGateConfig } from "../../src/orchestrator/liquidationCandidateGate";
+ import { BorrowerCooldownRegistry } from "../../src/utils/borrowerCooldown";
+ import type { LiquidationCandidate } from "../../src/protocols/aaveV3";
++import type { PriceOracleCache } from "../../src/utils/priceOracleCache";
+@SP@
+ const account = "0x00000000000000000000000000000000000000bb" as Address;
+ const debtAsset = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
+ const collateralAsset = "0x4200000000000000000000000000000000000006" as Address;
+@SP@
+-function candidate(debtToCover: bigint, repayValueUsd: number): LiquidationCandidate {
+-  return {
++function candidate(
++  debtToCover: bigint,
++  repayValueUsd: number,
++  extra: Partial<LiquidationCandidate> & { noProtocolFee?: boolean } = {},
++): LiquidationCandidate {
++  const { noProtocolFee, ...rest } = extra;
++  const built: LiquidationCandidate = {
+     account,
+     collateralAsset,
+     debtAsset,
+     debtToCover,
+     repayValueUsd,
+     liquidationBonusBps: 500,
++    liquidationProtocolFeeBps: 1_000,
++    debtDecimals: 6,
+     healthFactor: 0n,
++    ...rest,
+   };
++  if (noProtocolFee === true) {
++    const { liquidationProtocolFeeBps: _omit, ...without } = built;
++    return without;
++  }
++  return built;
+ }
+@SP@
+-describe("LiquidationCandidateGate", () => {
+-  it("drops dust candidates before enqueue", async () => {
+-    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+-    const gate = new LiquidationCandidateGate({
+-      minDebtUsd: 25,
+-      resolveGasCostUsd: async () => 0.01,
+-      resolveFlashFeeBps: async () => 5,
+-      borrowerCooldown: new BorrowerCooldownRegistry({ cooldownMs: 60_000, nowMs: () => 0 }),
+-      logger,
+-    });
+-    const filtered = await gate.filterCandidates("base", [
+-      candidate(1_000_000n, 1),
+-      candidate(50_000_000n, 50),
++function gate(over: Partial<LiquidationCandidateGateConfig> = {}) {
++  const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
++  const g = new LiquidationCandidateGate({
++    minNetProfitUsd: 1,
++    minDebtSanityUsd: 5,
++    resolveSlippageBps: async () => 20,
++    resolveGasCostUsd: async () => 0.05,
++    resolveFlashFeeBps: async () => 5,
++    borrowerCooldown: new BorrowerCooldownRegistry({ cooldownMs: 60_000, nowMs: () => 0 }),
++    logger,
++    ...over,
++  });
++  return { g, logger };
++}
++const shadowLogs = (logger: { info: ReturnType<typeof vi.fn> }) =>
++  logger.info.mock.calls.filter((c) => c[0] === "liquidation_floor_shadow").map((c) => c[1] as Record<string, unknown>);
++
++describe("LiquidationCandidateGate (net-profit floor)", () => {
++  it("$50 is no longer the gate: $30 passes on net profit; $3 fails the sanity floor; net-negative fails", async () => {
++    const { g, logger } = gate();
++    const kept = await g.filterCandidates("base", [
++      candidate(30_000_000n, 30),
++      candidate(3_000_000n, 3),
++      candidate(500_000_000n, 500, { liquidationProtocolFeeBps: 1_000 }),
+     ], "test");
+-    expect(filtered).toHaveLength(1);
+-    expect(filtered[0]?.repayValueUsd).toBe(50);
++    expect(kept.map((k) => k.repayValueUsd)).toEqual([30, 500]);
++    const evals = logger.info.mock.calls.filter((c) => c[0] === "liquidation_evaluated").map((c) => c[1] as Record<string, unknown>);
++    expect(evals.map((e) => e.pass)).toEqual([true, false, true]);
++    expect(evals[1]).toMatchObject({ reason: "below_min_net_profit" }); // $3 -> net ~ $0.07 < $1 (sanity also applies)
++  });
++
++  it("high gas: >$50 debt is dropped when net < floor", async () => {
++    const { g } = gate({ resolveGasCostUsd: async () => 3 });
++    const kept = await g.filterCandidates("base", [candidate(60_000_000n, 60)], "test");
++    expect(kept).toHaveLength(0);
++  });
++
++  it("emits liquidation_floor_shadow on EVERY eval — pass, fail, missing inputs, untrusted price", async () => {
++    const untrustedOracle = { forceRefreshUsdPrices: async () => ({}) } as unknown as PriceOracleCache;
++    const a = gate();
++    await a.g.filterCandidates("base", [candidate(30_000_000n, 30), candidate(1_000_000n, 1), candidate(9_000_000n, 9, { noProtocolFee: true })], "t");
++    const shadows = shadowLogs(a.logger);
++    expect(shadows).toHaveLength(3);
++    for (const s of shadows) {
++      expect(s).toEqual(expect.objectContaining({
++        net025: expect.any(Boolean), net1: expect.any(Boolean), net5: expect.any(Boolean), debt50: expect.any(Boolean),
++        livePass: expect.any(Boolean), counts: expect.any(Object), message: expect.stringContaining("liquidation_floor_shadow"),
++      }));
++    }
++    expect(shadows[0]).toMatchObject({ net025: true, net1: true, net5: false, debt50: false, livePass: true });
++    expect(shadows[1]).toMatchObject({ net025: false, net1: false, net5: false, debt50: false, livePass: false });
++    expect(shadows[2]).toMatchObject({ net025: false, net1: false, net5: false, inputsOk: false, livePass: false });
++    expect(shadows[2]!.missingInputs).toContain("liquidationProtocolFeeBps");
++
