@@ -1,0 +1,195 @@
++  }
+   const liquidationGate = new LiquidationCandidateGate({
+-    minDebtUsd: config.minLiquidationDebtUsd,
++    minNetProfitUsd: config.minNetProfitUsd,
++    minDebtSanityUsd: config.minLiquidationDebtUsd,
++    resolveSlippageBps: resolveDynamicSlippageBps,
+     resolveGasCostUsd: resolveDynamicGasCostUsd,
+     resolveFlashFeeBps: resolveFlashLoanFeeBps,
+     ...(priceOracleCache === undefined ? {} : { priceOracle: priceOracleCache }),
+@@ -1786,6 +1796,7 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
+         fallbackRpcUrls: config.fallbackRpcUrls,
+         aaveSubgraphUrl: config.aaveSubgraphUrl,
+         minLiquidationDebtUsd: config.minLiquidationDebtUsd,
++        minNetProfitUsd: config.minNetProfitUsd,
+         borrowerDeadLetterCooldownMs: config.borrowerDeadLetterCooldownMs,
+         oracleMaxStaleMs: config.oracleMaxStaleMs,
+         minProfitUsd: config.minProfitUsd,
+@@ -1885,7 +1896,9 @@ async function runDryRunReplay(config: RuntimeConfig, metrics: BotMetrics, logge
+       return Number((gasCostWei * nativePriceRaw) / 1_000_000_000_000_000_000n) / 1e8;
+     })();
+   const replayGate = new LiquidationCandidateGate({
+-    minDebtUsd: config.minLiquidationDebtUsd,
++    minNetProfitUsd: config.minNetProfitUsd,
++    minDebtSanityUsd: config.minLiquidationDebtUsd,
++    resolveSlippageBps: async () => config.slippageBps,
+     resolveGasCostUsd: async () => replayGasCostUsd,
+     resolveFlashFeeBps: async () => config.flashLoanFeeBps,
+     ...(priceOracleForReplay === undefined ? {} : { priceOracle: priceOracleForReplay }),
+diff --git a/src/orchestrator/liquidationCandidateGate.ts b/src/orchestrator/liquidationCandidateGate.ts
+index ab3dc6f..b6d1c0d 100644
+--- a/src/orchestrator/liquidationCandidateGate.ts
++++ b/src/orchestrator/liquidationCandidateGate.ts
+@@ -9,7 +9,12 @@ import {
+   computeDebtUsdFromWei,
+   type DustFilterDecision,
+ } from "../protocols/liquidationCandidateFilter";
+-import { evaluateLiquidationProfitability } from "../profitability/liquidationProfitabilityGate";
++import {
++  computeFloorShadow,
++  evaluateLiquidationProfitability,
++  FloorShadowCounters,
++  LIVE_V1_RECEIVER_SWAP_FEE_BPS,
++} from "../profitability/liquidationProfitabilityGate";
+ import type { BorrowerCooldownRegistry } from "../utils/borrowerCooldown";
+ import { shouldApplyBorrowerCooldown } from "../utils/borrowerCooldownPolicy";
+ import { DustLogCooldown } from "../utils/dustLogCooldown";
+@@ -71,7 +76,14 @@ function planLogFields(plan: LiquidationPlan): Record<string, unknown> {
+ }
+@SP@
+ export interface LiquidationCandidateGateConfig {
+-  readonly minDebtUsd: number;
++  /** Net-profit floor (MIN_NET_PROFIT_USD, default $1): gate passes only if estimated net >= this. */
++  readonly minNetProfitUsd: number;
++  /** Small-debt SANITY floor (MIN_DEBT_SANITY_USD, default $5) — not a profitability gate. */
++  readonly minDebtSanityUsd: number;
++  /** Uniswap fee of the receiver's collateral->debt swap in bps (live v1 receiver is fixed 0.3% => 30). */
++  readonly swapFeeBps?: number;
++  /** Expected swap slippage in bps (required: the gate fails closed without it). */
++  readonly resolveSlippageBps: () => Promise<number>;
+   readonly resolveGasCostUsd: () => Promise<number>;
+   readonly resolveFlashFeeBps: () => Promise<number>;
+   readonly priceOracle?: PriceOracleCache;
+@@ -90,6 +102,8 @@ export interface LiquidationCandidateGateConfig {
+@SP@
+ export class LiquidationCandidateGate {
+   private readonly dustLogCooldown: DustLogCooldown;
++  /** In-process cumulative counts of the 24h SIM floor shadow (also logged on every eval). */
++  public readonly floorShadowCounters = new FloorShadowCounters();
+@SP@
+   public constructor(private readonly config: LiquidationCandidateGateConfig) {
+     this.dustLogCooldown = config.dustLogCooldown ?? new DustLogCooldown();
+@@ -124,6 +138,7 @@ export class LiquidationCandidateGate {
+   ): Promise<LiquidationCandidate[]> {
+     const gasCostUsd = await this.config.resolveGasCostUsd();
+     const flashFeeBps = await this.config.resolveFlashFeeBps();
++    const slippageBps = await this.config.resolveSlippageBps();
+     const kept: LiquidationCandidate[] = [];
+     for (const candidate of candidates) {
+       if (this.isBorrowerBlocked(chain, candidate.account)) {
+@@ -132,12 +147,21 @@ export class LiquidationCandidateGate {
+       const resolved = await this.resolveFreshDebtUsd(candidate, chain);
+       const profitability = evaluateLiquidationProfitability({
+         debtUsd: resolved.debtUsd,
+-        liquidationBonusBps: candidate.liquidationBonusBps,
++        liquidationBonusBps: candidate.effectiveLiquidationBonusBps ?? candidate.liquidationBonusBps,
++        liquidationProtocolFeeBps: candidate.liquidationProtocolFeeBps,
+         gasCostUsd,
+         flashFeeBps,
+-        hardFloorUsd: this.config.minDebtUsd,
++        swapRequired: candidate.collateralAsset.toLowerCase() !== candidate.debtAsset.toLowerCase(),
++        swapFeeBps: this.config.swapFeeBps ?? LIVE_V1_RECEIVER_SWAP_FEE_BPS,
++        slippageBps,
++        minNetProfitUsd: this.config.minNetProfitUsd,
++        minDebtSanityUsd: this.config.minDebtSanityUsd,
+       });
+-      const gatePass = resolved.trusted && profitability.pass;
++      // Lesson: verdict debtUsd must reconcile with the REAL on-chain debt. The repaid debt can never exceed the
++      // borrower's actual debt; if it does the sizing/price data is inconsistent => fail closed.
++      const debtExceedsOnChain = resolved.actualDebtUsd !== undefined
++        && resolved.debtUsd > resolved.actualDebtUsd * 1.001 + 1e-9;
++      const gatePass = resolved.trusted && profitability.pass && !debtExceedsOnChain;
+       let sanityPass = true;
+       if (this.config.oracleSanityCheck !== undefined) {
+         const sanity = await this.config.oracleSanityCheck({
+@@ -164,18 +188,20 @@ export class LiquidationCandidateGate {
+         stage,
+         debtUsd: resolved.debtUsd,
+         ...profitability,
++        ...(debtExceedsOnChain ? { debtExceedsOnChainDebt: true } : {}),
+         pass: finalPass,
+         ...sizingLogFields(candidate, resolved),
+       });
++      this.logFloorShadow(chain, candidate, stage, resolved, profitability, finalPass);
+       const diagnosticRow = {
+         kind: "liquidation" as const,
+         account: candidate.account,
+         stage,
+-        grossProfitUsd: resolved.debtUsd * (candidate.liquidationBonusBps / 10_000),
++        grossProfitUsd: resolved.debtUsd * ((candidate.effectiveLiquidationBonusBps ?? candidate.liquidationBonusBps) / 10_000),
+         gasCostUsd,
+-        netDeltaUsd: profitability.netProfitUsd,
+-        failureMarginBps: profitability.effectiveFloor > 0
+-          ? Math.round((profitability.netProfitUsd / profitability.effectiveFloor) * 10_000)
++        netDeltaUsd: profitability.netProfitUsd ?? 0,
++        failureMarginBps: profitability.netProfitUsd !== null && profitability.minNetProfitUsd > 0
++          ? Math.round((profitability.netProfitUsd / profitability.minNetProfitUsd) * 10_000)
+           : 0,
+         passed: finalPass,
+       };
+@@ -184,13 +210,26 @@ export class LiquidationCandidateGate {
+           ...diagnosticRow,
+           skipReason: !sanityPass
+             ? "oracle_sanity_deviation"
+-            : `below_effective_floor_${profitability.effectiveFloor.toFixed(2)}`,
++            : debtExceedsOnChain
++              ? "debt_exceeds_onchain_debt"
++              : !resolved.trusted
++                ? "oracle_untrusted"
++                : profitability.reason === "inputs_missing"
++                  ? `profit_inputs_missing_${profitability.missingInputs.join("+")}`
++                  : profitability.reason === "below_debt_sanity_floor"
++                    ? `below_debt_sanity_floor_${profitability.minDebtSanityUsd}`
++                    : `below_min_net_profit_${profitability.minNetProfitUsd}`,
+         });
+       } else {
+         getCycleDiagnosticsCollector().record(diagnosticRow);
+       }
+@SP@
+-      const decision = this.buildFilterDecision(resolved, profitability.pass, gasCostUsd);
++      const decision = this.buildFilterDecision(
++        resolved,
++        profitability.pass && !debtExceedsOnChain,
++        gasCostUsd,
++        profitability.reason,
++      );
+       logLiquidationDustDecision(this.config.logger, {
+         chain,
+         account: candidate.account,
+@@ -198,8 +237,8 @@ export class LiquidationCandidateGate {
+         collateralAsset: candidate.collateralAsset,
+         stage,
+         decision,
+-        minDebtUsd: this.config.minDebtUsd,
+-        effectiveFloorUsd: profitability.effectiveFloor,
++        minDebtUsd: this.config.minDebtSanityUsd,
++        ...(profitability.effectiveFloor === null ? {} : { effectiveFloorUsd: profitability.effectiveFloor }),
+         dustLogCooldown: this.dustLogCooldown,
+       });
+       if (decision.isDust || !sanityPass) {
+@@ -284,16 +323,63 @@ export class LiquidationCandidateGate {
+     await this.filterCandidates(chain, candidates, "ws_reserve_event");
+   }
+@SP@
++  /**
++   * Emitted on EVERY profitability evaluation (pass, fail, missing inputs, untrusted price) so a 24h SIM run can count
++   * how many candidates each floor would have caught:  grep liquidation_floor_shadow
++   */
++  private logFloorShadow(
++    chain: SupportedChain,
++    candidate: LiquidationCandidate,
++    stage: string,
++    resolved: ResolvedDebtUsd,
++    profitability: ReturnType<typeof evaluateLiquidationProfitability>,
++    finalPass: boolean,
++  ): void {
++    const shadow = computeFloorShadow(profitability, resolved.debtUsd, resolved.trusted);
++    this.floorShadowCounters.record({ ...shadow, live: finalPass });
++    this.config.logger.info("liquidation_floor_shadow", {
++      chain,
++      account: candidate.account,
++      stage,
++      debtUsd: resolved.debtUsd,
++      netProfitUsd: profitability.netProfitUsd,
++      inputsOk: shadow.inputsOk,
++      missingInputs: profitability.missingInputs,
