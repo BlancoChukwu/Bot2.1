@@ -324,7 +324,7 @@ index a2b3245..c50e5bc 100644
 +  readonly minNetProfitUsd: number;
    readonly borrowerDeadLetterCooldownMs: number;
    readonly oracleMaxStaleMs: number;
-   readonly minProfitUsd: number;
+   readonly oraclePollIntervalMs: number;
 @@ -104,7 +105,9 @@ export async function runPhase2TargetedDustDryRun(
    };
 @SP@
@@ -347,23 +347,3 @@ index c2a0d60..2bc2b55 100644
 +  /** Small-debt SANITY floor (MIN_DEBT_SANITY_USD, default $5). Not a profitability gate. */
    readonly minLiquidationDebtUsd: number;
 +  /** Net-profit floor (MIN_NET_PROFIT_USD, default $1): gas + flash premium + swap fee + slippage netted out. */
-   readonly minNetProfitUsd: number;
-   readonly borrowerDeadLetterCooldownMs: number;
-   readonly oracleMaxStaleMs: number;
-   readonly oraclePollIntervalMs: number;
-@@ -296,12 +299,10 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
-     dailyPnlCsvPath: optionalEnv(parsedEnv, "DAILY_PNL_CSV_PATH"),
-     arbitrageMinProfitUsd: parseMinNumber(parsedEnv.ARBITRAGE_MIN_PROFIT_USD, 0.15, 0, "ARBITRAGE_MIN_PROFIT_USD"),
-     priceFeedRegistry,
--    minLiquidationDebtUsd: parseMinNumber(
--      parsedEnv.MIN_LIQUIDATION_DEBT_USD,
--      Math.max(parseMinNumber(parsedEnv.MIN_PROFIT_USD, 10, 0, "MIN_PROFIT_USD"), 50),
--      0,
--      "MIN_LIQUIDATION_DEBT_USD",
--    ),
-+    // The old $50 hard debt floor (MIN_LIQUIDATION_DEBT_USD, default max(MIN_PROFIT_USD,50)) is REPLACED by a net-profit
-+    // floor plus this small sanity floor. The legacy env var is intentionally ignored (startup logs legacy_min_liquidation_debt_usd_ignored).
-+    minLiquidationDebtUsd: parseMinNumber(parsedEnv.MIN_DEBT_SANITY_USD, 5, 0, "MIN_DEBT_SANITY_USD"),
-+    minNetProfitUsd: parseMinNumber(parsedEnv.MIN_NET_PROFIT_USD, 1, 0, "MIN_NET_PROFIT_USD"),
-     borrowerDeadLetterCooldownMs: parseMinNumber(
-       parsedEnv.MIN_PROFIT_USD_PLACEHOLDER, 600_000,
