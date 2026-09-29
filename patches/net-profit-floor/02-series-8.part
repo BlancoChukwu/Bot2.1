@@ -1,0 +1,116 @@
++describe("computeFloorShadow / FloorShadowCounters", () => {
++  it("flags each floor independently and counts them", () => {
++    const counters = new FloorShadowCounters();
++    // net of the base case at various sizes
++    const eval_ = (debtUsd: number, gas = 0.1) => evaluateLiquidationProfitability({ ...base, debtUsd, gasCostUsd: gas });
++    const tiny = eval_(3, 0.05);      // net << 0.25
++    const mid = eval_(40);            // sub-$50 debt
++    const big = eval_(5_000);         // clearly > $5
++    const s1 = computeFloorShadow(tiny, 3, true);
++    const s2 = computeFloorShadow(mid, 40, true);
++    const s3 = computeFloorShadow(big, 5_000, true);
++    expect(s1).toMatchObject({ net025: false, net1: false, net5: false, debt50: false });
++    expect(s2.debt50).toBe(false);
++    expect(s3).toMatchObject({ net025: true, net1: true, net5: true, debt50: true, live: true });
++    [s1, s2, s3].forEach((s) => counters.record(s));
++    expect(counters.snapshot().total).toBe(3);
++    expect(counters.snapshot().debt50).toBe(1);
++  });
++
++  it("untrusted debt or missing inputs => every net flag false (no silent pass)", () => {
++    const r = evaluateLiquidationProfitability(base);
++    const untrusted = computeFloorShadow(r, 1_000, false);
++    expect(untrusted).toMatchObject({ net025: false, net1: false, net5: false, debt50: false, live: false, inputsOk: false });
++    const missing = computeFloorShadow(evaluateLiquidationProfitability({ ...base, gasCostUsd: undefined }), 1_000, true);
++    expect(missing).toMatchObject({ net025: false, net1: false, net5: false, inputsOk: false, live: false });
+   });
+ });
+diff --git a/test/unit/replay0xf20e51765799.test.ts b/test/unit/replay0xf20e51765799.test.ts
+index 2087508..b1fdba2 100644
+--- a/test/unit/replay0xf20e51765799.test.ts
++++ b/test/unit/replay0xf20e51765799.test.ts
+@@ -108,7 +108,9 @@ const fixtureRows: FakeUserRow[] = fixture.reserves.map((row) => ({
+ function dustGate() {
+   const log = logger();
+   const gate = new LiquidationCandidateGate({
+-    minDebtUsd: 50, // hardFloor 50 as logged on host
++    minNetProfitUsd: 1,
++      minDebtSanityUsd: 5,
++      resolveSlippageBps: async () => 20,
+     resolveGasCostUsd: async () => 0.01,
+     resolveFlashFeeBps: async () => 5,
+     borrowerCooldown: new BorrowerCooldownRegistry({ cooldownMs: 60_000, nowMs: () => 0 }),
+@SIG@
+2.47.3
+
+From 86c676f47150aa34aa548fdc1061a3779740fb3e Mon Sep 17 00:00:00 2001
+From: BlancoChukwu <blanco.chukwu@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 01:45:12 -0600
+Subject: [PATCH] Docs: scope for cbETH/wstETH/weETH Base pairs and Moonwell
+ (Grok-Work e722227) rebase sizing (scope only, no code).
+
+---
+ docs/SCOPE_LST_PAIRS_AND_MOONWELL_REBASE.md | 100 ++++++++++++++++++++
+ 1 file changed, 100 insertions(+)
+ create mode 100644 docs/SCOPE_LST_PAIRS_AND_MOONWELL_REBASE.md
+
+diff --git a/docs/SCOPE_LST_PAIRS_AND_MOONWELL_REBASE.md b/docs/SCOPE_LST_PAIRS_AND_MOONWELL_REBASE.md
+new file mode 100644
+index 0000000..6848df7
+--- /dev/null
++++ b/docs/SCOPE_LST_PAIRS_AND_MOONWELL_REBASE.md
+@@ -0,0 +1,100 @@
++# Scope only — (A) cbETH / wstETH / weETH on Base Aave pairs, (B) Moonwell rebase sizing
++
++Status: **SCOPE ONLY. No LST or Moonwell code is in this branch.** Date: 2026-09-29. Base: `9b3937b` + `fix/net-profit-floor`.
++Legend: **[V-mcp]** = read from Aave MCP today, **[V-chain]** = read on-chain (Base RPC) today, **[U]** = unverified / inference.
++
++## A) Adding cbETH, wstETH, weETH
++
++### A1. Aave reserve parameters (Base pool `0xA238…d1c5`) — [V-mcp]
++| | wstETH | cbETH | weETH |
++|---|---|---|---|
++| Token | `0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452` | `0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22` | `0x04C0599Ae5A44757c0af6F9eC3b93da8976c150A` |
++| LTV / LT | 75% / 79% | 75% / 79% | 75% / 77% |
++| Liq. bonus (non-eMode) | **6%** | **7.5%** | **7.5%** |
++| Supply / borrow cap | 15,000 / 1,200 | 50,000 / 1,010 | 20,000 / **1 (borrow cap reached)** |
++| Supplied (USD) | ~$34.3M | ~$144.7M | ~$45.7M |
++| Borrowed (USD) | ~$1.16M | ~$0.61M | ~$7.8k |
++| Borrowable? | yes | yes | effectively **no** (cap = 1 weETH, reached) |
++| eMode (collateral) | 1 ETH-corr (LT93/pen 2%), 8 wstETH/WETH (LT95/pen **1%**) | 1, 9 cbETH/WETH (LT95/pen **2%**) | 1, 7 weETH/WETH (LT95/pen **1.25%**) |
++
++Implications
++- **Real-world liquidation surface is LST-collateral / WETH-debt.** All three are ETH-correlated; the borrower who is liquidatable holds them as collateral against WETH (or USDC/GHO). LST as **debt** is ~nil (weETH borrow cap is 1 token; wstETH/cbETH borrows are <$1.2M).
++- **eMode changes the bonus.** A user in eMode 8/9/7 is liquidated at **1% / 2% / 1.25%**, not 6% / 7.5% / 7.5%. Config bonus values are the wrong number for exactly the positions most likely to be underwater (ETH-correlated leverage loops). Our sizing already reads the effective bonus on-chain (`aaveReservePositions` eMode-aware); the *net-profit floor* then makes many eMode LST positions unprofitable (1% bonus − 10% protocol fee − 0.3% swap − flash 0.05% − slippage ≈ 0.4–0.5% of debt before gas). Expect these to be **rejected by `MIN_NET_PROFIT_USD` unless debt is large** (≥ ~$300–500 at $1 floor / low Base gas). This is correct behaviour, not a bug — the shadow log will quantify it.
++- Bonus and protocol fee must come from `Pool.getConfiguration` + `getEModeCategoryData` per position ([lesson: on-chain only, never config defaults]). `AaveReservePair.liquidationBonusBps` for LSTs would be reference-only.
++
++### A2. Oracles — [V-chain]
++Aave oracle `0x2Cc0…e156` sources (all 8 decimals, all "capped" adapters):
++- wstETH → `0x1AFC5010Fb182B6e62D6a3B522F09F644Fb62EfD` ("Capped wstETH / stETH(ETH) / USD")
++- cbETH → `0xB6E9fbba669763BD811B10A761110C449824b5BB` ("Capped cbETH / ETH / USD")
++- weETH → `0x0A0fFc2952B682eb36cde5Bdb03169C2c5F5305c` ("Capped weETH / eETH(ETH) / USD")
++
++Work: add the three feeds to `priceFeedRegistry` / `PriceOracleCache` (Base) and `startBackgroundPoll` list (currently only WETH/USDC/cbBTC hard-coded in `src/index.ts`), plus `healthyPegAsset`/staleness config per feed (**heartbeat not read — [U]**; read `latestRoundData().updatedAt` + Chainlink heartbeat before setting `ORACLE_MAX_STALE_MS` per asset). The Aave-oracle fallback path (`aaveOracleAddress`) already prices any listed reserve, so *pricing* works without new feeds; *freshness gating/gap-fill* needs feed entries. ~40 LOC config + tests.
++
++### A3. Uniswap V3 pools, fee tiers, depth — [V-chain] (liquidity = in-range L; token balances are pool holdings)
++| Pair | 0.01% | 0.05% | **0.3% (live receiver)** | 1% |
++|---|---|---|---|---|
++| wstETH/WETH | `0x20E0…7e` L=4.6e22, 13.3 wstETH/21.2 WETH | `0x6f44…5644` L=1.3e21, 0.27/0.87 | `0x106C…1AF4` L=2.4e15, **~0.00005/0.00002** (empty) | `0xa8F8…f009` L=2e16, ~0.008/0.011 (empty) |
++| cbETH/WETH | `0xA9Da…2A46` L=2.0e23, 4.0/13.0 | `0x1064…aa0d` L=5.8e21, 6.1/17.5 | `0x7B96…3ff8` L=2e18, **0.52/0.75** | `0x6fb9…EA87` ~empty |
++| weETH/WETH | `0xB141…DE78` L=2.9e20, 3.4/6.5 | `0x33df…312E` L=0 | `0x06b8…4e539` L=1.6e15, **~0.0004/0.0005** (empty) | `0xFa03…2D60` ~empty |
++| LST/USDC | wstETH/USDC 0.05% `0x4583…00cA` (~37.7 wstETH… thin, $974 USDC side); cbETH/USDC 0.3% `0xa8E4…f48a` ($1.8k USDC side); weETH/USDC: no liquidity in any tier |
++
++**Blocking finding:** the live v1 receiver swaps with a **fixed `swapFee = 3000`** (0.3%). For wstETH/WETH and weETH/WETH the 0.3% pool is effectively empty; only 0.01%/0.05% pools hold depth. cbETH/WETH 0.3% has ~0.5 cbETH (~$1.6k) — too thin for anything above a few hundred dollars. With the live v1 receiver, **LST-collateral liquidations would revert (`InsufficientDebtForRepay` / router revert) or take catastrophic slippage.** The `SWAP_SLIPPAGE_BPS = 200` minOut in the receiver bounds loss to 2% but the tx then reverts (no loss, wasted gas).
++Depth caveat: token balances above are TVL snapshots, not swap-size limits; exact executable size needs Quoter `quoteExactInputSingle` at target sizes — **not run [U]**.
++
++### A4. Receiver fee-tier implications
++- Live v1 (`0x379c…8ada6`, code hash pinned in `liquidationReceiverReadiness.ts`) is immutable: fee 3000 only, **no way to route LSTs through the 0.01%/0.05% pools**. Supporting LSTs on-chain requires **a new receiver** (per-call or per-pair `fee` in params — that changes the 5-field v1 layout and the readiness code-hash/ABI probe) — explicitly out of scope here and forbidden this task.
++- Until then: LST pairs must be **excluded from `reservePairs`** (or gated `executable=false`) so we do not spend gas on doomed txs. Detection/shadow-logging of LST candidates is fine and useful.
++- The net-profit floor's `swapFeeBps` is `LIVE_V1_RECEIVER_SWAP_FEE_BPS = 30`; a v2 receiver would make it per-pair (`AaveReservePair.swapFeeTier` already exists as informational field: set 100 for wstETH/cbETH/weETH vs WETH).
++- Same-token pairs (WETH debt / LST collateral) still need the swap leg; LST debt / WETH collateral is irrelevant (no LST debt).
++
++### A5. Allowlist / config / code touchpoints (for the future implementation PR)
++1. `src/config/chains.ts`: add address constants; `baseCollateralBonusBps` (reference only); `baseLegacyDefaultDebtToCover` (WETH debt already exists); new pairs `basePair(wstETH|cbETH|weETH, WETH, 100)` — gated off until receiver v2.
++2. `src/config/…decimals` maps: `liquidationCandidateGate.resolveDebtDecimals` only knows USDC/WETH/cbBTC; LSTs are 18 dec (default 18 OK) — fine but add explicit entries + test.
++3. `src/index.ts`: `canonicalBase*` constants, oracle background poll list, `liquidationReceiver` token list for the sweeper (`ReceiverSweeper.tokens()` auto-picks `reservePairs`, so sweeps of LST residuals come for free once pairs are added).
++4. Price/`healthyPegAsset` + feed-freshness entries for 3 feeds (A2).
